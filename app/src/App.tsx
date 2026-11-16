@@ -14,11 +14,27 @@ type UploadInfo = {
   duration: number;
   width: number;
   height: number;
-  chunks: number;
   kind: 'video' | 'audio';
 };
 
-type SavedUpload = UploadInfo & { createdAt: number };
+type StagedMedia = {
+  id: string;
+  source_type: 'upload' | 'url';
+  status: 'receiving' | 'downloading' | 'ready' | 'failed' | 'finalizing' | 'completed';
+  filename: string;
+  title: string | null;
+  file_size: number;
+  duration: number;
+  width: number;
+  height: number;
+  kind: 'video' | 'audio';
+  bytes_received: number;
+  total_bytes: number | null;
+  speed: number | null;
+  eta: number | null;
+  error: string | null;
+  project_id: string | null;
+};
 type Template = { name: string; tone: string; sample: string; featured?: boolean; base_template?: string };
 type LLMSettings = { provider: string; apiKey: string; model: string; baseUrl: string };
 type ClipWord = { start: number; end: number; preview_start: number; preview_end: number; text: string };
@@ -149,7 +165,6 @@ async function responseError(response: Response): Promise<string> {
 
 const ALLOWED_EXTENSIONS = new Set(['mp4', 'mov', '3gp', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'm4a']);
 const ACCEPT = '.mp4,.mov,.3gp,.avi,.mkv,.webm,.mp3,.wav,.m4a,video/mp4,video/quicktime,video/3gpp,video/x-msvideo,video/webm,audio/mpeg,audio/wav,audio/mp4';
-const CHUNK_SIZE = 2 * 1024 * 1024;
 const templates: Template[] = [
   { name: 'Default', tone: 'default', sample: 'Un gran momento' },
   { name: 'Modern', tone: 'modern', sample: 'Ideas que inspiran' },
@@ -174,81 +189,6 @@ const platforms = [
   { label: 'Vimeo', domain: 'vimeo.com', glyph: 'v', color: '#1ab7ea' },
 ];
 
-function openDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open('kellyclipai-local', 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains('uploads')) db.createObjectStore('uploads', { keyPath: 'id' });
-      if (!db.objectStoreNames.contains('chunks')) db.createObjectStore('chunks', { keyPath: 'key' });
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('No se pudo abrir el almacenamiento local.'));
-  });
-}
-
-function transactionComplete(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error ?? new Error('No se pudo guardar el archivo.'));
-    transaction.onabort = () => reject(transaction.error ?? new Error('Se canceló el guardado del archivo.'));
-  });
-}
-
-async function storeChunk(id: string, index: number, blob: Blob): Promise<void> {
-  const db = await openDatabase();
-  const tx = db.transaction('chunks', 'readwrite');
-  tx.objectStore('chunks').put({ key: `${id}:${index.toString().padStart(8, '0')}`, id, index, blob });
-  await transactionComplete(tx);
-  db.close();
-}
-
-async function saveUpload(record: SavedUpload): Promise<void> {
-  const db = await openDatabase();
-  const tx = db.transaction('uploads', 'readwrite');
-  tx.objectStore('uploads').put(record);
-  await transactionComplete(tx);
-  db.close();
-}
-
-async function removeChunks(id: string): Promise<void> {
-  const db = await openDatabase();
-  const tx = db.transaction('chunks', 'readwrite');
-  const store = tx.objectStore('chunks');
-  const request = store.getAllKeys();
-  request.onsuccess = () => request.result.forEach((key) => {
-    if (typeof key === 'string' && key.startsWith(`${id}:`)) store.delete(key);
-  });
-  await transactionComplete(tx);
-  db.close();
-}
-
-async function loadMostRecentUpload(): Promise<{ info: UploadInfo; blob: Blob } | null> {
-  const db = await openDatabase();
-  const records = await new Promise<SavedUpload[]>((resolve, reject) => {
-    const request = db.transaction('uploads').objectStore('uploads').getAll();
-    request.onsuccess = () => resolve(request.result as SavedUpload[]);
-    request.onerror = () => reject(request.error ?? new Error('No se pudo recuperar el proyecto local.'));
-  });
-  const latest = records.sort((a, b) => b.createdAt - a.createdAt)[0];
-  if (!latest) {
-    db.close();
-    return null;
-  }
-  const chunks = await new Promise<Array<{ index: number; blob: Blob }>>((resolve, reject) => {
-    const request = db.transaction('chunks').objectStore('chunks').getAll();
-    request.onsuccess = () => resolve((request.result as Array<{ id: string; index: number; blob: Blob }>)
-      .filter((chunk) => chunk.id === latest.id)
-      .sort((a, b) => a.index - b.index));
-    request.onerror = () => reject(request.error ?? new Error('No se pudo leer el video guardado.'));
-  });
-  db.close();
-  if (chunks.length !== latest.chunks) throw new Error('El archivo guardado está incompleto. Vuelve a importarlo.');
-  const type = latest.kind === 'audio' ? 'audio/*' : 'video/*';
-  const { createdAt: _createdAt, ...info } = latest;
-  return { info, blob: new Blob(chunks.map((chunk) => chunk.blob), { type }) };
-}
-
 function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '—';
   const value = Math.floor(seconds);
@@ -258,6 +198,90 @@ function formatDuration(seconds: number): string {
   return hours > 0
     ? `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
     : `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+function stagedUploadInfo(staged: StagedMedia): UploadInfo {
+  return {
+    id: staged.id,
+    name: staged.filename,
+    size: staged.file_size,
+    duration: staged.duration,
+    width: staged.width,
+    height: staged.height,
+    kind: staged.kind,
+  };
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit > 0 && value < 10 ? 1 : 0)} ${units[unit]}`;
+}
+
+function uploadStagedFile(
+  stagedId: string,
+  file: File,
+  onProgress: (progress: number) => void,
+  onRequest: (request: XMLHttpRequest | null) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('POST', `${API_BASE}/api/staged-media/${stagedId}/content`);
+    request.setRequestHeader('Content-Type', 'application/octet-stream');
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
+      }
+    };
+    request.onload = () => {
+      onRequest(null);
+      if (request.status >= 200 && request.status < 300) {
+        resolve();
+        return;
+      }
+      try {
+        const body = JSON.parse(request.responseText) as { detail?: string };
+        reject(new Error(body.detail ?? `El servidor respondió con error (${request.status}).`));
+      } catch {
+        reject(new Error(`El servidor respondió con error (${request.status}).`));
+      }
+    };
+    request.onerror = () => {
+      onRequest(null);
+      reject(new Error('No se pudo conectar con el almacenamiento local.'));
+    };
+    request.onabort = () => {
+      onRequest(null);
+      reject(new Error('Importación cancelada.'));
+    };
+    onRequest(request);
+    request.send(file);
+  });
+}
+
+async function pollStagedMedia(
+  stagedId: string,
+  onUpdate: (staged: StagedMedia) => void,
+  active: () => boolean,
+): Promise<StagedMedia> {
+  while (active()) {
+    const response = await fetch(`${API_BASE}/api/staged-media/${stagedId}`);
+    if (!response.ok) throw new Error(await responseError(response));
+    const staged = await response.json() as StagedMedia;
+    onUpdate(staged);
+    if (staged.status === 'ready' || staged.status === 'completed') return staged;
+    if (staged.status === 'failed') {
+      throw new Error(staged.error ?? 'La importación falló. Vuelve a intentarlo.');
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 600));
+  }
+  throw new Error('La importación se interrumpió.');
 }
 
 function metadataFor(file: File): Promise<{ duration: number; width: number; height: number; thumbnail: string }> {
@@ -319,13 +343,13 @@ function extensionOf(name: string): string {
 function App() {
   const [route, setRoute] = useState(window.location.pathname);
   const [fileInfo, setFileInfo] = useState<UploadInfo | null>(null);
-  const [fileUrl, setFileUrl] = useState('');
   const [thumbnail, setThumbnail] = useState('');
   const [progress, setProgress] = useState<number | null>(null);
   const [uploadError, setUploadError] = useState('');
   const [dragging, setDragging] = useState(false);
   const [link, setLink] = useState('');
   const [linkMessage, setLinkMessage] = useState('');
+  const [downloadProgress, setDownloadProgress] = useState<StagedMedia | null>(null);
   const [ratio, setRatio] = useState('9:16');
   const [duration, setDuration] = useState('Cualquiera');
   const [activeTemplate, setActiveTemplate] = useState('Default');
@@ -359,6 +383,8 @@ function App() {
   const [zoomError, setZoomError] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const cancelImportRef = useRef(false);
+  const importGenerationRef = useRef(0);
+  const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recordChunksRef = useRef<Blob[]>([]);
@@ -379,14 +405,47 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    loadMostRecentUpload().then((restored) => {
-      if (!active || !restored) return;
-      setFileInfo(restored.info);
-      setFileUrl(URL.createObjectURL(restored.blob));
-      setProgress(100);
-    }).catch((error: unknown) => {
-      if (active) setUploadError(error instanceof Error ? error.message : 'No se pudo recuperar el archivo guardado.');
-    });
+    const restoreUpload = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/api/staged-media/latest?source=upload`);
+        if (!response.ok) throw new Error(await responseError(response));
+        const latest = await response.json() as StagedMedia | null;
+        if (!active || !latest) return;
+        if (latest.status === 'failed') {
+          setUploadError(latest.error ?? 'La última carga no se completó. Vuelve a seleccionar el archivo.');
+          return;
+        }
+        setFileInfo(stagedUploadInfo(latest));
+        setThumbnail('');
+        setProgress(latest.status === 'ready'
+          ? 100
+          : latest.file_size > 0
+            ? Math.min(99, Math.floor((latest.bytes_received / latest.file_size) * 100))
+            : 0);
+        if (latest.status === 'receiving') {
+          await pollStagedMedia(
+            latest.id,
+            (staged) => {
+              if (!active) return;
+              setProgress(staged.status === 'ready'
+                ? 100
+                : staged.file_size > 0
+                  ? Math.min(99, Math.floor((staged.bytes_received / staged.file_size) * 100))
+                  : 0);
+              if (staged.status === 'failed') {
+                setUploadError(staged.error ?? 'La carga se interrumpió. Vuelve a seleccionar el archivo.');
+                setProgress(null);
+                setFileInfo(null);
+              }
+            },
+            () => active,
+          );
+        }
+      } catch (error) {
+        if (active) setUploadError(error instanceof Error ? error.message : 'No se pudo recuperar la carga local.');
+      }
+    };
+    void restoreUpload();
     return () => {
       active = false;
     };
@@ -415,10 +474,6 @@ function App() {
     };
   }, []);
 
-  useEffect(() => () => {
-    if (fileUrl) URL.revokeObjectURL(fileUrl);
-  }, [fileUrl]);
-
   useEffect(() => {
     if (!recording) return;
     const interval = window.setInterval(() => setRecordingTime((value) => value + 1), 1000);
@@ -438,47 +493,63 @@ function App() {
       return;
     }
 
+    uploadRequestRef.current?.abort();
     cancelImportRef.current = false;
+    const generation = ++importGenerationRef.current;
     setLinkProject(null);
     setFileInfo(null);
     setThumbnail('');
     setProgress(0);
-    const id = crypto.randomUUID();
     const kind = file.type.startsWith('audio/') || ['mp3', 'wav', 'm4a'].includes(extension) ? 'audio' : 'video';
     try {
       const metadata = await metadataFor(file);
-      const chunkCount = Math.ceil(file.size / CHUNK_SIZE);
-      for (let index = 0; index < chunkCount; index += 1) {
-        if (cancelImportRef.current) {
-          await removeChunks(id);
-          setProgress(null);
-          return;
-        }
-        await storeChunk(id, index, file.slice(index * CHUNK_SIZE, Math.min(file.size, (index + 1) * CHUNK_SIZE), file.type));
-        setProgress(Math.round(((index + 1) / chunkCount) * 100));
-      }
-      if (cancelImportRef.current) {
-        await removeChunks(id);
+      if (cancelImportRef.current || generation !== importGenerationRef.current) {
         setProgress(null);
         return;
       }
-      const info: UploadInfo = {
-        id,
-        name: file.name,
-        size: file.size,
-        duration: metadata.duration,
-        width: metadata.width,
-        height: metadata.height,
-        chunks: chunkCount,
-        kind,
-      };
-      await saveUpload({ ...info, createdAt: Date.now() });
+      const createResponse = await fetch(`${API_BASE}/api/staged-media/uploads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          file_size: file.size,
+          content_type: file.type || 'application/octet-stream',
+          duration: metadata.duration,
+          width: metadata.width,
+          height: metadata.height,
+          kind,
+        }),
+      });
+      if (!createResponse.ok) throw new Error(await responseError(createResponse));
+      const staged = await createResponse.json() as StagedMedia;
+      if (cancelImportRef.current || generation !== importGenerationRef.current) {
+        const deleteResponse = await fetch(`${API_BASE}/api/staged-media/${staged.id}`, { method: 'DELETE' });
+        if (!deleteResponse.ok) throw new Error(await responseError(deleteResponse));
+        setProgress(null);
+        return;
+      }
+      const info = stagedUploadInfo(staged);
       setFileInfo(info);
       setThumbnail(metadata.thumbnail);
-      setFileUrl(URL.createObjectURL(file));
+      await uploadStagedFile(
+        staged.id,
+        file,
+        (value) => {
+          if (generation === importGenerationRef.current) setProgress(value);
+        },
+        (request) => {
+          if (generation === importGenerationRef.current) uploadRequestRef.current = request;
+        },
+      );
+      if (generation === importGenerationRef.current) {
+        setProgress(100);
+        setUploadError('');
+      }
     } catch (error) {
-      await removeChunks(id).catch(() => undefined);
+      if (generation !== importGenerationRef.current) return;
+      if (uploadRequestRef.current) uploadRequestRef.current = null;
       setProgress(null);
+      setFileInfo(null);
       setUploadError(error instanceof Error ? error.message : 'No se pudo guardar el archivo en este dispositivo.');
     }
   }, []);
@@ -498,6 +569,8 @@ function App() {
 
   const cancelImport = () => {
     cancelImportRef.current = true;
+    uploadRequestRef.current?.abort();
+    setProgress(null);
     setUploadError('Importación cancelada.');
   };
 
@@ -521,15 +594,33 @@ function App() {
       return;
     }
     setIsSubmitting(true);
+    setDownloadProgress(null);
     setLinkMessage(`Descargando desde ${detectedPlatform.label} con yt-dlp. Solo importa contenido propio o autorizado.`);
     try {
-      const form = new FormData();
-      form.append('url', link.trim());
-      form.append('config', JSON.stringify(projectConfig()));
-      const response = await fetch(`${API_BASE}/api/projects/from-url`, { method: 'POST', body: form });
-      if (!response.ok) throw new Error(await responseError(response));
-      const imported = await response.json() as ProjectResult;
+      const startResponse = await fetch(`${API_BASE}/api/staged-media/downloads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: link.trim(), config: projectConfig() }),
+      });
+      if (!startResponse.ok) throw new Error(await responseError(startResponse));
+      const started = await startResponse.json() as StagedMedia;
+      setDownloadProgress(started);
+      const ready = started.status === 'ready'
+        ? started
+        : await pollStagedMedia(
+            started.id,
+            setDownloadProgress,
+            () => true,
+          );
+      const projectResponse = await fetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!projectResponse.ok) throw new Error(await responseError(projectResponse));
+      const imported = await projectResponse.json() as ProjectResult;
       setLinkProject(imported);
+      setDownloadProgress(null);
       setLinkMessage('Video descargado y guardado. Revisa la configuración antes de procesar.');
       navigate(`/p/${imported.id}/configure`);
     } catch (error) {
@@ -673,14 +764,12 @@ function App() {
     try {
       let target = linkProject;
       if (!target) {
-        const restored = await loadMostRecentUpload();
-        if (!restored || restored.info.id !== fileInfo?.id) {
-          throw new Error('No se encontró el video local. Vuelve a importarlo antes de procesar.');
-        }
-        const form = new FormData();
-        form.append('file', restored.blob, fileInfo.name);
-        form.append('config', JSON.stringify(projectConfig()));
-        const response = await fetch(`${API_BASE}/api/projects`, { method: 'POST', body: form });
+        if (!fileInfo) throw new Error('No se encontró el video local. Vuelve a importarlo antes de procesar.');
+        const response = await fetch(`${API_BASE}/api/staged-media/${fileInfo.id}/project`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ config: projectConfig() }),
+        });
         if (!response.ok) throw new Error(await responseError(response));
         target = await response.json() as ProjectResult;
       }
@@ -694,6 +783,55 @@ function App() {
       setIsSubmitting(false);
     }
   };
+
+  useEffect(() => {
+    if (window.location.pathname !== '/') return;
+    let active = true;
+    const resumeDownload = async () => {
+      try {
+        const latestResponse = await fetch(`${API_BASE}/api/staged-media/latest?source=url`);
+        if (!latestResponse.ok) throw new Error(await responseError(latestResponse));
+        const latest = await latestResponse.json() as StagedMedia | null;
+        if (!active || !latest) return;
+        if (latest.status === 'failed') {
+          setLinkMessage(latest.error ?? 'La descarga no se completó. Vuelve a intentarlo.');
+          return;
+        }
+        setIsSubmitting(true);
+        setDownloadProgress(latest);
+        setLinkMessage('Reanudando la descarga local del enlace…');
+        const ready = latest.status === 'ready'
+          ? latest
+          : await pollStagedMedia(latest.id, (staged) => {
+              if (active) setDownloadProgress(staged);
+            }, () => active);
+        if (!active) return;
+        const response = await fetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        if (!response.ok) throw new Error(await responseError(response));
+        const imported = await response.json() as ProjectResult;
+        if (!active) return;
+        setLinkProject(imported);
+        setDownloadProgress(null);
+        setLinkMessage('Video descargado y guardado. Revisa la configuración antes de procesar.');
+        navigate(`/p/${imported.id}/configure`);
+      } catch (error) {
+        if (active) {
+          setLinkMessage(error instanceof Error ? error.message : 'No se pudo reanudar la descarga.');
+          setDownloadProgress(null);
+        }
+      } finally {
+        if (active) setIsSubmitting(false);
+      }
+    };
+    void resumeDownload();
+    return () => {
+      active = false;
+    };
+  }, [navigate]);
 
   const isSettings = route === '/settings';
   const projectRoute = route.match(/^\/p\/([^/]+)(?:\/(configure|processing|edit\/([^/]+)))?$/);
@@ -912,7 +1050,7 @@ function App() {
                     <button className="icon-button cancel-upload" type="button" onClick={cancelImport} aria-label="Cancelar importación" disabled={progress === 100}><X size={17} /></button>
                   </div>
                   <div className="progress-line"><span style={{ width: `${progress}%` }} /></div>
-                  <div className="progress-copy"><span>{progress === 100 ? 'Guardado en este dispositivo' : `Guardando en este dispositivo ${progress}%`}</span><span>{progress}%</span></div>
+                  <div className="progress-copy"><span>{progress === 100 ? 'Listo en el almacenamiento local' : `Subiendo al almacenamiento local ${progress}%`}</span><span>{progress}%</span></div>
                 </div>
               </div>
             )}
@@ -929,6 +1067,29 @@ function App() {
               <button type="submit" className="continue-button" disabled={!link.trim() || isSubmitting}>{isSubmitting ? 'Descargando…' : 'Continuar'} <ArrowRight size={16} /></button>
             </form>
             {linkMessage && <p className="form-message" role="status">{linkMessage}</p>}
+            {downloadProgress?.source_type === 'url' && downloadProgress.status === 'downloading' && (
+              <div className="download-progress" aria-live="polite">
+                {downloadProgress.total_bytes && downloadProgress.total_bytes > 0 && (
+                  <div className="progress-line">
+                    <span style={{ width: `${Math.min(100, Math.round((downloadProgress.bytes_received / downloadProgress.total_bytes) * 100))}%` }} />
+                  </div>
+                )}
+                <div className="progress-copy">
+                  <span>
+                    {downloadProgress.total_bytes && downloadProgress.total_bytes > 0
+                      ? `${formatBytes(downloadProgress.bytes_received)} de ${formatBytes(downloadProgress.total_bytes)}`
+                      : `${formatBytes(downloadProgress.bytes_received)} descargados`}
+                    {downloadProgress.speed ? ` · ${formatBytes(downloadProgress.speed)}/s` : ''}
+                    {downloadProgress.eta !== null ? ` · quedan ${formatDuration(downloadProgress.eta)}` : ''}
+                  </span>
+                  <span>
+                    {downloadProgress.total_bytes && downloadProgress.total_bytes > 0
+                      ? `${Math.min(100, Math.round((downloadProgress.bytes_received / downloadProgress.total_bytes) * 100))}%`
+                      : ''}
+                  </span>
+                </div>
+              </div>
+            )}
 
             <div
               className={`drop-zone ${dragging ? 'is-dragging' : ''}`}
@@ -1299,7 +1460,9 @@ function ResultsPage({
       const link = document.createElement('a');
       link.href = `${API_BASE}${selectedClips[0].download_url}`;
       link.download = `${selectedClips[0].id}.mp4`;
+      document.body.appendChild(link);
       link.click();
+      link.remove();
       return;
     }
     if (!project) return;

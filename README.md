@@ -63,7 +63,7 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.1.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.0.2.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador requiere internet para instalar
 WebView2 si hace falta; el modelo Whisper `small` se descarga la primera vez
@@ -71,7 +71,10 @@ que procesas un video. No incluye credenciales LLM ni de redes sociales:
 configúralas en Ajustes o en `%LOCALAPPDATA%\kellyClipAi\.env`.
 
 Los proyectos, archivos y base SQLite de la versión instalada se guardan en
-`%LOCALAPPDATA%\kellyClipAi\data`. La desinstalación no borra esos archivos.
+`%LOCALAPPDATA%\kellyClipAi\data`. Las cargas locales se transmiten al disco de
+la aplicación con progreso real y quedan recuperables al reiniciar. Las
+descargas por URL también muestran bytes, velocidad y ETA informados por
+yt-dlp. La desinstalación no borra esos archivos.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
 

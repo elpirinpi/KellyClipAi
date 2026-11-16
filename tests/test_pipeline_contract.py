@@ -14,6 +14,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import backend.main as backend_main
 from backend import database
 from backend.llm import LLMConfigurationError, resolve_llm
 from backend.main import _validate_download_url, create_app
@@ -173,6 +174,13 @@ def test_archive_and_public_share_serve_selected_real_clip(
         project_id, clip_id, clip_path = _create_completed_project_with_clip(
             client, settings, video_with_audio
         )
+        direct_download = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/download"
+        )
+        assert direct_download.status_code == 200
+        assert direct_download.content == clip_path.read_bytes()
+        assert direct_download.headers["content-disposition"].startswith("attachment;")
+
         stored = database.get_project(settings.database_path, project_id)
         assert stored is not None
         second_id = str(uuid.uuid4())
@@ -205,6 +213,31 @@ def test_archive_and_public_share_serve_selected_real_clip(
         assert details.json()["title"] == "Clip real de prueba"
         assert file_response.status_code == 200
         assert file_response.content == clip_path.read_bytes()
+
+
+def test_editor_draft_cors_preflight_allows_put(tmp_path: Path) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=("http://localhost:5173",),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    with TestClient(create_app(settings)) as client:
+        response = client.options(
+            "/api/projects/project/clips/clip/edit",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "PUT" in response.headers["access-control-allow-methods"]
 
 
 def test_clip_can_be_rendered_at_1080p_and_enhanced(
@@ -359,6 +392,159 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
         assert stream.status_code == 200
         assert "event: progress" in stream.text
         assert '"progress": 100' in stream.text
+
+
+def test_staged_upload_streams_to_disk_and_survives_reload(tmp_path: Path) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=("http://localhost:5173",),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    config = {
+        "ratio": "9:16",
+        "duration": "Cualquiera",
+        "subtitle_template": "Default",
+        "options": {
+            "emojis": True,
+            "keywords": True,
+            "broll": False,
+            "silence": False,
+            "censor": False,
+        },
+        "moment": "",
+        "whisper_model": "small",
+        "schedule": None,
+    }
+    payload = (b"video-bytes-" * (256 * 1024)) + b"end"
+
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/staged-media/uploads",
+            json={
+                "filename": "large-source.mp4",
+                "file_size": len(payload),
+                "content_type": "video/mp4",
+                "duration": 12.5,
+                "width": 1920,
+                "height": 1080,
+                "kind": "video",
+            },
+        )
+        assert created.status_code == 201
+        staged_id = created.json()["id"]
+
+        uploaded = client.post(
+            f"/api/staged-media/{staged_id}/content",
+            content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 200
+        assert uploaded.json()["status"] == "ready"
+        assert uploaded.json()["bytes_received"] == len(payload)
+
+        restored = client.get("/api/staged-media/latest?source=upload")
+        assert restored.status_code == 200
+        assert restored.json()["id"] == staged_id
+        assert restored.json()["duration"] == 12.5
+
+        project_response = client.post(
+            f"/api/staged-media/{staged_id}/project",
+            json={"config": config},
+        )
+        assert project_response.status_code == 201
+        project_id = project_response.json()["id"]
+        source = settings.data_dir / "projects" / project_id / "source"
+        assert source.read_bytes() == payload
+
+        repeated = client.post(
+            f"/api/staged-media/{staged_id}/project",
+            json={"config": config},
+        )
+        assert repeated.status_code == 201
+        assert repeated.json()["id"] == project_id
+        assert client.get(f"/api/staged-media/{staged_id}").json()["status"] == "completed"
+
+
+def test_staged_upload_rejects_truncated_file(tmp_path: Path) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/api/staged-media/uploads",
+            json={"filename": "source.mp4", "file_size": 5},
+        )
+        staged_id = created.json()["id"]
+        response = client.post(
+            f"/api/staged-media/{staged_id}/content",
+            content=b"bad",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert response.status_code == 400
+        assert client.get(f"/api/staged-media/{staged_id}").json()["status"] == "failed"
+
+
+def test_staged_url_download_persists_real_progress_hook_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    database.initialize(settings.database_path)
+    staged_id = str(uuid.uuid4())
+    database.create_staged_media(
+        settings.database_path,
+        staged_id,
+        "url",
+        "downloading",
+        "Descarga de enlace",
+    )
+    observed_progress: list[dict] = []
+
+    def download_with_progress(url: str, target_dir: Path, progress_hook) -> tuple[Path, str]:
+        assert url == "https://youtube.com/watch?v=authorized"
+        progress_hook(
+            {
+                "status": "downloading",
+                "downloaded_bytes": 5 * 1024 * 1024,
+                "total_bytes": 10 * 1024 * 1024,
+                "speed": 512 * 1024,
+                "eta": 10,
+            }
+        )
+        observed_progress.append(database.get_staged_media(settings.database_path, staged_id))
+        target = target_dir / "download.mp4"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"media bytes")
+        return target, "Video autorizado"
+
+    monkeypatch.setattr(backend_main, "_download_video", download_with_progress)
+    backend_main._download_staged_media(settings, staged_id, "https://youtube.com/watch?v=authorized")
+
+    assert observed_progress[0]["bytes_received"] == 5 * 1024 * 1024
+    assert observed_progress[0]["total_bytes"] == 10 * 1024 * 1024
+    assert observed_progress[0]["speed"] == 512 * 1024
+    assert observed_progress[0]["eta"] == 10
+    finished = database.get_staged_media(settings.database_path, staged_id)
+    assert finished["status"] == "ready"
+    assert finished["title"] == "Video autorizado"
+    assert finished["file_size"] == len(b"media bytes")
 
 
 def test_url_import_rejects_non_https_and_unapproved_hosts() -> None:

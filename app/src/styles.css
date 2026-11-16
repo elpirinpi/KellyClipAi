@@ -112,6 +112,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .progress-line { width: 100%; height: 5px; margin-top: 7px; border-radius: 8px; overflow: hidden; background: #eeedf3; }
 .progress-line span { display: block; height: 100%; border-radius: inherit; background: #7c5cff; transition: width .1s linear; }
 .progress-copy { display: flex; justify-content: space-between; margin-top: 5px; color: #7a8497; font-size: 10px; }
+.download-progress { margin: 8px 2px 12px; }
 
 .config-area { display: flex; flex-direction: column; gap: 16px; margin: 40px auto 0; width: min(860px, 100%); }
 .settings-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }

@@ -49,6 +49,29 @@ def initialize(database_path: Path) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS staged_media (
+                id TEXT PRIMARY KEY,
+                source_type TEXT NOT NULL CHECK (source_type IN ('upload', 'url')),
+                status TEXT NOT NULL CHECK (status IN ('receiving', 'downloading', 'ready', 'failed', 'finalizing', 'deleting', 'completed')),
+                filename TEXT NOT NULL,
+                title TEXT,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                duration REAL NOT NULL DEFAULT 0,
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL DEFAULT 'video',
+                bytes_received INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER,
+                speed REAL,
+                eta REAL,
+                error TEXT,
+                config_json TEXT,
+                project_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS staged_media_source_created
+                ON staged_media(source_type, created_at DESC);
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -131,6 +154,156 @@ def initialize(database_path: Path) -> None:
         if "external_url" not in schedule_columns:
             conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def fail_interrupted_staged_media(database_path: Path) -> None:
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            UPDATE staged_media
+            SET status = 'failed',
+                error = 'La aplicación se cerró antes de completar la importación. Inténtalo de nuevo.',
+                updated_at = ?
+            WHERE status IN ('receiving', 'downloading', 'finalizing', 'deleting')
+            """,
+            (utc_now(),),
+        )
+
+
+def create_staged_media(
+    database_path: Path,
+    staged_id: str,
+    source_type: str,
+    status: str,
+    filename: str,
+    *,
+    file_size: int = 0,
+    duration: float = 0,
+    width: int = 0,
+    height: int = 0,
+    kind: str = "video",
+    config: dict[str, Any] | None = None,
+) -> None:
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO staged_media (
+                id, source_type, status, filename, file_size, duration, width,
+                height, kind, config_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                staged_id,
+                source_type,
+                status,
+                filename,
+                file_size,
+                duration,
+                width,
+                height,
+                kind,
+                json.dumps(config, ensure_ascii=False) if config is not None else None,
+                now,
+                now,
+            ),
+        )
+
+
+def get_staged_media(database_path: Path, staged_id: str) -> dict[str, Any] | None:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM staged_media WHERE id = ?", (staged_id,)
+        ).fetchone()
+    return staged_media_from_row(row) if row else None
+
+
+def latest_staged_media(
+    database_path: Path, source_type: str
+) -> dict[str, Any] | None:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM staged_media
+            WHERE source_type = ? AND status IN ('receiving', 'downloading', 'ready', 'failed')
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (source_type,),
+        ).fetchone()
+    return staged_media_from_row(row) if row else None
+
+
+def staged_media_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["config"] = (
+        json.loads(item.pop("config_json")) if item.get("config_json") is not None else None
+    )
+    return item
+
+
+def update_staged_media(
+    database_path: Path, staged_id: str, **values: Any
+) -> None:
+    allowed = {
+        "status",
+        "filename",
+        "title",
+        "file_size",
+        "bytes_received",
+        "total_bytes",
+        "speed",
+        "eta",
+        "error",
+        "project_id",
+    }
+    updates = {key: value for key, value in values.items() if key in allowed}
+    if not updates:
+        return
+    assignments = [f"{key} = ?" for key in updates]
+    parameters = list(updates.values())
+    assignments.append("updated_at = ?")
+    parameters.extend([utc_now(), staged_id])
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            f"UPDATE staged_media SET {', '.join(assignments)} WHERE id = ?",
+            parameters,
+        )
+
+
+def claim_staged_media(database_path: Path, staged_id: str) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE staged_media
+            SET status = 'finalizing', error = NULL, updated_at = ?
+            WHERE id = ? AND status = 'ready'
+            """,
+            (utc_now(), staged_id),
+        )
+    return cursor.rowcount == 1
+
+
+def claim_staged_media_for_deletion(database_path: Path, staged_id: str) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE staged_media
+            SET status = 'deleting', updated_at = ?
+            WHERE id = ? AND status IN ('receiving', 'ready', 'failed')
+            """,
+            (utc_now(), staged_id),
+        )
+    return cursor.rowcount == 1
+
+
+def delete_staged_media(database_path: Path, staged_id: str) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM staged_media WHERE id = ? AND status = 'deleting'",
+            (staged_id,),
+        )
+    return cursor.rowcount == 1
 
 
 def create_project(

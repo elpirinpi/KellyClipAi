@@ -71,6 +71,25 @@ class ZoomImportRequest(BaseModel):
     config: ProjectConfig
 
 
+class StagedUploadRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    file_size: int = Field(gt=0)
+    content_type: str = Field(default="application/octet-stream", max_length=100)
+    duration: float = Field(default=0, ge=0)
+    width: int = Field(default=0, ge=0)
+    height: int = Field(default=0, ge=0)
+    kind: Literal["video", "audio"] = "video"
+
+
+class StagedDownloadRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4096)
+    config: ProjectConfig
+
+
+class StagedProjectRequest(BaseModel):
+    config: ProjectConfig | None = None
+
+
 class EditablePhrase(BaseModel):
     id: str = Field(min_length=1, max_length=100)
     start: float = Field(ge=0)

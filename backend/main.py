@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import secrets
 import sqlite3
 import shutil
 import socket
 import tempfile
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Callable, Literal
 from urllib.parse import urlencode, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -22,6 +25,7 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from sse_starlette.sse import EventSourceResponse
+from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.types import Scope
@@ -56,6 +60,9 @@ from .schemas import (
     ProcessRequest,
     ProjectConfig,
     PublishClipsRequest,
+    StagedDownloadRequest,
+    StagedProjectRequest,
+    StagedUploadRequest,
     ZoomImportRequest,
 )
 from .settings import AppSettings, get_settings
@@ -72,6 +79,10 @@ _ALLOWED_DOWNLOAD_HOSTS = {
     "facebook.com",
 }
 _VIDEO_SUFFIXES = {".3gp", ".avi", ".mkv", ".mov", ".mp4", ".webm"}
+_AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav"}
+_STAGED_SUFFIXES = _VIDEO_SUFFIXES | _AUDIO_SUFFIXES
+_STAGED_WRITE_SIZE = 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class SPAStaticFiles(StaticFiles):
@@ -144,7 +155,11 @@ def _validate_download_url(value: str) -> str:
     return value.strip()
 
 
-def _download_video(url: str, target_dir: Path) -> tuple[Path, str]:
+def _download_video(
+    url: str,
+    target_dir: Path,
+    progress_hook: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[Path, str]:
     target_dir.mkdir(parents=True, exist_ok=True)
     options = {
         "format": "bv*+ba/b",
@@ -156,6 +171,8 @@ def _download_video(url: str, target_dir: Path) -> tuple[Path, str]:
         "quiet": True,
         "no_warnings": True,
     }
+    if progress_hook is not None:
+        options["progress_hooks"] = [progress_hook]
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
             info = downloader.extract_info(url, download=True)
@@ -179,6 +196,96 @@ def _download_video(url: str, target_dir: Path) -> tuple[Path, str]:
         ) from error
 
 
+def _download_staged_media(settings: AppSettings, staged_id: str, url: str) -> None:
+    staging_dir = settings.data_dir / "staging" / staged_id
+    last_progress_at = 0.0
+    last_progress_bytes = 0
+
+    def report_progress(data: dict[str, Any]) -> None:
+        nonlocal last_progress_at, last_progress_bytes
+        if data.get("status") != "downloading":
+            return
+        downloaded = max(0, int(data.get("downloaded_bytes") or 0))
+        total_value = data.get("total_bytes") or data.get("total_bytes_estimate")
+        total = max(0, int(total_value)) if total_value else None
+        now = time.monotonic()
+        if (
+            now - last_progress_at < 0.5
+            and downloaded - last_progress_bytes < 4 * _STAGED_WRITE_SIZE
+        ):
+            return
+        speed_value = data.get("speed")
+        eta_value = data.get("eta")
+        database.update_staged_media(
+            settings.database_path,
+            staged_id,
+            bytes_received=downloaded,
+            total_bytes=total,
+            speed=max(0.0, float(speed_value)) if speed_value is not None else None,
+            eta=max(0.0, float(eta_value)) if eta_value is not None else None,
+        )
+        last_progress_at = now
+        last_progress_bytes = downloaded
+
+    try:
+        downloaded, title = _download_video(url, staging_dir, report_progress)
+        staged_path = settings.data_dir / "staging" / f"{staged_id}.source"
+        shutil.move(str(downloaded), staged_path)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        file_size = staged_path.stat().st_size
+        database.update_staged_media(
+            settings.database_path,
+            staged_id,
+            status="ready",
+            filename=staged_path.name,
+            title=title,
+            file_size=file_size,
+            bytes_received=file_size,
+            total_bytes=file_size,
+            speed=None,
+            eta=None,
+            error=None,
+        )
+    except Exception as error:
+        logger.exception("No se pudo completar la descarga staged %s", staged_id)
+        detail = error.detail if isinstance(error, HTTPException) else str(error)
+        database.update_staged_media(
+            settings.database_path,
+            staged_id,
+            status="failed",
+            error=f"No se pudo descargar el video: {detail}",
+            speed=None,
+            eta=None,
+        )
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _serialize_staged_media(staged: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: staged[key]
+        for key in (
+            "id",
+            "source_type",
+            "status",
+            "filename",
+            "title",
+            "file_size",
+            "duration",
+            "width",
+            "height",
+            "kind",
+            "bytes_received",
+            "total_bytes",
+            "speed",
+            "eta",
+            "error",
+            "project_id",
+            "created_at",
+            "updated_at",
+        )
+    }
+
+
 def create_app(
     settings: AppSettings | None = None,
     web_dir: Path | None = None,
@@ -189,6 +296,7 @@ def create_app(
     async def lifespan(_: FastAPI):
         app_settings.data_dir.mkdir(parents=True, exist_ok=True)
         database.initialize(app_settings.database_path)
+        database.fail_interrupted_staged_media(app_settings.database_path)
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
         scheduler_task = asyncio.create_task(schedule_worker(app_settings))
         try:
@@ -200,13 +308,13 @@ def create_app(
             except asyncio.CancelledError:
                 pass
 
-    application = FastAPI(title="kellyClipAi API", version="1.0.1", lifespan=lifespan)
+    application = FastAPI(title="kellyClipAi API", version="1.0.2", lifespan=lifespan)
     application.state.settings = app_settings
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(app_settings.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["DELETE", "GET", "POST", "PUT"],
         allow_headers=["Content-Type", "Last-Event-ID"],
     )
 
@@ -392,6 +500,251 @@ def create_app(
     @application.get("/api/projects")
     def projects() -> list[dict]:
         return [_serialize_project(project) for project in database.list_projects(app_settings.database_path)]
+
+    @application.get("/api/staged-media/latest")
+    def latest_staged_media(source: Literal["upload", "url"]) -> dict | None:
+        staged = database.latest_staged_media(app_settings.database_path, source)
+        return _serialize_staged_media(staged) if staged else None
+
+    @application.post("/api/staged-media/uploads", status_code=201)
+    def create_staged_upload(request: StagedUploadRequest) -> dict:
+        filename = Path(request.filename.replace("\\", "/")).name
+        suffix = Path(filename).suffix.lower()
+        if not filename or suffix not in _STAGED_SUFFIXES:
+            raise HTTPException(
+                status_code=415,
+                detail="Formato no compatible. Usa un formato de video o audio admitido.",
+            )
+        staged_id = str(uuid.uuid4())
+        (app_settings.data_dir / "staging").mkdir(parents=True, exist_ok=True)
+        database.create_staged_media(
+            app_settings.database_path,
+            staged_id,
+            "upload",
+            "receiving",
+            filename,
+            file_size=request.file_size,
+            duration=request.duration,
+            width=request.width,
+            height=request.height,
+            kind=request.kind,
+        )
+        return _serialize_staged_media(
+            database.get_staged_media(app_settings.database_path, staged_id)
+        )
+
+    @application.post("/api/staged-media/{staged_id}/content")
+    async def receive_staged_upload(staged_id: str, request: Request) -> dict:
+        staged = database.get_staged_media(app_settings.database_path, staged_id)
+        if staged is None or staged["source_type"] != "upload":
+            raise HTTPException(status_code=404, detail="No se encontró la carga local.")
+        if staged["status"] != "receiving":
+            raise HTTPException(status_code=409, detail="La carga local ya no está disponible.")
+
+        staging_root = app_settings.data_dir / "staging"
+        partial_path = staging_root / f"{staged_id}.part"
+        staged_path = staging_root / f"{staged_id}.source"
+        received = 0
+        last_saved = 0
+        try:
+            with partial_path.open("wb") as target:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    received += len(chunk)
+                    if received > staged["file_size"]:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="La carga supera el tamaño del archivo seleccionado.",
+                        )
+                    for offset in range(0, len(chunk), _STAGED_WRITE_SIZE):
+                        block = memoryview(chunk)[offset : offset + _STAGED_WRITE_SIZE]
+                        await asyncio.to_thread(target.write, block)
+                    if received - last_saved >= 4 * _STAGED_WRITE_SIZE:
+                        database.update_staged_media(
+                            app_settings.database_path,
+                            staged_id,
+                            bytes_received=received,
+                        )
+                        last_saved = received
+                await asyncio.to_thread(target.flush)
+            if received != staged["file_size"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="La carga se interrumpió antes de recibir el archivo completo.",
+                )
+            partial_path.replace(staged_path)
+        except HTTPException as error:
+            partial_path.unlink(missing_ok=True)
+            database.update_staged_media(
+                app_settings.database_path,
+                staged_id,
+                status="failed",
+                error=str(error.detail),
+            )
+            raise
+        except ClientDisconnect as error:
+            partial_path.unlink(missing_ok=True)
+            database.update_staged_media(
+                app_settings.database_path,
+                staged_id,
+                status="failed",
+                error="La conexión se interrumpió durante la carga. Vuelve a seleccionarlo.",
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="La conexión se interrumpió durante la carga. Vuelve a seleccionarlo.",
+            ) from error
+        except OSError as error:
+            partial_path.unlink(missing_ok=True)
+            database.update_staged_media(
+                app_settings.database_path,
+                staged_id,
+                status="failed",
+                error=f"No se pudo guardar el archivo en disco: {error}",
+            )
+            raise HTTPException(
+                status_code=507,
+                detail=f"No se pudo guardar el archivo en disco. Revisa el espacio disponible: {error}",
+            ) from error
+
+        database.update_staged_media(
+            app_settings.database_path,
+            staged_id,
+            status="ready",
+            bytes_received=received,
+            total_bytes=received,
+            speed=None,
+            eta=None,
+            error=None,
+        )
+        return _serialize_staged_media(
+            database.get_staged_media(app_settings.database_path, staged_id)
+        )
+
+    @application.post("/api/staged-media/downloads", status_code=202)
+    def create_staged_download(
+        request: StagedDownloadRequest,
+        background_tasks: BackgroundTasks,
+    ) -> dict:
+        validated_url = _validate_download_url(request.url)
+        staged_id = str(uuid.uuid4())
+        (app_settings.data_dir / "staging").mkdir(parents=True, exist_ok=True)
+        database.create_staged_media(
+            app_settings.database_path,
+            staged_id,
+            "url",
+            "downloading",
+            "Descarga de enlace",
+            config=request.config.model_dump(mode="json"),
+        )
+        background_tasks.add_task(
+            _download_staged_media,
+            app_settings,
+            staged_id,
+            validated_url,
+        )
+        return _serialize_staged_media(
+            database.get_staged_media(app_settings.database_path, staged_id)
+        )
+
+    @application.get("/api/staged-media/{staged_id}")
+    def get_staged_media(staged_id: str) -> dict:
+        staged = database.get_staged_media(app_settings.database_path, staged_id)
+        if staged is None:
+            raise HTTPException(status_code=404, detail="No se encontró la importación.")
+        return _serialize_staged_media(staged)
+
+    @application.delete("/api/staged-media/{staged_id}", status_code=204)
+    def delete_staged_media(staged_id: str) -> Response:
+        staged = database.get_staged_media(app_settings.database_path, staged_id)
+        if staged is None:
+            raise HTTPException(status_code=404, detail="No se encontró la importación.")
+        if not database.claim_staged_media_for_deletion(
+            app_settings.database_path, staged_id
+        ):
+            raise HTTPException(status_code=409, detail="No se puede cancelar esta importación ahora.")
+        try:
+            if staged["source_type"] == "upload":
+                for suffix in (".part", ".source"):
+                    (app_settings.data_dir / "staging" / f"{staged_id}{suffix}").unlink(missing_ok=True)
+            else:
+                shutil.rmtree(app_settings.data_dir / "staging" / staged_id, ignore_errors=True)
+                (app_settings.data_dir / "staging" / f"{staged_id}.source").unlink(missing_ok=True)
+        except OSError as error:
+            database.update_staged_media(
+                app_settings.database_path,
+                staged_id,
+                status="failed",
+                error=f"No se pudo limpiar el archivo temporal: {error}",
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"No se pudo limpiar el archivo temporal: {error}",
+            ) from error
+        if not database.delete_staged_media(app_settings.database_path, staged_id):
+            raise HTTPException(status_code=409, detail="La importación cambió mientras se cancelaba.")
+        return Response(status_code=204)
+
+    @application.post("/api/staged-media/{staged_id}/project", status_code=201)
+    def create_project_from_staged_media(
+        staged_id: str,
+        request: StagedProjectRequest,
+    ) -> dict:
+        staged = database.get_staged_media(app_settings.database_path, staged_id)
+        if staged is None:
+            raise HTTPException(status_code=404, detail="No se encontró la importación.")
+        if staged["status"] == "completed" and staged["project_id"]:
+            project = database.get_project(app_settings.database_path, staged["project_id"])
+            if project:
+                return _serialize_project(project)
+        if staged["status"] != "ready":
+            raise HTTPException(status_code=409, detail="El archivo aún no está listo para crear el proyecto.")
+        config = request.config.model_dump(mode="json") if request.config else staged["config"]
+        if config is None:
+            raise HTTPException(status_code=422, detail="Falta la configuración del proyecto.")
+        if staged["source_type"] == "upload" and Path(staged["filename"]).suffix.lower() not in _VIDEO_SUFFIXES:
+            raise HTTPException(
+                status_code=415,
+                detail="Para crear clips con IA, selecciona un archivo de video compatible.",
+            )
+        staged_path = app_settings.data_dir / "staging" / f"{staged_id}.source"
+        if not staged_path.is_file():
+            raise HTTPException(status_code=404, detail="El archivo guardado ya no está disponible.")
+        if not database.claim_staged_media(app_settings.database_path, staged_id):
+            raise HTTPException(status_code=409, detail="La importación ya está creando un proyecto.")
+
+        project_id = str(uuid.uuid4())
+        project_dir = app_settings.data_dir / "projects" / project_id
+        input_path = project_dir / "source"
+        try:
+            project_dir.mkdir(parents=True, exist_ok=False)
+            shutil.move(str(staged_path), input_path)
+            database.create_project(
+                app_settings.database_path,
+                project_id,
+                staged["title"] or staged["filename"],
+                input_path,
+                config,
+            )
+            database.update_staged_media(
+                app_settings.database_path,
+                staged_id,
+                status="completed",
+                project_id=project_id,
+                error=None,
+            )
+        except Exception:
+            if input_path.is_file():
+                shutil.move(str(input_path), staged_path)
+            shutil.rmtree(project_dir, ignore_errors=True)
+            database.update_staged_media(
+                app_settings.database_path,
+                staged_id,
+                status="ready",
+            )
+            raise
+        return _serialize_project(database.get_project(app_settings.database_path, project_id))
 
     @application.post("/api/projects", status_code=201)
     def create_uploaded_project(
