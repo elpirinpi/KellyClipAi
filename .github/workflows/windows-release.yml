@@ -3,6 +3,12 @@ name: Windows installer
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to build and upload
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,9 +32,6 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
-      - name: Install Inno Setup
-        run: winget install --id JRSoftware.InnoSetup --exact --version 6.7.3 --silent --accept-package-agreements --accept-source-agreements
-
       - name: Build installer
         shell: pwsh
         run: .\build_windows.ps1
@@ -39,7 +42,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = (Get-Content .\app\package.json -Raw | ConvertFrom-Json).version
-          $tag = $env:GITHUB_REF_NAME
+          $tag = if ($env:GITHUB_EVENT_NAME -eq "release") { $env:GITHUB_REF_NAME } else { "${{ inputs.release_tag }}" }
           if ($tag -ne "v$version") {
             throw "Release tag $tag does not match app version v$version."
           }
