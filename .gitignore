@@ -25,3 +25,5 @@ data/
 
 app/node_modules/
 app/dist/
+build/
+artifacts/

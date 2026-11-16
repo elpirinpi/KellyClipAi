@@ -5,7 +5,7 @@ import {
   LockKeyhole, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Video, WandSparkles, X,
 } from 'lucide-react';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = __KELLYCLIP_API_BASE__;
 
 type UploadInfo = {
   id: string;

@@ -1,0 +1,46 @@
+name: Windows installer
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-2022
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.0"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install Inno Setup
+        run: winget install --id JRSoftware.InnoSetup --exact --version 6.7.3 --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Build installer
+        shell: pwsh
+        run: .\build_windows.ps1
+
+      - name: Attach installer to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content .\app\package.json -Raw | ConvertFrom-Json).version
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne "v$version") {
+            throw "Release tag $tag does not match app version v$version."
+          }
+          gh release upload $tag ".\artifacts\KellyClipAi-Setup-$version.exe" --repo $env:GITHUB_REPOSITORY --clobber

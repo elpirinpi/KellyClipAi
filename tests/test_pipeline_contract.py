@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import uuid
@@ -601,3 +602,48 @@ def test_broll_processing_requires_the_selected_provider_key(
     assert response.status_code == 422
     assert "PEXELS_API_KEY" in response.json()["detail"]
     assert database.get_project(settings.database_path, project_id)["status"] == "ready"
+
+
+def test_packaged_frontend_uses_spa_fallback_and_preserves_api_404(
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    web_dir = tmp_path / "web"
+    web_dir.mkdir()
+    (web_dir / "index.html").write_text("<html>kellyClipAi</html>", encoding="utf-8")
+    (web_dir / "app.js").write_text("window.kellyClipAi = true;", encoding="utf-8")
+
+    with TestClient(create_app(settings, web_dir=web_dir)) as client:
+        root = client.get("/")
+        route = client.get("/p/project-id/configure")
+        asset = client.get("/app.js")
+        missing_api = client.get("/api/not-found")
+
+    assert root.status_code == 200
+    assert route.text == "<html>kellyClipAi</html>"
+    assert asset.text == "window.kellyClipAi = true;"
+    assert missing_api.status_code == 404
+
+
+def test_desktop_launcher_creates_user_config_outside_install_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import desktop
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("PATH", "original-path")
+
+    user_dir = desktop._prepare_user_directory()
+
+    assert (user_dir / ".env").read_text(encoding="utf-8").startswith("# Carpeta local")
+    assert Path(os.environ["KELLYCLIP_DATA_DIR"]) == user_dir / "data"
+    assert os.environ["KELLYCLIP_FRONTEND_BASE_URL"] == "http://127.0.0.1:8000"
+    assert Path(os.environ["PATH"].split(os.pathsep)[0]) == desktop._resource_path("bin")

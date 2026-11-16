@@ -18,10 +18,13 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sse_starlette.sse import EventSourceResponse
+from starlette.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from starlette.types import Scope
 
 from . import database
 from .editor import (
@@ -69,6 +72,21 @@ _ALLOWED_DOWNLOAD_HOSTS = {
     "facebook.com",
 }
 _VIDEO_SUFFIXES = {".3gp", ".avi", ".mkv", ".mov", ".mp4", ".webm"}
+
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as error:
+            request_path = str(scope.get("path", "")).lstrip("/")
+            if (
+                error.status_code != 404
+                or request_path == "api"
+                or request_path.startswith("api/")
+            ):
+                raise
+            return await super().get_response("index.html", scope)
 
 
 def _parse_config(value: str) -> ProjectConfig:
@@ -161,7 +179,10 @@ def _download_video(url: str, target_dir: Path) -> tuple[Path, str]:
         ) from error
 
 
-def create_app(settings: AppSettings | None = None) -> FastAPI:
+def create_app(
+    settings: AppSettings | None = None,
+    web_dir: Path | None = None,
+) -> FastAPI:
     app_settings = settings or get_settings()
 
     @asynccontextmanager
@@ -179,7 +200,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             except asyncio.CancelledError:
                 pass
 
-    application = FastAPI(title="kellyClipAi API", version="1.0.0", lifespan=lifespan)
+    application = FastAPI(title="kellyClipAi API", version="1.0.1", lifespan=lifespan)
     application.state.settings = app_settings
     application.add_middleware(
         CORSMiddleware,
@@ -796,6 +817,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             media_type="video/mp4",
             filename=f"{clip_id}.mp4",
         )
+
+    if web_dir is not None:
+        application.mount("/", SPAStaticFiles(directory=web_dir, html=True), name="frontend")
 
     return application
 

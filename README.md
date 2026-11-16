@@ -61,6 +61,32 @@ El script abre una ventana PowerShell para FastAPI (`127.0.0.1:8000`) y otra
 para Vite (`127.0.0.1:5173`). Cierra ambas ventanas al terminar. No se publican
 videos ni se dejan servidores ejecutándose en segundo plano.
 
+## Instalador de Windows
+
+Descarga `KellyClipAi-Setup-1.0.1.exe` desde **Assets** del release en GitHub e
+inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
+oficial de Microsoft WebView2. El instalador requiere internet para instalar
+WebView2 si hace falta; el modelo Whisper `small` se descarga la primera vez
+que procesas un video. No incluye credenciales LLM ni de redes sociales:
+configúralas en Ajustes o en `%LOCALAPPDATA%\kellyClipAi\.env`.
+
+Los proyectos, archivos y base SQLite de la versión instalada se guardan en
+`%LOCALAPPDATA%\kellyClipAi\data`. La desinstalación no borra esos archivos.
+FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
+instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
+
+Para generar el instalador desde el código fuente, instala Python 3.13,
+Node.js 22 e Inno Setup 6, y ejecuta desde PowerShell:
+
+```powershell
+.\build_windows.ps1
+```
+
+El script verifica la suma SHA-256 de FFmpeg y la firma del bootstrapper de
+WebView2. El instalador resultante aparece en `artifacts\`. Al publicar un tag
+`vX.Y.Z` que coincida con `app/package.json`, GitHub Actions construye el
+instalador y lo adjunta al release.
+
 La primera transcripción descarga el modelo de Whisper seleccionado desde el
 repositorio oficial de modelos. Los proyectos, originales, miniaturas y MP4
 resultantes quedan en `data/`; la configuración de cada proyecto y el historial

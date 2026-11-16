@@ -7,7 +7,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT_DIR / ".env")
+ENV_FILE = Path(
+    os.getenv("KELLYCLIP_ENV_FILE", str(ROOT_DIR / ".env"))
+).expanduser()
+load_dotenv(ENV_FILE)
 
 
 @dataclass(frozen=True)
