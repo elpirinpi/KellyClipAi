@@ -326,6 +326,7 @@ def create_app(
     async def lifespan(_: FastAPI):
         app_settings.data_dir.mkdir(parents=True, exist_ok=True)
         database.initialize(app_settings.database_path)
+        database.fail_interrupted_projects(app_settings.database_path)
         database.fail_interrupted_staged_media(app_settings.database_path)
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
         scheduler_task = asyncio.create_task(schedule_worker(app_settings))

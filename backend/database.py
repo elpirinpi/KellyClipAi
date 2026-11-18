@@ -269,6 +269,41 @@ def fail_interrupted_staged_media(database_path: Path) -> None:
         )
 
 
+def fail_interrupted_projects(database_path: Path) -> int:
+    error = (
+        "El procesamiento se interrumpió al cerrar o reiniciar la aplicación. "
+        "Puedes volver a intentarlo."
+    )
+    with _lock, connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT id, progress FROM projects WHERE status IN ('queued', 'processing')"
+        ).fetchall()
+        if not rows:
+            return 0
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE projects
+            SET status = 'failed', step = 'failed', error = ?, updated_at = ?
+            WHERE status IN ('queued', 'processing')
+            """,
+            (error, now),
+        )
+        for row in rows:
+            append_event(
+                conn,
+                row["id"],
+                "failed",
+                {
+                    "status": "failed",
+                    "step": "failed",
+                    "progress": row["progress"],
+                    "message": error,
+                },
+            )
+    return len(rows)
+
+
 def create_staged_media(
     database_path: Path,
     staged_id: str,
