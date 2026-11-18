@@ -518,6 +518,7 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
     config = {
         "ratio": "9:16",
         "duration": "Cualquiera",
+        "framing": "speaker",
         "subtitle_template": "Default",
         "options": {
             "emojis": True,

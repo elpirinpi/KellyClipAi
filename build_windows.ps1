@@ -68,7 +68,9 @@ if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notm
 }
 foreach ($file in @(
     (Join-Path $root 'backend\models\face_detection_yunet_2023mar.onnx'),
-    (Join-Path $root 'backend\models\LICENSE')
+    (Join-Path $root 'backend\models\face_landmarker.task'),
+    (Join-Path $root 'backend\models\LICENSE'),
+    (Join-Path $root 'backend\models\MEDIAPIPE-LICENSE.txt')
 )) {
     if (-not (Test-Path $file)) {
         throw "Falta un archivo requerido para el seguimiento facial: $file"
@@ -96,6 +98,7 @@ if (-not (Test-Path $gplLicense)) {
     --collect-all uvicorn `
     --collect-all webview `
     --collect-all cv2 `
+    --collect-all mediapipe `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops.auto `
     --hidden-import uvicorn.protocols.http.auto `
@@ -103,7 +106,9 @@ if (-not (Test-Path $gplLicense)) {
     --add-data "$(Join-Path $appDir 'dist');web" `
     --add-data "$(Join-Path $root '.env.example');config" `
     --add-data "$(Join-Path $root 'backend\models\face_detection_yunet_2023mar.onnx');backend/models" `
+    --add-data "$(Join-Path $root 'backend\models\face_landmarker.task');backend/models" `
     --add-data "$(Join-Path $root 'backend\models\LICENSE');backend/models" `
+    --add-data "$(Join-Path $root 'backend\models\MEDIAPIPE-LICENSE.txt');backend/models" `
     --add-binary "$(Join-Path $ffmpegBin 'ffmpeg.exe');bin" `
     --add-binary "$(Join-Path $ffmpegBin 'ffprobe.exe');bin" `
     (Join-Path $root 'desktop.py')

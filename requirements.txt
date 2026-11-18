@@ -6,7 +6,8 @@ av==15.1.0
 yt-dlp==2026.10.26
 sse-starlette==3.7.0
 pydantic==2.14.3
-opencv-python-headless==4.11.0.86
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.35
 python-dotenv==1.2.4
 httpx==0.28.1
-PyJWT[crypto]==2.10.1
+PyJWT[crypto]==2.15.0

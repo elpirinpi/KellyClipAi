@@ -95,6 +95,7 @@ type ProjectResult = {
   config: {
     ratio: string;
     duration: string;
+    framing?: 'speaker' | 'split' | 'blur' | 'center';
     subtitle_template: string;
     options: Record<string, boolean>;
     moment: string;
@@ -486,6 +487,7 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState<StagedMedia | null>(null);
   const [ratio, setRatio] = useState('9:16');
   const [duration, setDuration] = useState('Cualquiera');
+  const [framing, setFraming] = useState<'speaker' | 'split' | 'blur' | 'center'>('speaker');
   const [activeTemplate, setActiveTemplate] = useState('Default');
   const [templateTab, setTemplateTab] = useState<'featured' | 'custom' | 'brand'>('featured');
   const [savedTemplates, setSavedTemplates] = useState<Template[]>([]);
@@ -973,6 +975,7 @@ function App() {
     return {
       ratio,
       duration,
+      framing,
       subtitle_template: activeTemplate,
       options,
       moment,
@@ -1107,6 +1110,7 @@ function App() {
           setLinkProject(loaded);
           setRatio(loaded.config.ratio);
           setDuration(loaded.config.duration);
+          setFraming(loaded.config.framing ?? 'speaker');
           setActiveTemplate(loaded.config.subtitle_template);
           setOptions({
             emojis: true,
@@ -1537,6 +1541,19 @@ function App() {
                   <Option checked={options.censor} onClick={() => toggleOption('censor')} title="Auto-censurar" description="Silencia y oculta palabrotas" />
                   <Option checked={options.face_tracking} onClick={() => toggleOption('face_tracking')} title="Seguir rostro en el encuadre" description="Mantiene a la persona principal visible al recortar" />
                 </div>
+                <label className="config-field">
+                  <span>Encuadre inteligente</span>
+                  <select className="text-input" value={framing} onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === 'speaker' || value === 'split' || value === 'blur' || value === 'center') setFraming(value);
+                  }}>
+                    <option value="speaker">Seguir al orador</option>
+                    <option value="split">Pantalla dividida</option>
+                    <option value="blur">Fondo desenfocado</option>
+                    <option value="center">Centrado</option>
+                  </select>
+                  <small>El seguimiento del orador estima actividad labial durante la voz detectada, localmente.</small>
+                </label>
               </section>
 
               <section className="config-card moment-card">

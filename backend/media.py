@@ -549,25 +549,69 @@ def _build_filter(
     enhance_audio: bool = False,
     include_broll: bool = False,
     crop_paths: list[list[FaceCropKeyframe] | None] | None = None,
+    framing: str = "speaker",
 ) -> tuple[str, str, str]:
     parts: list[str] = []
     video_labels: list[str] = []
     audio_labels: list[str] = []
     for index, (start, end) in enumerate(intervals):
         video_label, audio_label = f"v{index}", f"a{index}"
-        crop_path = crop_paths[index] if crop_paths else None
-        crop_filter = (
-            f"crop={width}:{height}:"
-            f"x='{_crop_coordinate_expression(crop_path, 'x')}':"
-            f"y='{_crop_coordinate_expression(crop_path, 'y')}'"
-            if crop_path
-            else f"crop={width}:{height}"
-        )
-        parts.append(
-            f"[0:v]trim=start={_filter_time(start)}:end={_filter_time(end)},"
-            f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"{crop_filter},setsar=1[{video_label}]"
-        )
+        if framing == "split":
+            top_source, bottom_source = f"split_top_src{index}", f"split_bottom_src{index}"
+            top_label, bottom_label = f"split_top{index}", f"split_bottom{index}"
+            pane_height = height // 2
+            parts.append(f"[0:v]split=2[{top_source}][{bottom_source}]")
+            for source, label, horizontal_crop in (
+                (top_source, top_label, "0"),
+                (bottom_source, bottom_label, "iw-ow"),
+            ):
+                parts.append(
+                    f"[{source}]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                    f"setpts=PTS-STARTPTS,scale={width}:{pane_height}:"
+                    "force_original_aspect_ratio=increase,"
+                    f"crop={width}:{pane_height}:x='{horizontal_crop}':y='(ih-oh)/2'"
+                    f"[{label}]"
+                )
+            parts.append(
+                f"[{top_label}][{bottom_label}]vstack=inputs=2[{video_label}]"
+            )
+        elif framing == "blur":
+            background_source, foreground_source = (
+                f"blur_bg_src{index}",
+                f"blur_fg_src{index}",
+            )
+            background_label, foreground_label = f"blur_bg{index}", f"blur_fg{index}"
+            parts.append(f"[0:v]split=2[{background_source}][{foreground_source}]")
+            parts.append(
+                f"[{background_source}]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                f"setpts=PTS-STARTPTS,scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},boxblur=20:10[{background_label}]"
+            )
+            parts.append(
+                f"[{foreground_source}]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                f"setpts=PTS-STARTPTS,scale={round(width * 0.8)}:{round(height * 0.8)}:"
+                "force_original_aspect_ratio=decrease,format=rgba,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+                f"setsar=1[{foreground_label}]"
+            )
+            parts.append(
+                f"[{background_label}][{foreground_label}]overlay=shortest=1[{video_label}]"
+            )
+        else:
+            crop_path = crop_paths[index] if crop_paths else None
+            crop_filter = (
+                f"crop={width}:{height}:"
+                f"x='{_crop_coordinate_expression(crop_path, 'x')}':"
+                f"y='{_crop_coordinate_expression(crop_path, 'y')}'"
+                if crop_path and framing == "speaker"
+                else f"crop={width}:{height}"
+            )
+            parts.append(
+                f"[0:v]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"{crop_filter},setsar=1[{video_label}]"
+            )
         parts.append(
             f"[0:a]atrim=start={_filter_time(start)}:end={_filter_time(end)},"
             f"asetpts=PTS-STARTPTS[{audio_label}]"
@@ -662,14 +706,21 @@ def _render_clip(
     )
     width, height = _ratio_size(config.ratio, output_resolution)
     crop_paths = None
-    if config.options.face_tracking:
+    if config.options.face_tracking and config.framing == "speaker":
         try:
+            speech_intervals = [
+                (word.start, word.end)
+                for segment in transcript
+                for word in segment.words
+                if word.start < proposal.fin and word.end > proposal.inicio
+            ]
             crop_paths = analyze_face_crop_paths(
                 input_path,
                 proposal.inicio,
                 intervals,
                 width,
                 height,
+                speech_intervals=speech_intervals,
             )
         except FaceTrackingError as error:
             raise MediaProcessingError(str(error)) from error
@@ -683,6 +734,7 @@ def _render_clip(
         enhance_audio,
         broll_path is not None,
         crop_paths,
+        config.framing,
     )
     arguments = [
         ffmpeg_path,

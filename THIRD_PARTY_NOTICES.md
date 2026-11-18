@@ -24,5 +24,12 @@ licensed under MIT. The model file is
 The corresponding license is included beside the model.
 
 The feature runs locally on CPU using the pinned
-`opencv-python-headless` package. Video frames and face detections are not
+`opencv-contrib-python` and `mediapipe` packages. Video frames and face detections are not
 uploaded to a third-party service.
+
+Active-speaker framing also uses the MediaPipe Face Landmarker model from
+[Google AI Edge MediaPipe](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task).
+The model and MediaPipe are distributed under Apache-2.0; the license is
+included as `backend/models/MEDIAPIPE-LICENSE.txt`. The model file is
+`backend/models/face_landmarker.task`, SHA-256:
+`64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`.

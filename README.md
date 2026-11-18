@@ -103,9 +103,11 @@ la aplicación con progreso real y quedan recuperables al reiniciar. Las
 descargas por URL también muestran bytes, velocidad y ETA informados por
 yt-dlp. La desinstalación no borra esos archivos.
 Al generar clips, el recorte puede seguir el rostro principal con YuNet en
-CPU; desactívalo en **Opciones de edición** para volver al encuadre centrado.
-El modelo se incluye localmente en la aplicación y el análisis no sube
-fotogramas ni detecciones a servicios externos.
+CPU. El encuadre **Seguir al orador** estima el movimiento labial con MediaPipe
+durante los segmentos de voz detectados; si no hay una señal fiable, vuelve al
+rostro dominante. También puedes elegir pantalla dividida, fondo desenfocado o
+encuadre centrado. Los modelos se incluyen localmente y ningún fotograma,
+detección ni cálculo de labios se envía a servicios externos.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
 
