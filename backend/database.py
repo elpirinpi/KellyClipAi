@@ -34,6 +34,7 @@ def connection(database_path: Path) -> Iterator[sqlite3.Connection]:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(database_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
         conn.commit()
@@ -219,7 +220,6 @@ def initialize(database_path: Path) -> None:
             "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
             "ON staged_media(owner_id, source_type, created_at DESC)"
         )
-        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _migrate_owned_table(

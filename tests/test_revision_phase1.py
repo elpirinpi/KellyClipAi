@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -427,3 +428,18 @@ def test_ffmpeg_timeout_kills_and_reaps_the_process(
 
     assert process.killed
     assert process.wait_calls >= 1
+
+
+def test_each_database_connection_enforces_foreign_keys(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+
+    with database.connection(settings.database_path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO project_events(project_id, event_type, payload_json, created_at)
+                VALUES ('missing-project', 'progress', '{}', 'now')
+                """
+            )
