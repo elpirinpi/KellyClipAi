@@ -37,6 +37,7 @@ class EditOptions(BaseModel):
     broll: bool = False
     silence: bool = False
     censor: bool = False
+    face_tracking: bool = True
 
 
 class ProjectConfig(BaseModel):
@@ -146,6 +147,20 @@ class ClipArchiveRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_clip_ids(self) -> ClipArchiveRequest:
+        if len(self.clip_ids) != len(set(self.clip_ids)):
+            raise ValueError("La selección contiene clips duplicados.")
+        return self
+
+
+class SaveProjectFilesRequest(BaseModel):
+    destination: str = Field(min_length=1, max_length=32768)
+    clip_ids: list[str] = Field(default_factory=list, max_length=10)
+    include_original: bool = False
+
+    @model_validator(mode="after")
+    def validate_files(self) -> SaveProjectFilesRequest:
+        if not self.include_original and not self.clip_ids:
+            raise ValueError("Selecciona el video original o al menos un clip.")
         if len(self.clip_ids) != len(set(self.clip_ids)):
             raise ValueError("La selección contiene clips duplicados.")
         return self

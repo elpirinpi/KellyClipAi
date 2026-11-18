@@ -75,6 +75,14 @@ def _wait_for_backend(thread: threading.Thread) -> None:
     )
 
 
+class DesktopApi:
+    def select_download_folder(self) -> str | None:
+        import webview
+
+        selected = webview.windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+        return selected[0] if selected else None
+
+
 def main(smoke_test: bool = False) -> None:
     user_dir = _prepare_user_directory()
     logging.basicConfig(
@@ -138,6 +146,7 @@ def main(smoke_test: bool = False) -> None:
             min_size=(360, 600),
             width=1440,
             height=940,
+            js_api=DesktopApi(),
         )
         webview.start(gui="edgechromium", debug=False)
     finally:

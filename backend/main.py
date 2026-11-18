@@ -72,6 +72,7 @@ from .schemas import (
     ProcessRequest,
     ProjectConfig,
     PublishClipsRequest,
+    SaveProjectFilesRequest,
     StagedDownloadRequest,
     StagedProjectRequest,
     StagedUploadRequest,
@@ -1480,6 +1481,103 @@ def create_app(
             filename=f"kellyClipAi-clips-{project_id[:8]}.zip",
             background=BackgroundTask(archive_path.unlink, missing_ok=True),
         )
+
+    @application.get("/api/projects/{project_id}/original/download")
+    def download_original(project_id: str) -> FileResponse:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        source = app_settings.data_dir / "projects" / project_id / "source"
+        if not source.is_file():
+            raise HTTPException(status_code=404, detail="El video original ya no está disponible.")
+        title = Path(project["title"]).name
+        filename = title if Path(title).suffix else f"{title}.mp4"
+        filename = "".join(
+            "_" if character in '<>:"/\\|?*' or ord(character) < 32 else character
+            for character in filename
+        ).strip(" .")
+        return FileResponse(
+            source,
+            media_type="application/octet-stream",
+            filename=filename or f"{project_id}.mp4",
+        )
+
+    @application.post("/api/projects/{project_id}/downloads/save")
+    def save_project_files(
+        project_id: str,
+        request: SaveProjectFilesRequest,
+    ) -> dict[str, list[str]]:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        destination = Path(request.destination).expanduser()
+        try:
+            destination = destination.resolve(strict=True)
+        except OSError as error:
+            raise HTTPException(
+                status_code=422,
+                detail="La carpeta elegida no existe o no está disponible.",
+            ) from error
+        if not destination.is_dir():
+            raise HTTPException(status_code=422, detail="El destino debe ser una carpeta.")
+
+        sources: list[tuple[Path, str]] = []
+        if request.include_original:
+            source = app_settings.data_dir / "projects" / project_id / "source"
+            if not source.is_file():
+                raise HTTPException(status_code=404, detail="El video original ya no está disponible.")
+            title = Path(project["title"]).name
+            original_name = title if Path(title).suffix else f"{title}.mp4"
+            sources.append((source, original_name))
+
+        clips_by_id = {clip["id"]: clip for clip in project.get("clips") or []}
+        missing_ids = [clip_id for clip_id in request.clip_ids if clip_id not in clips_by_id]
+        if missing_ids:
+            raise HTTPException(status_code=404, detail="Uno o más clips seleccionados no existen.")
+        for clip_id in request.clip_ids:
+            sources.append((clip_file(project_id, clip_id), f"{clip_id}.mp4"))
+
+        saved: list[str] = []
+        temporary_files: list[Path] = []
+        try:
+            for source, requested_name in sources:
+                if not source.is_file():
+                    raise HTTPException(status_code=404, detail="Uno de los archivos ya no está disponible.")
+                safe_name = "".join(
+                    "_" if character in '<>:"/\\|?*' or ord(character) < 32 else character
+                    for character in Path(requested_name).name
+                ).strip(" .") or f"{project_id}.mp4"
+                stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+                output = destination / safe_name
+                index = 2
+                while output.exists():
+                    output = destination / f"{stem} ({index}){suffix}"
+                    index += 1
+                with tempfile.NamedTemporaryFile(
+                    prefix=".kellyclipai-", suffix=".tmp", dir=destination, delete=False
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                temporary_files.append(temporary_path)
+                shutil.copyfile(source, temporary_path)
+                temporary_path.replace(output)
+                temporary_files.remove(temporary_path)
+                saved.append(output.name)
+        except HTTPException:
+            for temporary_path in temporary_files:
+                temporary_path.unlink(missing_ok=True)
+            for saved_name in saved:
+                (destination / saved_name).unlink(missing_ok=True)
+            raise
+        except OSError as error:
+            for temporary_path in temporary_files:
+                temporary_path.unlink(missing_ok=True)
+            for saved_name in saved:
+                (destination / saved_name).unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"No se pudieron guardar los archivos en la carpeta elegida: {error}",
+            ) from error
+        return {"saved": saved}
 
     @application.post("/api/projects/{project_id}/clips/{clip_id}/share", status_code=201)
     def create_clip_share(project_id: str, clip_id: str) -> dict[str, str]:

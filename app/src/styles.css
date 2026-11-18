@@ -266,7 +266,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .job-status.published { color: #188345; }
 .job-status.failed { color: #a23c31; }
 .job-status.exported { color: #6546d0; }
-.job-link { color: #6348c4; font-size: 10px; text-decoration: none; }
+.job-link { padding: 0; border: 0; background: transparent; color: #6348c4; font-size: 10px; text-decoration: none; cursor: pointer; }
 .job-link:hover { text-decoration: underline; }
 .broll-attribution { margin: 8px 0 0; color: #838b9c; font-size: 10px; }
 .broll-attribution a { color: #6348c4; text-decoration: none; }

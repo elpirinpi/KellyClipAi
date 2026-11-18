@@ -139,6 +139,16 @@ type ScheduleJob = {
   download_url: string | null;
 };
 
+declare global {
+  interface Window {
+    pywebview?: {
+      api: {
+        select_download_folder: () => Promise<string | null>;
+      };
+    };
+  }
+}
+
 function defaultModelFor(provider: string): string {
   return {
     Groq: 'openai/gpt-oss-120b',
@@ -156,6 +166,23 @@ async function responseError(response: Response): Promise<string> {
   } catch {
     return `El servidor respondió con error (${response.status}).`;
   }
+}
+
+function triggerDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function downloadWithAuth(url: string, filename: string): Promise<void> {
+  const response = await apiFetch(url);
+  if (!response.ok) throw new Error(await responseError(response));
+  triggerDownload(await response.blob(), filename);
 }
 
 const ALLOWED_EXTENSIONS = new Set(['mp4', 'mov', '3gp', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'm4a']);
@@ -461,7 +488,14 @@ function App() {
   const [savedTemplates, setSavedTemplates] = useState<Template[]>([]);
   const [templateName, setTemplateName] = useState('');
   const [savingTemplate, setSavingTemplate] = useState(false);
-  const [options, setOptions] = useState({ emojis: true, keywords: true, broll: false, silence: false, censor: false });
+  const [options, setOptions] = useState({
+    emojis: true,
+    keywords: true,
+    broll: false,
+    silence: false,
+    censor: false,
+    face_tracking: true,
+  });
   const [moment, setMoment] = useState('');
   const [schedule, setSchedule] = useState(false);
   const [scheduleDate, setScheduleDate] = useState('');
@@ -1071,7 +1105,15 @@ function App() {
           setRatio(loaded.config.ratio);
           setDuration(loaded.config.duration);
           setActiveTemplate(loaded.config.subtitle_template);
-          setOptions({ emojis: true, keywords: true, broll: false, silence: false, censor: false, ...loaded.config.options });
+          setOptions({
+            emojis: true,
+            keywords: true,
+            broll: false,
+            silence: false,
+            censor: false,
+            face_tracking: true,
+            ...loaded.config.options,
+          });
           setMoment(loaded.config.moment);
           setSchedule(Boolean(loaded.config.schedule));
           if (loaded.config.schedule) {
@@ -1218,7 +1260,9 @@ function App() {
       if (!response.ok) throw new Error(await responseError(response));
       setUpdateStatus(await response.json() as UpdateStatus);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo comprobar si hay actualizaciones.');
+      const message = error instanceof Error ? error.message : 'No se pudo comprobar si hay actualizaciones.';
+      setUpdateStatus((current) => current ? { ...current, state: 'error', error: message } : current);
+      setNotice(message);
     }
   };
 
@@ -1246,12 +1290,22 @@ function App() {
           {isSettings ? <ArrowLeft size={17} /> : <Settings2 size={17} />}
           <span>{isSettings ? 'Volver' : 'Ajustes'}</span>
         </button>
+        {updateStatus?.enabled && <button
+          className="settings-link"
+          type="button"
+          onClick={() => void checkForUpdates()}
+          disabled={updateStatus.state === 'checking'}
+          aria-label="Comprobar actualizaciones"
+        >
+          {updateStatus.state === 'checking' ? <LoaderCircle size={17} className="spin" /> : <Download size={17} />}
+          <span>{updateStatus.state === 'checking' ? 'Comprobando…' : 'Buscar actualizaciones'}</span>
+        </button>}
         {!shareToken && <button className="settings-link" type="button" onClick={() => void handleSignOut()} aria-label="Cerrar sesión">
           <LogOut size={17} /><span>Cerrar sesión</span>
         </button>}
       </header>
 
-      {updateStatus?.enabled && (updateStatus.update_available || updateStatus.state === 'error') && (
+      {updateStatus?.enabled && (updateStatus.update_available || ['checking', 'current', 'error'].includes(updateStatus.state)) && (
         <aside className="update-banner" aria-live="polite">
           <div className="update-copy">
             <strong>
@@ -1265,6 +1319,8 @@ function App() {
                       ? 'Sigue los pasos del instalador para actualizar kellyClipAi'
                       : updateStatus.state === 'error'
                         ? updateStatus.error
+                        : updateStatus.state === 'current'
+                          ? 'Estás usando la última versión de kellyClipAi.'
                         : `Nueva versión ${updateStatus.latest_version} disponible`}
             </strong>
             {updateStatus.state === 'downloading' && (
@@ -1475,6 +1531,7 @@ function App() {
                   <Option checked={options.broll} onClick={() => { toggleOption('broll'); if (!options.broll) setNotice('B-rolls es una función premium y necesita una clave de Pexels o Pixabay.'); }} title="Añadir B-rolls" description="Inserta imágenes de apoyo" premium />
                   <Option checked={options.silence} onClick={() => toggleOption('silence')} title="Eliminar silencios" description="Recorta las pausas largas" />
                   <Option checked={options.censor} onClick={() => toggleOption('censor')} title="Auto-censurar" description="Silencia y oculta palabrotas" />
+                  <Option checked={options.face_tracking} onClick={() => toggleOption('face_tracking')} title="Seguir rostro en el encuadre" description="Mantiene a la persona principal visible al recortar" />
                 </div>
               </section>
 
@@ -1745,34 +1802,55 @@ function ResultsPage({
       setNotice('Selecciona al menos un clip para descargarlo.');
       return;
     }
-    if (selectedClips.length === 1) {
-      const link = document.createElement('a');
-      link.href = `${API_BASE}${selectedClips[0].download_url}`;
-      link.download = `${selectedClips[0].id}.mp4`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      return;
-    }
+    await saveProjectFiles(false, selectedClips.map((clip) => clip.id));
+  };
+  const saveProjectFiles = async (includeOriginal: boolean, clipIds: string[]) => {
     if (!project) return;
-    setBusyAction('archive');
+    setBusyAction(includeOriginal ? 'original' : 'archive');
     setNotice('');
     try {
-      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/archive`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clip_ids: selectedClips.map((clip) => clip.id) }),
-      });
+      const desktopApi = window.pywebview?.api;
+      if (desktopApi) {
+        const destination = await desktopApi.select_download_folder();
+        if (!destination) {
+          setNotice('Guardado cancelado. No se eligió una carpeta.');
+          return;
+        }
+        const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/downloads/save`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destination, include_original: includeOriginal, clip_ids: clipIds }),
+        });
+        if (!response.ok) throw new Error(await responseError(response));
+        const result = await response.json() as { saved: string[] };
+        setNotice(`Guardado en la carpeta elegida: ${result.saved.join(', ')}`);
+        return;
+      }
+
+      const filename = includeOriginal
+        ? `${project.title.replace(/[<>:"/\\|?*]/g, '_')}${/\.[^.]+$/.test(project.title) ? '' : '.mp4'}`
+        : clipIds.length === 1
+          ? `${clipIds[0]}.mp4`
+          : `kellyClipAi-clips-${project.id.slice(0, 8)}.zip`;
+      const url = includeOriginal
+        ? `${API_BASE}/api/projects/${project.id}/original/download`
+        : clipIds.length === 1
+          ? `${API_BASE}/api/projects/${project.id}/clips/${clipIds[0]}/download`
+          : `${API_BASE}/api/projects/${project.id}/clips/archive`;
+      const response = clipIds.length > 1 && !includeOriginal
+        ? await apiFetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clip_ids: clipIds }),
+        })
+        : await apiFetch(url);
       if (!response.ok) throw new Error(await responseError(response));
-      const url = URL.createObjectURL(await response.blob());
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `kellyClipAi-clips-${project.id.slice(0, 8)}.zip`;
-      link.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setNotice(`ZIP creado con ${selectedClips.length} clips reales.`);
+      triggerDownload(await response.blob(), filename);
+      setNotice(includeOriginal ? 'Video original descargado.' : clipIds.length > 1
+        ? `ZIP creado con ${clipIds.length} clips reales.`
+        : 'Clip descargado.');
     } catch (downloadError) {
-      setNotice(downloadError instanceof Error ? downloadError.message : 'No se pudo crear el ZIP.');
+      setNotice(downloadError instanceof Error ? downloadError.message : 'No se pudieron guardar los archivos.');
     } finally {
       setBusyAction('');
     }
@@ -1870,6 +1948,10 @@ function ResultsPage({
             {busyAction === 'archive' ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
             Descargar
           </button>
+          <button type="button" onClick={() => void saveProjectFiles(true, [])} disabled={busyAction === 'original'}>
+            {busyAction === 'original' ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
+            Guardar video original
+          </button>
           <button type="button" onClick={editSelected}><Scissors size={15} /> Editar clips</button>
         </div>
       </header>
@@ -1900,7 +1982,12 @@ function ResultsPage({
                   failed: 'No confirmado',
                 }[job.status] ?? job.status}</span>
                 {job.external_url && <a className="job-link" href={job.external_url} target="_blank" rel="noreferrer">Ver publicación</a>}
-                {job.download_url && <a className="job-link" href={`${API_BASE}${job.download_url}`} download>Descargar MP4</a>}
+                {job.download_url && <button className="job-link" type="button" onClick={() => void downloadWithAuth(
+                  `${API_BASE}${job.download_url}`,
+                  `${job.id}.mp4`,
+                ).catch((downloadError: unknown) => setNotice(
+                  downloadError instanceof Error ? downloadError.message : 'No se pudo descargar el video.',
+                ))}>Descargar MP4</button>}
                 {job.error && <p role="status">{job.error}</p>}
               </article>
             ))}
@@ -1953,7 +2040,9 @@ function ResultsPage({
               <div className="clip-score-actions">
                 <div className="clip-score"><strong>{clip.score.toFixed(1)}</strong><span>VIRALIDAD</span></div>
                 <div className="clip-actions">
-                  <a className="clip-action primary" href={`${API_BASE}${clip.download_url}`}><Download size={16} /> Descargar</a>
+                  <button type="button" className="clip-action primary" onClick={() => void saveProjectFiles(false, [clip.id])} disabled={busyAction === 'archive'}>
+                    {busyAction === 'archive' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />} Descargar
+                  </button>
                   <button type="button" className="clip-action" disabled={busyAction === 'publish'} onClick={() => void publishClips([clip.id])}><ArrowRight size={15} /> Publicar</button>
                   <button
                     type="button"

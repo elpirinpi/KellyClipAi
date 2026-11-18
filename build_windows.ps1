@@ -66,6 +66,14 @@ $signature = Get-AuthenticodeSignature -FilePath $webViewSetup
 if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
     throw 'No se pudo verificar la firma del instalador de WebView2 de Microsoft.'
 }
+foreach ($file in @(
+    (Join-Path $root 'backend\models\face_detection_yunet_2023mar.onnx'),
+    (Join-Path $root 'backend\models\LICENSE')
+)) {
+    if (-not (Test-Path $file)) {
+        throw "Falta un archivo requerido para el seguimiento facial: $file"
+    }
+}
 if (-not (Test-Path $gplLicense)) {
     Invoke-WebRequest `
         -Uri 'https://raw.githubusercontent.com/FFmpeg/FFmpeg/946fcce07b/COPYING.GPLv3' `
@@ -87,12 +95,15 @@ if (-not (Test-Path $gplLicense)) {
     --collect-all yt_dlp `
     --collect-all uvicorn `
     --collect-all webview `
+    --collect-all cv2 `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops.auto `
     --hidden-import uvicorn.protocols.http.auto `
     --hidden-import uvicorn.lifespan.on `
     --add-data "$(Join-Path $appDir 'dist');web" `
     --add-data "$(Join-Path $root '.env.example');config" `
+    --add-data "$(Join-Path $root 'backend\models\face_detection_yunet_2023mar.onnx');backend/models" `
+    --add-data "$(Join-Path $root 'backend\models\LICENSE');backend/models" `
     --add-binary "$(Join-Path $ffmpegBin 'ffmpeg.exe');bin" `
     --add-binary "$(Join-Path $ffmpegBin 'ffprobe.exe');bin" `
     (Join-Path $root 'desktop.py')

@@ -16,11 +16,19 @@ from fastapi.testclient import TestClient
 
 import backend.main as backend_main
 from backend import database
+from backend.face_tracking import (
+    FaceCropKeyframe,
+    _Face,
+    _SubjectTracker,
+    _crop_position,
+    analyze_face_crop_paths,
+)
 from backend.llm import LLMConfigurationError, _prompt, resolve_llm
 from backend.main import _validate_download_url, create_app as create_application
 from backend.media import (
     _caption_groups,
     _caption_max_chars,
+    _crop_coordinate_expression,
     _subtract_intervals,
     _write_ass,
     create_thumbnail,
@@ -216,6 +224,7 @@ def _create_completed_project_with_clip(
             "broll": False,
             "silence": False,
             "censor": False,
+            "face_tracking": True,
         },
         "moment": "",
         "whisper_model": "small",
@@ -315,6 +324,58 @@ def test_archive_and_public_share_serve_selected_real_clip(
         assert details.json()["title"] == "Clip real de prueba"
         assert file_response.status_code == 200
         assert file_response.content == clip_path.read_bytes()
+
+
+def test_original_and_selected_clips_can_be_saved_to_a_chosen_folder(
+    video_with_audio: Path, tmp_path: Path
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    destination = tmp_path / "chosen-folder"
+    destination.mkdir()
+    with TestClient(create_app(settings)) as client:
+        project_id, clip_id, clip_path = _create_completed_project_with_clip(
+            client, settings, video_with_audio
+        )
+        original = client.get(f"/api/projects/{project_id}/original/download")
+        saved = client.post(
+            f"/api/projects/{project_id}/downloads/save",
+            json={
+                "destination": str(destination),
+                "include_original": True,
+                "clip_ids": [clip_id],
+            },
+        )
+        repeated = client.post(
+            f"/api/projects/{project_id}/downloads/save",
+            json={
+                "destination": str(destination),
+                "include_original": True,
+                "clip_ids": [clip_id],
+            },
+        )
+        invalid_destination = client.post(
+            f"/api/projects/{project_id}/downloads/save",
+            json={"destination": str(tmp_path / "missing"), "clip_ids": [clip_id]},
+        )
+
+    assert original.status_code == 200
+    assert original.content == video_with_audio.read_bytes()
+    assert original.headers["content-disposition"].endswith('filename="source.mp4"')
+    assert saved.status_code == 200
+    assert (destination / "source.mp4").read_bytes() == video_with_audio.read_bytes()
+    assert (destination / f"{clip_id}.mp4").read_bytes() == clip_path.read_bytes()
+    assert repeated.status_code == 200
+    assert (destination / "source (2).mp4").read_bytes() == video_with_audio.read_bytes()
+    assert (destination / f"{clip_id} (2).mp4").read_bytes() == clip_path.read_bytes()
+    assert invalid_destination.status_code == 422
 
 
 def test_editor_draft_cors_preflight_allows_put(tmp_path: Path) -> None:
@@ -433,6 +494,7 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
             "broll": False,
             "silence": False,
             "censor": False,
+            "face_tracking": True,
         },
         "moment": "un momento concreto",
         "whisper_model": "small",
@@ -846,6 +908,90 @@ def test_broll_overlay_renders_with_a_real_local_video(
     assert metadata["width"] == 1280
     assert metadata["height"] == 720
     assert metadata["has_audio"] is True
+
+
+def test_yunet_analyzes_real_frames_without_inventing_faces(
+    video_with_audio: Path,
+) -> None:
+    tracks = analyze_face_crop_paths(
+        video_with_audio,
+        0,
+        [(0.0, 2.0)],
+        720,
+        1280,
+    )
+
+    assert tracks == [None]
+
+
+def test_face_tracker_keeps_subject_during_dropout_and_recenters_later() -> None:
+    tracker = _SubjectTracker(1920, 1080)
+    first = tracker.update([_Face(400, 300, 120, 120, 0.9)], 0.0, False)
+    moved = tracker.update([_Face(600, 300, 120, 120, 0.9)], 0.5, False)
+    held = tracker.update([], 1.0, False)
+    recentered = tracker.update([], 3.0, False)
+
+    assert first == (460.0, 360.0)
+    assert first[0] < moved[0] < 660
+    assert held == moved
+    assert abs(recentered[0] - 960) < abs(moved[0] - 960)
+
+
+def test_face_crop_positions_clamp_to_source_edges() -> None:
+    assert _crop_position((0, 540), 1920, 1080, 720, 1280) == (0.0, 0.0)
+    x, y = _crop_position((1920, 540), 1920, 1080, 720, 1280)
+
+    assert x == pytest.approx(1920 * (1280 / 1080) - 720)
+    assert y == 0
+
+
+def test_ffmpeg_accepts_a_smooth_dynamic_face_crop_expression(
+    tmp_path: Path,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg
+    points = [
+        FaceCropKeyframe(0.0, 0.0, 0.0),
+        FaceCropKeyframe(1.0, 240.0, 0.0),
+        FaceCropKeyframe(2.0, 480.0, 0.0),
+    ]
+    crop_filter = (
+        "scale=720:1280:force_original_aspect_ratio=increase,"
+        f"crop=720:1280:x='{_crop_coordinate_expression(points, 'x')}':y='0'"
+    )
+    output = tmp_path / "tracked.mp4"
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1920x1080:r=25:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-vf",
+            crop_filter,
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-y",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output.is_file()
+    assert probe_media(output, shutil.which("ffprobe") or "ffprobe")["width"] == 720
 
 
 def test_broll_processing_requires_the_selected_provider_key(

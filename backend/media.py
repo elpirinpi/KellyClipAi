@@ -7,6 +7,11 @@ import textwrap
 from pathlib import Path
 from typing import Callable
 
+from .face_tracking import (
+    FaceCropKeyframe,
+    FaceTrackingError,
+    analyze_face_crop_paths,
+)
 from .schemas import ClipProposal, ProjectConfig, TranscriptSegment, Word
 
 ProgressCallback = Callable[[float], None]
@@ -511,6 +516,32 @@ def _filter_time(value: float) -> str:
     return f"{max(0.0, value):.3f}"
 
 
+def _crop_coordinate_expression(
+    points: list[FaceCropKeyframe],
+    coordinate: str,
+) -> str:
+    if not points:
+        raise ValueError("El seguimiento facial no produjo posiciones de recorte.")
+    if coordinate not in {"x", "y"}:
+        raise ValueError(f"Coordenada de recorte no válida: {coordinate}.")
+
+    expression = f"{getattr(points[-1], coordinate):.3f}"
+    for current, following in reversed(list(zip(points, points[1:], strict=False))):
+        duration = following.time - current.time
+        if duration <= 0:
+            continue
+        start_value = getattr(current, coordinate)
+        end_value = getattr(following, coordinate)
+        interpolation = (
+            f"({start_value:.3f}+({end_value - start_value:.3f})"
+            f"*(t-{current.time:.3f})/{duration:.3f})"
+        )
+        expression = (
+            f"if(lt(t,{following.time:.3f}),{interpolation},{expression})"
+        )
+    return expression
+
+
 def _build_filter(
     intervals: list[tuple[float, float]],
     width: int,
@@ -520,16 +551,25 @@ def _build_filter(
     censor_ranges: list[tuple[float, float]],
     enhance_audio: bool = False,
     include_broll: bool = False,
+    crop_paths: list[list[FaceCropKeyframe] | None] | None = None,
 ) -> tuple[str, str, str]:
     parts: list[str] = []
     video_labels: list[str] = []
     audio_labels: list[str] = []
     for index, (start, end) in enumerate(intervals):
         video_label, audio_label = f"v{index}", f"a{index}"
+        crop_path = crop_paths[index] if crop_paths else None
+        crop_filter = (
+            f"crop={width}:{height}:"
+            f"x='{_crop_coordinate_expression(crop_path, 'x')}':"
+            f"y='{_crop_coordinate_expression(crop_path, 'y')}'"
+            if crop_path
+            else f"crop={width}:{height}"
+        )
         parts.append(
             f"[0:v]trim=start={_filter_time(start)}:end={_filter_time(end)},"
             f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},setsar=1[{video_label}]"
+            f"{crop_filter},setsar=1[{video_label}]"
         )
         parts.append(
             f"[0:a]atrim=start={_filter_time(start)}:end={_filter_time(end)},"
@@ -622,6 +662,18 @@ def _render_clip(
         output_resolution,
     )
     width, height = _ratio_size(config.ratio, output_resolution)
+    crop_paths = None
+    if config.options.face_tracking:
+        try:
+            crop_paths = analyze_face_crop_paths(
+                input_path,
+                proposal.inicio,
+                intervals,
+                width,
+                height,
+            )
+        except FaceTrackingError as error:
+            raise MediaProcessingError(str(error)) from error
     filter_graph, video_output, audio_output = _build_filter(
         intervals,
         width,
@@ -631,6 +683,7 @@ def _render_clip(
         censor_ranges,
         enhance_audio,
         broll_path is not None,
+        crop_paths,
     )
     arguments = [
         ffmpeg_path,
