@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -499,3 +500,166 @@ def test_publish_endpoint_enqueues_jobs_instead_of_publishing_inline(
     assert len(result["jobs"]) == 1
     assert result["jobs"][0]["status"] == "scheduled"
     assert len(jobs) == 1
+
+
+def test_delete_project_removes_media_schedules_and_share_links(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    database.initialize(settings.database_path)
+    project_id = "delete-project"
+    config = ProjectConfig()
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Project to delete",
+        tmp_path / "source.mp4",
+        config.model_dump(mode="json"),
+        "test-user",
+    )
+    project_dir = settings.data_dir / "projects" / project_id
+    (project_dir / "clips").mkdir(parents=True)
+    (project_dir / "source").write_bytes(b"source video")
+    (project_dir / "clips" / "clip-id.mp4").write_bytes(b"rendered clip")
+    database.update_project(
+        settings.database_path,
+        project_id,
+        status="completed",
+        clips=[
+            {
+                "id": "clip-id",
+                "filename": "clip-id.mp4",
+                "status": "ready",
+            }
+        ],
+    )
+    database.create_or_get_clip_share(
+        settings.database_path, project_id, "clip-id", "share-token"
+    )
+    scheduled_jobs = database.enqueue_schedule_jobs(
+        settings.database_path,
+        project_id,
+        ["clip-id"],
+        "youtube",
+        "2099-01-01T00:00:00+00:00",
+        "private",
+    )
+    export_path = settings.data_dir / "exports" / f"{scheduled_jobs[0]['id']}.mp4"
+    export_path.parent.mkdir(parents=True)
+    export_path.write_bytes(b"exported clip")
+    assert database.claim_schedule_job(
+        settings.database_path, scheduled_jobs[0]["id"]
+    )
+    database.finish_schedule_job(
+        settings.database_path,
+        scheduled_jobs[0]["id"],
+        "exported",
+        output_path=str(export_path),
+    )
+
+    async def idle_schedule_worker(_settings: AppSettings) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_module, "schedule_worker", idle_schedule_worker)
+    with TestClient(main_module.create_app(settings, auth_required=False)) as client:
+        storage_before = client.get("/api/storage").json()["used_bytes"]
+        response = client.delete(f"/api/projects/{project_id}")
+        storage_after = client.get("/api/storage").json()["used_bytes"]
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True}
+    assert database.get_project(settings.database_path, project_id) is None
+    assert database.get_clip_share(settings.database_path, "share-token") is None
+    assert database.list_schedule_jobs(
+        settings.database_path, owner_id="test-user"
+    ) == []
+    assert not project_dir.exists()
+    assert not export_path.exists()
+    assert storage_before >= len(b"source video") + len(b"rendered clip")
+    assert storage_after == 0
+    assert database.events_after(settings.database_path, project_id, 0) == []
+
+
+def test_startup_removes_expired_staging_files_and_rows(
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    database.initialize(settings.database_path)
+    staged_id = "expired-staging-id"
+    database.create_staged_media(
+        settings.database_path,
+        staged_id,
+        "upload",
+        "failed",
+        f"{staged_id}.source",
+        owner_id="test-user",
+    )
+    old_timestamp = time.time() - 48 * 60 * 60
+    with database.connection(settings.database_path) as connection:
+        connection.execute(
+            "UPDATE staged_media SET updated_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", staged_id),
+        )
+    staged_path = settings.data_dir / "staging" / f"{staged_id}.source"
+    staged_path.parent.mkdir(parents=True)
+    staged_path.write_bytes(b"expired")
+    os.utime(staged_path, (old_timestamp, old_timestamp))
+
+    with TestClient(main_module.create_app(settings, auth_required=False)):
+        pass
+
+    assert database.get_staged_media(
+        settings.database_path, staged_id, "test-user"
+    ) is None
+    assert not staged_path.exists()
+
+
+def test_delete_project_rejects_active_processing(
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    database.initialize(settings.database_path)
+    project_id = "active-delete-project"
+    config = ProjectConfig()
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Processing project",
+        tmp_path / "source.mp4",
+        config.model_dump(mode="json"),
+        "test-user",
+    )
+
+    with TestClient(main_module.create_app(settings, auth_required=False)) as client:
+        database.update_project(
+            settings.database_path, project_id, status="processing"
+        )
+        response = client.delete(f"/api/projects/{project_id}")
+
+    assert response.status_code == 409
+    assert database.get_project(settings.database_path, project_id) is not None

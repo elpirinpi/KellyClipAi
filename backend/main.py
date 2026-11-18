@@ -106,6 +106,7 @@ _VIDEO_SUFFIXES = {".3gp", ".avi", ".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav"}
 _STAGED_SUFFIXES = _VIDEO_SUFFIXES | _AUDIO_SUFFIXES
 _STAGED_WRITE_SIZE = 1024 * 1024
+_STAGING_MAX_AGE = timedelta(hours=24)
 logger = logging.getLogger(__name__)
 
 
@@ -321,6 +322,84 @@ def _serialize_staged_media(staged: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _remove_staging_artifacts(settings: AppSettings, staged_ids: list[str]) -> None:
+    staging_root = (settings.data_dir / "staging").resolve()
+    for staged_id in staged_ids:
+        for candidate in (
+            staging_root / staged_id,
+            staging_root / f"{staged_id}.source",
+        ):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            if candidate.is_symlink():
+                candidate.unlink()
+                continue
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(staging_root):
+                logger.warning("Se omitió una ruta de staging fuera de la carpeta local.")
+                continue
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink()
+
+
+def _cleanup_expired_staging(settings: AppSettings) -> None:
+    cutoff = datetime.now(UTC) - _STAGING_MAX_AGE
+    expired_ids = database.cleanup_expired_staged_media(
+        settings.database_path, cutoff.isoformat()
+    )
+    staging_root = settings.data_dir / "staging"
+    try:
+        _remove_staging_artifacts(settings, expired_ids)
+        if not staging_root.is_dir():
+            return
+        for entry in staging_root.iterdir():
+            try:
+                if entry.is_symlink():
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff.timestamp():
+                        entry.unlink()
+                    continue
+                if entry.is_dir():
+                    file_times = [
+                        path.stat().st_mtime
+                        for path in entry.rglob("*")
+                        if path.is_file() and not path.is_symlink()
+                    ]
+                    newest = max(file_times, default=entry.stat().st_mtime)
+                    if newest < cutoff.timestamp():
+                        shutil.rmtree(entry)
+                elif entry.is_file() and entry.stat().st_mtime < cutoff.timestamp():
+                    entry.unlink()
+            except OSError:
+                logger.exception("No se pudo limpiar el archivo de staging %s", entry)
+    except OSError:
+        logger.exception("No se pudo limpiar staging caducado")
+
+
+def _local_storage_bytes(settings: AppSettings) -> int:
+    total = 0
+    for root in (
+        settings.data_dir / "projects",
+        settings.data_dir / "staging",
+        settings.data_dir / "exports",
+    ):
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError as error:
+                logger.exception("No se pudo consultar el tamaño de %s", path)
+                raise HTTPException(
+                    status_code=500,
+                    detail="No se pudo calcular el almacenamiento local.",
+                ) from error
+    return total
+
+
 def create_app(
     settings: AppSettings | None = None,
     web_dir: Path | None = None,
@@ -347,6 +426,7 @@ def create_app(
         database.initialize(app_settings.database_path)
         database.fail_interrupted_projects(app_settings.database_path)
         database.fail_interrupted_staged_media(app_settings.database_path)
+        _cleanup_expired_staging(app_settings)
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
         processing_queue = ProjectProcessingQueue(
             app_settings.processing_concurrency,
@@ -854,6 +934,10 @@ def create_app(
             )
         ]
 
+    @application.get("/api/storage")
+    def storage_usage() -> dict[str, int]:
+        return {"used_bytes": _local_storage_bytes(app_settings)}
+
     @application.get("/api/staged-media/latest")
     def latest_staged_media(
         source: Literal["upload", "url"],
@@ -1183,6 +1267,63 @@ def create_app(
         if project is None:
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         return _serialize_project(project, include_transcript=True)
+
+    @application.delete("/api/projects/{project_id}")
+    def delete_project_route(project_id: str, request: Request) -> dict[str, bool]:
+        owner_id = request_user_id(request)
+        project = database.get_project(
+            app_settings.database_path, project_id, owner_id
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409,
+                detail="No se puede eliminar un proyecto mientras se procesa.",
+            )
+        jobs = database.list_schedule_jobs(
+            app_settings.database_path, project_id, owner_id
+        )
+        if any(job["status"] == "processing" for job in jobs):
+            raise HTTPException(
+                status_code=409,
+                detail="Espera a que termine la publicación antes de eliminar el proyecto.",
+            )
+        project_root = (app_settings.data_dir / "projects").resolve()
+        project_path = project_root / project_id
+        if not project_path.resolve().is_relative_to(project_root):
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        staged_ids = database.delete_project(
+            app_settings.database_path, project_id, owner_id
+        )
+        if staged_ids is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        try:
+            if project_path.is_symlink():
+                project_path.unlink()
+            elif project_path.is_dir():
+                shutil.rmtree(project_path)
+            export_root = (app_settings.data_dir / "exports").resolve()
+            for job in jobs:
+                if not job.get("output_path"):
+                    continue
+                export_path = Path(job["output_path"]).resolve()
+                if (
+                    export_path.is_relative_to(export_root)
+                    and export_path.is_file()
+                ):
+                    export_path.unlink()
+            _remove_staging_artifacts(app_settings, staged_ids)
+        except OSError as error:
+            logger.exception(
+                "No se pudieron eliminar todos los archivos del proyecto %s",
+                project_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="El proyecto se eliminó de la base de datos, pero no se pudieron limpiar todos sus archivos.",
+            ) from error
+        return {"deleted": True}
 
     @application.get("/api/projects/{project_id}/thumbnail")
     def get_thumbnail(project_id: str) -> FileResponse:

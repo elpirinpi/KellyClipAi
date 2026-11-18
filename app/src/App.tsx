@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, ty
 import {
   AlertCircle, ArrowLeft, ArrowRight, AudioLines, CalendarDays, Check, ChevronDown,
   ChevronLeft, ChevronRight, Circle, CloudUpload, Download, FileVideo2, Link2, LoaderCircle,
-  LockKeyhole, LogOut, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Video, WandSparkles, X,
+  LockKeyhole, LogOut, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Trash2, Video, WandSparkles, X,
 } from 'lucide-react';
 import { accessToken, apiFetch, getSupabase, initializeSupabase, signOut, streamApiEvents, syncMediaCookie } from './auth';
 import type { Session } from '@supabase/supabase-js';
@@ -1379,6 +1379,7 @@ function App() {
               error={projectError}
               onRetry={() => void retryProject()}
               onProjectUpdated={refreshProject}
+              onProjectDeleted={() => navigate('/')}
               onEdit={(clipId) => navigate(`/p/${projectRouteId}/edit/${clipId}`)}
             />
       ) : (
@@ -1710,12 +1711,14 @@ function ResultsPage({
   onRetry,
   onEdit,
   onProjectUpdated,
+  onProjectDeleted,
 }: {
   project: ProjectResult | null;
   error: string;
   onRetry: () => void;
   onEdit: (clipId: string) => void;
   onProjectUpdated: (projectId: string) => Promise<void>;
+  onProjectDeleted: () => void;
 }) {
   const [sort, setSort] = useState<'score' | 'time'>('score');
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -1727,6 +1730,8 @@ function ResultsPage({
   const [publishVisibility, setPublishVisibility] = useState('private');
   const [scheduleJobs, setScheduleJobs] = useState<ScheduleJob[]>([]);
   const [scheduleError, setScheduleError] = useState('');
+  const [storageUsedBytes, setStorageUsedBytes] = useState<number | null>(null);
+  const [storageError, setStorageError] = useState('');
   const players = useRef<Record<string, HTMLVideoElement | null>>({});
   const clips = useMemo(() => {
     const allClips = [...(project?.clips ?? [])];
@@ -1788,6 +1793,34 @@ function ResultsPage({
   };
   const publishSelected = () => void publishClips(selectedClips.map((clip) => clip.id));
 
+  const refreshStorageUsage = useCallback(async () => {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/storage`);
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { used_bytes: number };
+      setStorageUsedBytes(result.used_bytes);
+      setStorageError('');
+    } catch (error) {
+      setStorageError(error instanceof Error ? error.message : 'No se pudo consultar el almacenamiento.');
+    }
+  }, []);
+
+  const deleteProject = async () => {
+    if (!project || !window.confirm(
+      `¿Eliminar “${project.title}” y todos sus archivos, clips, publicaciones programadas y enlaces compartidos? Esta acción no se puede deshacer.`,
+    )) return;
+    setBusyAction('delete-project');
+    setNotice('');
+    try {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await responseError(response));
+      onProjectDeleted();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo eliminar el proyecto.');
+      setBusyAction('');
+    }
+  };
+
   const retryFailedClips = async () => {
     if (!project || !failedClips.length) return;
     setBusyAction('retry-clips');
@@ -1822,6 +1855,10 @@ function ResultsPage({
     setScheduleJobs([]);
     if (project?.status === 'completed') void refreshScheduleJobs();
   }, [project?.id, project?.status, refreshScheduleJobs]);
+
+  useEffect(() => {
+    void refreshStorageUsage();
+  }, [refreshStorageUsage]);
 
   useEffect(() => {
     if (!scheduleJobs.some((job) => job.status === 'scheduled' || job.status === 'processing')) return;
@@ -1985,11 +2022,18 @@ function ResultsPage({
             Guardar video original
           </button>
           <button type="button" onClick={editSelected}><Scissors size={15} /> Editar clips</button>
+          <button type="button" className="delete-project-button" onClick={() => void deleteProject()} disabled={busyAction === 'delete-project'}>
+            {busyAction === 'delete-project' ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}
+            Eliminar proyecto
+          </button>
         </div>
       </header>
       <div className="clips-heading">
         <div><span className="clips-version">V1</span><strong>CLIPS IA</strong></div>
         <span className="clips-count">{clips.length} clips</span>
+        <span className="storage-usage" role="status">
+          Almacenamiento local: {storageUsedBytes === null ? (storageError || 'calculando…') : formatBytes(storageUsedBytes)}
+        </span>
         <label className="sort-control"><span>Ordenar:</span><select value={sort} onChange={(event) => setSort(event.target.value as 'score' | 'time')}><option value="score">Mayor puntuación</option><option value="time">Cronológico</option></select></label>
       </div>
       {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}

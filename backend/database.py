@@ -624,6 +624,51 @@ def update_project(database_path: Path, project_id: str, **values: Any) -> None:
         )
 
 
+def delete_project(
+    database_path: Path,
+    project_id: str,
+    owner_id: str | None = None,
+) -> list[str] | None:
+    with _lock, connection(database_path) as conn:
+        query = "SELECT id FROM projects WHERE id = ?"
+        parameters: tuple[Any, ...] = (project_id,)
+        if owner_id is not None:
+            query += " AND owner_id = ?"
+            parameters += (owner_id,)
+        if conn.execute(query, parameters).fetchone() is None:
+            return None
+        staged_ids = [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM staged_media WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        ]
+        conn.execute("DELETE FROM scheduled_jobs WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM clip_shares WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM staged_media WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return staged_ids
+
+
+def cleanup_expired_staged_media(
+    database_path: Path,
+    cutoff: str,
+) -> list[str]:
+    with _lock, connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM staged_media WHERE updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        staged_ids = [str(row["id"]) for row in rows]
+        if staged_ids:
+            conn.executemany(
+                "DELETE FROM staged_media WHERE id = ?",
+                [(staged_id,) for staged_id in staged_ids],
+            )
+    return staged_ids
+
+
 def queue_project(
     database_path: Path,
     project_id: str,
