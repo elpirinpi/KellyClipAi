@@ -76,7 +76,7 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.3.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.0.4.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador requiere internet para instalar
 WebView2 si hace falta; el modelo Whisper `small` se descarga la primera vez
@@ -90,6 +90,17 @@ descargas por URL también muestran bytes, velocidad y ETA informados por
 yt-dlp. La desinstalación no borra esos archivos.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
+
+## Actualizaciones automáticas
+
+La app instalada comprueba al iniciar sesión y cada seis horas si existe una
+versión estable nueva en los releases oficiales de GitHub. Si hay una
+actualización, descarga el instalador en segundo plano y verifica su SHA-256
+antes de ofrecer **Instalar actualización**. La instalación abre el asistente
+oficial de Windows y requiere confirmación; cerrar y volver a abrir la app
+aplica la versión nueva. El proceso de actualización no elimina `.env`,
+proyectos ni videos, que se guardan fuera de la carpeta de instalación. El
+modo de desarrollo no descarga ni instala actualizaciones.
 
 Para generar el instalador desde el código fuente, instala Python 3.13,
 Node.js 22 e Inno Setup 6, y ejecuta desde PowerShell:

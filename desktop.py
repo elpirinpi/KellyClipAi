@@ -94,12 +94,19 @@ def main(smoke_test: bool = False) -> None:
 
     from backend.main import create_app
     from backend.settings import get_settings
+    from backend.updater import UpdateManager
+    from backend.version import APP_VERSION
     import uvicorn
     import webview
 
+    updater = UpdateManager(
+        APP_VERSION,
+        user_dir,
+        Path(sys.executable) if getattr(sys, "frozen", False) else None,
+    )
     server = uvicorn.Server(
         uvicorn.Config(
-            create_app(get_settings(), web_dir=web_dir),
+            create_app(get_settings(), web_dir=web_dir, updater=updater),
             host="127.0.0.1",
             port=8000,
             log_level="warning",

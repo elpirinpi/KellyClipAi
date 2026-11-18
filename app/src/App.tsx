@@ -38,6 +38,15 @@ type StagedMedia = {
   project_id: string | null;
 };
 type Template = { name: string; tone: string; sample: string; featured?: boolean; base_template?: string };
+type UpdateStatus = {
+  enabled: boolean;
+  current_version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  state: 'idle' | 'unavailable' | 'checking' | 'current' | 'available' | 'downloading' | 'downloaded' | 'installer_opened' | 'error';
+  progress: number;
+  error: string | null;
+};
 type ClipWord = { start: number; end: number; preview_start: number; preview_end: number; text: string };
 type EditablePhrase = {
   id: string;
@@ -459,6 +468,7 @@ function App() {
   const [schedulePlatform, setSchedulePlatform] = useState('youtube');
   const [scheduleVisibility, setScheduleVisibility] = useState('private');
   const [notice, setNotice] = useState('');
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [settingsProvider, setSettingsProvider] = useState('Groq');
   const [whisperModel, setWhisperModel] = useState('small');
   const [linkProject, setLinkProject] = useState<ProjectResult | null>(null);
@@ -530,6 +540,73 @@ function App() {
       unsubscribe?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (!authReady || !authSession) return;
+    let active = true;
+    const checkForUpdates = async () => {
+      try {
+        const response = await apiFetch(`${API_BASE}/api/updates/check`, { method: 'POST' });
+        if (!response.ok) throw new Error(await responseError(response));
+        let status = await response.json() as UpdateStatus;
+        if (status.state === 'available') {
+          const downloadResponse = await apiFetch(`${API_BASE}/api/updates/download`, { method: 'POST' });
+          if (!downloadResponse.ok) throw new Error(await responseError(downloadResponse));
+          status = await downloadResponse.json() as UpdateStatus;
+        }
+        if (active) setUpdateStatus(status);
+      } catch {
+        if (active) {
+          setUpdateStatus((current) => current ?? {
+            enabled: true,
+            current_version: '',
+            latest_version: null,
+            update_available: false,
+            state: 'error',
+            progress: 0,
+            error: 'No se pudo comprobar si hay actualizaciones.',
+          });
+        }
+      }
+    };
+    void checkForUpdates();
+    const interval = window.setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [authReady, currentUserId]);
+
+  useEffect(() => {
+    if (!authSession || !updateStatus || !['checking', 'downloading'].includes(updateStatus.state)) return;
+    let active = true;
+    const refresh = async () => {
+      try {
+        const response = await apiFetch(`${API_BASE}/api/updates`);
+        if (!response.ok) throw new Error(await responseError(response));
+        let status = await response.json() as UpdateStatus;
+        if (status.state === 'available') {
+          const downloadResponse = await apiFetch(`${API_BASE}/api/updates/download`, { method: 'POST' });
+          if (!downloadResponse.ok) throw new Error(await responseError(downloadResponse));
+          status = await downloadResponse.json() as UpdateStatus;
+        }
+        if (active) setUpdateStatus(status);
+      } catch {
+        if (active) {
+          setUpdateStatus((current) => current ? {
+            ...current,
+            state: 'error',
+            error: 'Se perdió la conexión mientras se consultaba la actualización.',
+          } : current);
+        }
+      }
+    };
+    const interval = window.setInterval(() => void refresh(), 1200);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [authSession, updateStatus?.state]);
 
   const navigate = useCallback((next: string) => {
     window.history.pushState(null, '', next);
@@ -1114,6 +1191,37 @@ function App() {
     }
   };
 
+  const downloadUpdate = async () => {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/updates/download`, { method: 'POST' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setUpdateStatus(await response.json() as UpdateStatus);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo iniciar la descarga de la actualización.');
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!window.confirm('Se abrirá el instalador oficial de kellyClipAi. Guarda tu trabajo antes de continuar.')) return;
+    try {
+      const response = await apiFetch(`${API_BASE}/api/updates/install`, { method: 'POST' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setUpdateStatus((current) => current ? { ...current, state: 'installer_opened' } : current);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo abrir el instalador.');
+    }
+  };
+
+  const checkForUpdates = async () => {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/updates/check`, { method: 'POST' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setUpdateStatus(await response.json() as UpdateStatus);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo comprobar si hay actualizaciones.');
+    }
+  };
+
   if (!shareToken && !authReady) {
     return <main className="auth-page"><p role="status">Conectando con el servicio de autenticación…</p></main>;
   }
@@ -1142,6 +1250,48 @@ function App() {
           <LogOut size={17} /><span>Cerrar sesión</span>
         </button>}
       </header>
+
+      {updateStatus?.enabled && (updateStatus.update_available || updateStatus.state === 'error') && (
+        <aside className="update-banner" aria-live="polite">
+          <div className="update-copy">
+            <strong>
+              {updateStatus.state === 'checking'
+                ? 'Buscando actualizaciones…'
+                : updateStatus.state === 'downloading'
+                  ? `Descargando kellyClipAi ${updateStatus.latest_version}… ${updateStatus.progress}%`
+                  : updateStatus.state === 'downloaded'
+                    ? `kellyClipAi ${updateStatus.latest_version} está lista para instalar`
+                    : updateStatus.state === 'installer_opened'
+                      ? 'Sigue los pasos del instalador para actualizar kellyClipAi'
+                      : updateStatus.state === 'error'
+                        ? updateStatus.error
+                        : `Nueva versión ${updateStatus.latest_version} disponible`}
+            </strong>
+            {updateStatus.state === 'downloading' && (
+              <span className="update-progress"><span style={{ width: `${updateStatus.progress}%` }} /></span>
+            )}
+          </div>
+          {updateStatus.state === 'available' && <span>La descarga comenzará automáticamente.</span>}
+          {updateStatus.state === 'downloaded' && (
+            <button type="button" className="subtle-button" onClick={() => void installUpdate()}>
+              <Download size={15} /> Instalar actualización
+            </button>
+          )}
+          {updateStatus.state === 'installer_opened' && (
+            <button type="button" className="subtle-button" onClick={() => void installUpdate()}>
+              <Download size={15} /> Abrir instalador de nuevo
+            </button>
+          )}
+          {updateStatus.state === 'error' && (
+            <button type="button" className="subtle-button" onClick={() => {
+              if (updateStatus.update_available) void downloadUpdate();
+              else void checkForUpdates();
+            }}>
+              Reintentar
+            </button>
+          )}
+        </aside>
+      )}
 
       {shareToken ? (
         <SharedClipPage token={shareToken} />

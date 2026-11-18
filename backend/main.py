@@ -78,6 +78,8 @@ from .schemas import (
     ZoomImportRequest,
 )
 from .settings import AppSettings, get_settings
+from .updater import UpdateError, UpdateManager
+from .version import APP_VERSION
 
 _ALLOWED_DOWNLOAD_HOSTS = {
     "youtube.com",
@@ -305,6 +307,7 @@ def create_app(
     *,
     auth_required: bool = True,
     auth_verifier: Any | None = None,
+    updater: UpdateManager | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
     verifier = auth_verifier
@@ -336,11 +339,12 @@ def create_app(
             if isinstance(verifier, SupabaseAuthVerifier):
                 await verifier.close()
 
-    application = FastAPI(title="kellyClipAi API", version="1.0.3", lifespan=lifespan)
+    application = FastAPI(title="kellyClipAi API", version=APP_VERSION, lifespan=lifespan)
     application.state.settings = app_settings
     application.state.auth_required = auth_required
     application.state.auth_verifier = verifier
     application.state.claimed_legacy_users = set()
+    application.state.updater = updater
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(app_settings.cors_origins),
@@ -459,6 +463,54 @@ def create_app(
     @application.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    def update_status() -> dict[str, Any]:
+        if application.state.updater is None:
+            return {
+                "enabled": False,
+                "current_version": APP_VERSION,
+                "latest_version": None,
+                "update_available": False,
+                "state": "unavailable",
+                "progress": 0,
+                "error": None,
+            }
+        return application.state.updater.status()
+
+    @application.get("/api/updates")
+    def get_update_status() -> dict[str, Any]:
+        return update_status()
+
+    @application.post("/api/updates/check")
+    def check_for_updates() -> dict[str, Any]:
+        if application.state.updater is None:
+            return update_status()
+        return application.state.updater.start_check()
+
+    @application.post("/api/updates/download")
+    def download_update() -> dict[str, Any]:
+        if application.state.updater is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Las actualizaciones están disponibles solo en la app instalada.",
+            )
+        try:
+            return application.state.updater.start_download()
+        except UpdateError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @application.post("/api/updates/install")
+    def install_update() -> dict[str, str]:
+        if application.state.updater is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Las actualizaciones están disponibles solo en la app instalada.",
+            )
+        try:
+            application.state.updater.open_installer()
+        except UpdateError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"status": "installer_opened"}
 
     @application.get("/api/auth/config")
     def auth_config() -> dict[str, str | bool]:

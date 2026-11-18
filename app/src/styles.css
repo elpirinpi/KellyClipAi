@@ -69,6 +69,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .auth-switch { display: block; margin: 18px auto 0; border: 0; background: transparent; color: #7354dc; font-size: 12px; cursor: pointer; }
 .auth-page > .developer-credit { width: calc(100% + 32px); margin-top: 24px; }
 .topbar { height: 56px; padding: 0 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #f6f6f8; background: #fff; }
+.update-banner { width: min(1200px, calc(100% - 32px)); margin: 14px auto 0; padding: 12px 14px; border: 1px solid #ded5fa; border-radius: 10px; background: #fbfaff; color: #4c3b86; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.update-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 7px; font-size: 12px; }
+.update-copy strong { font-weight: 600; }
+.update-progress { height: 5px; overflow: hidden; border-radius: 8px; background: #e8e3f7; }
+.update-progress span { display: block; height: 100%; border-radius: inherit; background: #7c5cff; transition: width .2s ease; }
 .brand { padding: 0; border: 0; background: transparent; display: inline-flex; align-items: center; gap: 9px; cursor: pointer; color: var(--text-main); }
 .brand-mark { width: 34px; height: 34px; border-radius: 10px; background: #f0eaff; display: flex; align-items: center; justify-content: center; gap: 2px; transform: rotate(-8deg); }
 .brand-mark span { display: block; width: 4px; border-radius: 4px; background: #7c5cff; transform: skew(-14deg); }
