@@ -10,6 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .credential_store import (
+    decrypt_oauth_token,
+    encrypt_oauth_token,
+    is_oauth_token_encrypted,
+)
+
 _lock = threading.RLock()
 _JSON_COLUMNS = {"config", "metadata", "transcript", "clips"}
 _PROJECT_COLUMNS = {
@@ -213,6 +219,7 @@ def initialize(database_path: Path) -> None:
             "SELECT 'legacy', provider, account_id, display_name, access_token, refresh_token, "
             "expires_at, metadata_json, updated_at FROM connected_accounts_legacy",
         )
+        _migrate_oauth_tokens(conn)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS projects_owner_created "
             "ON projects(owner_id, created_at DESC)"
@@ -239,6 +246,40 @@ def _migrate_owned_table(
     conn.execute(create_sql)
     conn.execute(copy_sql)
     conn.execute(f"DROP TABLE {legacy_name}")
+
+
+def _migrate_oauth_tokens(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT owner_id, provider, access_token, refresh_token, metadata_json
+        FROM connected_accounts
+        """
+    ).fetchall()
+    for row in rows:
+        access_token = row["access_token"]
+        refresh_token = row["refresh_token"]
+        metadata = json.loads(row["metadata_json"])
+        user_access_token = metadata.get("user_access_token")
+        if not is_oauth_token_encrypted(access_token):
+            access_token = encrypt_oauth_token(access_token)
+        if refresh_token and not is_oauth_token_encrypted(refresh_token):
+            refresh_token = encrypt_oauth_token(refresh_token)
+        if user_access_token and not is_oauth_token_encrypted(user_access_token):
+            metadata["user_access_token"] = encrypt_oauth_token(user_access_token)
+        conn.execute(
+            """
+            UPDATE connected_accounts
+            SET access_token = ?, refresh_token = ?, metadata_json = ?
+            WHERE owner_id = ? AND provider = ?
+            """,
+            (
+                access_token,
+                refresh_token,
+                json.dumps(metadata, ensure_ascii=False),
+                row["owner_id"],
+                row["provider"],
+            ),
+        )
 
 
 def claim_legacy_data(database_path: Path, owner_id: str) -> None:
@@ -801,10 +842,24 @@ def save_connected_account(
                 provider,
                 account_id,
                 display_name,
-                access_token,
-                refresh_token,
+                encrypt_oauth_token(access_token),
+                encrypt_oauth_token(refresh_token) if refresh_token else None,
                 expires_at,
-                json.dumps(metadata, ensure_ascii=False),
+                json.dumps(
+                    {
+                        **metadata,
+                        **(
+                            {
+                                "user_access_token": encrypt_oauth_token(
+                                    str(metadata["user_access_token"])
+                                )
+                            }
+                            if metadata.get("user_access_token")
+                            else {}
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
                 utc_now(),
             ),
         )
@@ -824,6 +879,13 @@ def get_connected_account(
         return None
     result = dict(row)
     result["metadata"] = json.loads(result.pop("metadata_json"))
+    result["access_token"] = decrypt_oauth_token(result["access_token"])
+    result["refresh_token"] = decrypt_oauth_token(result["refresh_token"])
+    user_access_token = result["metadata"].get("user_access_token")
+    if user_access_token:
+        result["metadata"]["user_access_token"] = decrypt_oauth_token(
+            user_access_token
+        )
     return result
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import os
 from ctypes import (
@@ -23,6 +24,8 @@ class _DataBlob(Structure):
 
 
 _ENTROPY = b"kellyClipAi:llm-api-key:v1"
+_OAUTH_ENTROPY = b"kellyClipAi:oauth-token:v1"
+_OAUTH_TOKEN_PREFIX = "dpapi:v1:"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
@@ -39,10 +42,10 @@ def _blob(data: bytes):
     return _DataBlob(len(data), cast(buffer, POINTER(c_ubyte))), buffer
 
 
-def _protect(data: bytes, decrypt: bool) -> bytes:
+def _protect(data: bytes, decrypt: bool, entropy: bytes = _ENTROPY) -> bytes:
     crypt32, kernel32 = _windows_api()
     input_blob, input_buffer = _blob(data)
-    entropy_blob, entropy_buffer = _blob(_ENTROPY)
+    entropy_blob, entropy_buffer = _blob(entropy)
     output_blob = _DataBlob()
     function = (
         crypt32.CryptUnprotectData
@@ -114,4 +117,35 @@ def decrypt_api_key(ciphertext: bytes) -> str:
     except UnicodeDecodeError as error:
         raise CredentialStoreError(
             "La clave guardada no se pudo recuperar. Vuelve a introducirla."
+        ) from error
+
+
+def is_oauth_token_encrypted(token: str) -> bool:
+    return token.startswith(_OAUTH_TOKEN_PREFIX)
+
+
+def encrypt_oauth_token(token: str) -> str:
+    if not token:
+        raise CredentialStoreError("El token OAuth no puede estar vacío.")
+    if is_oauth_token_encrypted(token):
+        return token
+    ciphertext = _protect(token.encode("utf-8"), decrypt=False, entropy=_OAUTH_ENTROPY)
+    encoded = base64.urlsafe_b64encode(ciphertext).decode("ascii")
+    return f"{_OAUTH_TOKEN_PREFIX}{encoded}"
+
+
+def decrypt_oauth_token(token: str | None) -> str | None:
+    if token is None:
+        return None
+    if not is_oauth_token_encrypted(token):
+        raise CredentialStoreError(
+            "Se encontró un token OAuth sin cifrar. Reinicia la aplicación para migrarlo."
+        )
+    encoded = token.removeprefix(_OAUTH_TOKEN_PREFIX)
+    try:
+        ciphertext = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        return _protect(ciphertext, decrypt=True, entropy=_OAUTH_ENTROPY).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as error:
+        raise CredentialStoreError(
+            "El token OAuth guardado no se pudo recuperar. Vuelve a conectar la cuenta."
         ) from error
