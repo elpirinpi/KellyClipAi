@@ -1759,7 +1759,17 @@ function ResultsPage({
         published: Array<{ clip_id: string; external_id: string; url: string }>;
         failed: { clip_id: string; error: string } | null;
         not_attempted: string[];
+        jobs?: ScheduleJob[];
       };
+      if (result.jobs) {
+        const queuedJobs = result.jobs;
+        setScheduleJobs((current) => [
+          ...current.filter((job) => !queuedJobs.some((queued) => queued.id === job.id)),
+          ...queuedJobs,
+        ]);
+        setNotice(`${queuedJobs.length} clip(s) añadidos a la cola real de publicación.`);
+        return;
+      }
       const publishedMessage = result.published.length
         ? `${result.published.length} clip(s) confirmados por ${publishPlatform}.`
         : '';

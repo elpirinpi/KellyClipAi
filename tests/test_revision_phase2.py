@@ -418,3 +418,84 @@ def test_retry_failed_clips_api_uses_queue_without_an_llm_key(
     assert failed_clip["status"] == "failed"
     assert failed_clip["video_url"] is None
     assert failed_clip["download_url"] is None
+
+
+def test_publish_endpoint_enqueues_jobs_instead_of_publishing_inline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+        youtube_client_id="test-client",
+        youtube_client_secret="test-secret",
+    )
+    database.initialize(settings.database_path)
+    project_id = "publish-queue-project"
+    config = ProjectConfig()
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Ready clip",
+        tmp_path / "source.mp4",
+        config.model_dump(mode="json"),
+        "test-user",
+    )
+    clip_path = settings.data_dir / "projects" / project_id / "clips" / "ready-clip-id.mp4"
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_bytes(b"ready clip")
+    database.update_project(
+        settings.database_path,
+        project_id,
+        status="completed",
+        clips=[
+            {
+                "id": "ready-clip-id",
+                "title": "Ready clip",
+                "filename": "ready-clip-id.mp4",
+                "status": "ready",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        database,
+        "get_connected_account",
+        lambda *_args: {"access_token": "available"},
+    )
+    monkeypatch.setattr(
+        main_module,
+        "publish_clip",
+        lambda *_args: pytest.fail("La petición HTTP no debe publicar clips en serie."),
+        raising=False,
+    )
+
+    async def idle_schedule_worker(_settings: AppSettings) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_module, "schedule_worker", idle_schedule_worker)
+    with TestClient(main_module.create_app(settings, auth_required=False)) as client:
+        response = client.post(
+            f"/api/projects/{project_id}/publish",
+            json={
+                "clip_ids": ["ready-clip-id"],
+                "platform": "youtube",
+                "visibility": "private",
+            },
+        )
+        jobs = database.list_schedule_jobs(
+            settings.database_path, project_id, "test-user"
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["published"] == []
+    assert result["failed"] is None
+    assert result["not_attempted"] == []
+    assert len(result["jobs"]) == 1
+    assert result["jobs"][0]["status"] == "scheduled"
+    assert len(jobs) == 1

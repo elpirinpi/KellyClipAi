@@ -65,7 +65,6 @@ from .integrations import (
     integration_status,
     list_zoom_recordings,
     provider_missing_credentials,
-    publish_clip,
 )
 from .llm import LLMConfigurationError, resolve_llm
 from .media import MediaProcessingError
@@ -1502,29 +1501,31 @@ def create_app(
         clips_by_id = {clip["id"]: clip for clip in project.get("clips") or []}
         if any(clip_id not in clips_by_id for clip_id in request.clip_ids):
             raise HTTPException(status_code=404, detail="Uno o más clips seleccionados no existen.")
-        published: list[dict[str, str]] = []
-        failed: dict[str, str] | None = None
-        not_attempted: list[str] = []
-        for index, clip_id in enumerate(request.clip_ids):
-            clip = clips_by_id[clip_id]
-            try:
-                result = publish_clip(
-                    app_settings,
-                    request.platform,
-                    clip,
-                    clip_file(project_id, clip_id),
-                    request.visibility,
-                    project["owner_id"],
-                )
-            except IntegrationError as error:
-                failed = {"clip_id": clip_id, "error": str(error)}
-                not_attempted = request.clip_ids[index + 1 :]
-                break
-            published.append({"clip_id": clip_id, **result})
+        if any(clips_by_id[clip_id].get("status") == "failed" for clip_id in request.clip_ids):
+            raise HTTPException(
+                status_code=422,
+                detail="No se pueden publicar clips cuyo renderizado falló.",
+            )
+        for clip_id in request.clip_ids:
+            clip_file(project_id, clip_id)
+        scheduled_at = database.utc_now()
+        jobs = database.enqueue_schedule_jobs(
+            app_settings.database_path,
+            project_id,
+            request.clip_ids,
+            request.platform,
+            scheduled_at,
+            request.visibility,
+        )
         return {
-            "published": published,
-            "failed": failed,
-            "not_attempted": not_attempted,
+            "published": [],
+            "failed": None,
+            "not_attempted": [],
+            "jobs": [
+                serialize_schedule_job(job)
+                for job in jobs
+                if job["clip_id"] in request.clip_ids
+            ],
         }
 
     def stored_editor_request(project: dict, clip: dict) -> ClipEditRequest:
