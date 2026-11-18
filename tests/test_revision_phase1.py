@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -443,3 +445,16 @@ def test_each_database_connection_enforces_foreign_keys(tmp_path: Path) -> None:
                 VALUES ('missing-project', 'progress', '{}', 'now')
                 """
             )
+
+
+def test_youtube_oauth_requests_read_scope_for_channel_lookup(tmp_path: Path) -> None:
+    settings = replace(
+        _settings(tmp_path / "data"),
+        youtube_client_id="client-id",
+        youtube_client_secret="client-secret",
+    )
+    authorization = integrations.authorization_url(settings, "youtube", "state")
+    scopes = set(parse_qs(urlparse(authorization).query)["scope"][0].split())
+
+    assert "https://www.googleapis.com/auth/youtube.upload" in scopes
+    assert "https://www.googleapis.com/auth/youtube.readonly" in scopes

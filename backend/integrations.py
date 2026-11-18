@@ -115,11 +115,15 @@ def authorization_url(settings: AppSettings, provider: str, state: str) -> str:
     redirect_uri = _redirect_uri(settings, provider)
     values: dict[str, str]
     if provider == "youtube":
+        # channels.list?mine=true requires youtube.readonly; verify OAuth with a real account.
         values = {
             "client_id": settings.youtube_client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": "openid email https://www.googleapis.com/auth/youtube.upload",
+            "scope": (
+                "openid email https://www.googleapis.com/auth/youtube.upload "
+                "https://www.googleapis.com/auth/youtube.readonly"
+            ),
             "access_type": "offline",
             "prompt": "consent",
             "state": state,
