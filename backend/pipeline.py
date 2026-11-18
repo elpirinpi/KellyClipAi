@@ -289,15 +289,15 @@ def _render_projects(
         output_path = output_dir / f"{clip_id}.mp4"
         subtitle_path = output_dir / f"{clip_id}.ass"
 
-        def on_encode_progress(percent: float) -> None:
-            overall = 72 + round(((index + percent / 100) / count) * 26)
+        def on_encode_progress(percent: float, clip_index: int = index) -> None:
+            overall = 72 + round(((clip_index + percent / 100) / count) * 26)
             _publish(
                 settings,
                 project_id,
                 "processing",
                 "editing",
                 min(overall, 98),
-                f"Editando clip {index + 1} de {count}…",
+                f"Editando clip {clip_index + 1} de {count}…",
             )
 
         render_config = project_config.model_copy(

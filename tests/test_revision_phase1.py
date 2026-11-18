@@ -447,6 +447,69 @@ def test_each_database_connection_enforces_foreign_keys(tmp_path: Path) -> None:
             )
 
 
+def test_deferred_render_callbacks_keep_their_clip_index(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    project_id = "callback-project"
+    input_path = settings.data_dir / "projects" / project_id / "source"
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Callbacks",
+        input_path,
+        {"ratio": "9:16"},
+        "test-user",
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        pipeline.database, "resolve_subtitle_template", lambda *_args: "Default"
+    )
+
+    def capture_callback(*args, **_kwargs):
+        callbacks.append(args[7])
+        return (10.0, [])
+
+    monkeypatch.setattr(pipeline, "render_clip", capture_callback)
+    monkeypatch.setattr(
+        pipeline,
+        "probe_media",
+        lambda *_args, **_kwargs: {"width": 720, "height": 1280},
+    )
+    monkeypatch.setattr(pipeline.shutil, "which", lambda _name: "ffprobe")
+    proposals = [
+        ClipProposal(
+            inicio=0,
+            fin=10,
+            titulo=f"Clip {index + 1}",
+            puntuacion=7,
+            razon_viral="Una frase.",
+        )
+        for index in range(2)
+    ]
+
+    pipeline._render_projects(
+        settings,
+        project_id,
+        input_path,
+        ProjectConfig(),
+        proposals,
+        [],
+        "ffmpeg",
+        "test-user",
+    )
+    for callback in callbacks:
+        callback(50)
+
+    events = database.events_after(settings.database_path, project_id, 1)
+    assert [event["data"]["message"] for event in events] == [
+        "Editando clip 1 de 2…",
+        "Editando clip 2 de 2…",
+    ]
+
+
 def test_youtube_oauth_requests_read_scope_for_channel_lookup(tmp_path: Path) -> None:
     settings = replace(
         _settings(tmp_path / "data"),
