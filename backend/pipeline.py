@@ -276,7 +276,7 @@ def _render_projects(
     project_id: str,
     input_path: Path,
     project_config: ProjectConfig,
-    proposal_records: list[dict[str, Any]],
+    proposal_records: list[dict[str, Any] | ClipProposal],
     transcript: list[TranscriptSegment],
     ffmpeg_path: str,
     owner_id: str,
@@ -285,6 +285,15 @@ def _render_projects(
     project_dir = input_path.parent
     output_dir = project_dir / "clips"
     output_dir.mkdir(parents=True, exist_ok=True)
+    proposal_records = [
+        {
+            "id": str(uuid.uuid4()),
+            "proposal": record.model_dump(mode="json"),
+        }
+        if isinstance(record, ClipProposal)
+        else record
+        for record in proposal_records
+    ]
     replacing_ids = {str(record["id"]) for record in proposal_records}
     rendered = [
         clip
