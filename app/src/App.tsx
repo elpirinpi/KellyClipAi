@@ -63,6 +63,8 @@ type ClipEditorState = {
 };
 type ClipResult = {
   id: string;
+  status?: 'ready' | 'failed';
+  error?: string;
   title: string;
   start: number;
   end: number;
@@ -76,8 +78,8 @@ type ClipResult = {
   resolution?: 720 | 1080;
   audio_enhanced?: boolean;
   filename: string;
-  video_url: string;
-  download_url: string;
+  video_url: string | null;
+  download_url: string | null;
   broll_provider?: string;
   broll_creator?: string;
   broll_attribution_url?: string;
@@ -1730,8 +1732,10 @@ function ResultsPage({
     const allClips = [...(project?.clips ?? [])];
     return allClips.sort((a, b) => sort === 'score' ? b.score - a.score : a.start - b.start);
   }, [project?.clips, sort]);
-  const allSelected = clips.length > 0 && clips.every((clip) => selected.has(clip.id));
-  const selectedClips = clips.filter((clip) => selected.has(clip.id));
+  const readyClips = clips.filter((clip) => clip.status !== 'failed');
+  const failedClips = clips.filter((clip) => clip.status === 'failed');
+  const allSelected = readyClips.length > 0 && readyClips.every((clip) => selected.has(clip.id));
+  const selectedClips = readyClips.filter((clip) => selected.has(clip.id));
 
   const publishClips = async (clipIds: string[]) => {
     if (!project || !clipIds.length) {
@@ -1773,6 +1777,24 @@ function ResultsPage({
     }
   };
   const publishSelected = () => void publishClips(selectedClips.map((clip) => clip.id));
+
+  const retryFailedClips = async () => {
+    if (!project || !failedClips.length) return;
+    setBusyAction('retry-clips');
+    setNotice('');
+    try {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/retry-failed-clips`, {
+        method: 'POST',
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      setNotice('Los clips fallidos se añadieron a la cola para reintentarlos.');
+      await onProjectUpdated(project.id);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudieron reintentar los clips fallidos.');
+    } finally {
+      setBusyAction('');
+    }
+  };
 
   const refreshScheduleJobs = useCallback(async () => {
     if (!project) return;
@@ -1927,7 +1949,7 @@ function ResultsPage({
   return (
     <main className="results-page">
       <header className="results-toolbar">
-        <label className="select-all"><input type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? new Set(clips.map((clip) => clip.id)) : new Set())} /> Seleccionar todo</label>
+        <label className="select-all"><input type="checkbox" checked={allSelected} onChange={(event) => setSelected(event.target.checked ? new Set(readyClips.map((clip) => clip.id)) : new Set())} /> Seleccionar todo</label>
         <div className="results-toolbar-actions">
           <label className="publish-select"><span className="visually-hidden">Plataforma para publicar</span><select value={publishPlatform} onChange={(event) => {
             const next = event.target.value;
@@ -1961,6 +1983,15 @@ function ResultsPage({
         <label className="sort-control"><span>Ordenar:</span><select value={sort} onChange={(event) => setSort(event.target.value as 'score' | 'time')}><option value="score">Mayor puntuación</option><option value="time">Cronológico</option></select></label>
       </div>
       {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}
+      {failedClips.length > 0 && project?.status !== 'processing' && project?.status !== 'queued' && (
+        <div className="project-failure">
+          <p className="error-message" role="alert"><AlertCircle size={16} />{failedClips.length} clip(s) fallaron; los demás se conservaron.</p>
+          <button type="button" className="retry-button" onClick={() => void retryFailedClips()} disabled={busyAction === 'retry-clips'}>
+            {busyAction === 'retry-clips' ? <LoaderCircle size={16} className="spin" /> : <WandSparkles size={16} />}
+            Reintentar clips fallidos
+          </button>
+        </div>
+      )}
       {scheduleError && (
         <div className="project-failure">
           <p className="error-message" role="alert"><AlertCircle size={16} />{scheduleError}</p>
@@ -2009,22 +2040,24 @@ function ResultsPage({
       <div className="clip-list">
         {clips.map((clip, index) => (
           <article className="clip-card" key={clip.id}>
-            <label className="clip-select"><input type="checkbox" checked={selected.has(clip.id)} onChange={(event) => setSelected((current) => {
+            <label className="clip-select"><input type="checkbox" checked={selected.has(clip.id)} disabled={clip.status === 'failed'} onChange={(event) => setSelected((current) => {
               const next = new Set(current);
               if (event.target.checked) next.add(clip.id);
               else next.delete(clip.id);
               return next;
             })} /><span className="visually-hidden">Seleccionar clip {index + 1}</span></label>
             <div className="clip-preview">
-              <video
+              {clip.status === 'failed'
+                ? <div className="clip-render-failed"><AlertCircle size={22} /><span>Render fallido</span></div>
+                : <video
                 ref={(element) => { players.current[clip.id] = element; }}
-                src={`${API_BASE}${clip.video_url}?v=${encodeURIComponent(project?.updated_at ?? '')}`}
+                src={`${API_BASE}${clip.video_url ?? ''}?v=${encodeURIComponent(project?.updated_at ?? '')}`}
                 controls
                 preload="metadata"
                 playsInline
                 aria-label={`Vista previa de ${clip.title}`}
-              />
-              <select
+              />}
+              {clip.status !== 'failed' && <select
                 className="clip-quality"
                 value={clip.resolution ?? 720}
                 onChange={(event) => void changeResolution(clip, event.target.value === '1080' ? 1080 : 720)}
@@ -2032,12 +2065,14 @@ function ResultsPage({
                 aria-label={`Resolución de ${clip.title}`}
               >
                 <option value={720}>720p</option><option value={1080}>1080p</option>
-              </select>
+              </select>}
               <span className="clip-duration">{formatDuration(clip.duration)}</span>
             </div>
             <div className="clip-content">
               <h2>#{index + 1} {clip.title}</h2>
-              <div className="clip-score-actions">
+              {clip.status === 'failed'
+                ? <p className="error-message" role="alert">{clip.error ?? 'No se pudo renderizar este clip.'}</p>
+                : <div className="clip-score-actions">
                 <div className="clip-score"><strong>{clip.score.toFixed(1)}</strong><span>VIRALIDAD</span></div>
                 <div className="clip-actions">
                   <button type="button" className="clip-action primary" onClick={() => void saveProjectFiles(false, [clip.id])} disabled={busyAction === 'archive'}>
@@ -2067,7 +2102,9 @@ function ResultsPage({
                   <button type="button" className="clip-action icon-only" aria-label="Cambiar plantilla" onClick={() => onEdit(clip.id)}><FileVideo2 size={16} /></button>
                   <button type="button" className="clip-action icon-only" aria-label="Editar transcripción" onClick={() => onEdit(clip.id)}><Scissors size={16} /></button>
                 </div>
-              </div>
+              </div>}
+              {clip.status !== 'failed' && (
+              <>
               <section className="viral-reason"><strong>Razón viral</strong><p>{clip.viral_reason}</p></section>
               {clip.broll_provider && <p className="broll-attribution">B-roll de {clip.broll_provider} · {clip.broll_creator}{clip.broll_attribution_url && <> · <a href={clip.broll_attribution_url} target="_blank" rel="noreferrer">Ver fuente</a></>}</p>}
               <section className="clip-transcript" aria-label={`Transcripción del clip ${index + 1}`}>
@@ -2093,6 +2130,8 @@ function ResultsPage({
                   </button>
                 ))}</div>
               </section>
+              </>
+              )}
             </div>
           </article>
         ))}
@@ -2292,9 +2331,9 @@ function ClipEditorPage({
             <div className="editor-preview-card">
               <div className="editor-preview-frame">
                 <video
-                  key={previewUrl || clip.video_url}
+                  key={previewUrl || clip.video_url || clip.id}
                   ref={player}
-                  src={previewUrl || `${API_BASE}${clip.video_url}`}
+                  src={previewUrl || (clip.video_url ? `${API_BASE}${clip.video_url}` : undefined)}
                   controls
                   playsInline
                   preload="metadata"

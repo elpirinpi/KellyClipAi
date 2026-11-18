@@ -628,13 +628,16 @@ def queue_project(
     database_path: Path,
     project_id: str,
     config: dict[str, Any],
+    *,
+    preserve_clips: bool = False,
 ) -> bool:
+    clips_update = "clips_json = clips_json" if preserve_clips else "clips_json = '[]'"
     with _lock, connection(database_path) as conn:
         cursor = conn.execute(
-            """
+            f"""
             UPDATE projects
             SET config_json = ?, status = 'queued', step = 'upload', progress = 0,
-                error = NULL, clips_json = '[]', updated_at = ?
+                error = NULL, {clips_update}, updated_at = ?
             WHERE id = ? AND status NOT IN ('processing', 'queued')
             """,
             (json.dumps(config, ensure_ascii=False), utc_now(), project_id),

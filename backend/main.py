@@ -143,8 +143,16 @@ def _serialize_project(project: dict, *, include_transcript: bool = False) -> di
     project["clips"] = [
         {
             **clip,
-            "video_url": f"/api/projects/{project_id}/clips/{clip['id']}/file",
-            "download_url": f"/api/projects/{project_id}/clips/{clip['id']}/download",
+            "video_url": (
+                f"/api/projects/{project_id}/clips/{clip['id']}/file"
+                if clip.get("status") != "failed"
+                else None
+            ),
+            "download_url": (
+                f"/api/projects/{project_id}/clips/{clip['id']}/download"
+                if clip.get("status") != "failed"
+                else None
+            ),
         }
         for clip in project.get("clips") or []
     ]
@@ -343,8 +351,12 @@ def create_app(
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
         processing_queue = ProjectProcessingQueue(
             app_settings.processing_concurrency,
-            lambda project_id, llm_config: asyncio.to_thread(
-                process_project, project_id, llm_config, app_settings
+            lambda project_id, llm_config, retry_failed_only: asyncio.to_thread(
+                process_project,
+                project_id,
+                llm_config,
+                app_settings,
+                retry_failed_only=retry_failed_only,
             ),
         )
         await processing_queue.start()
@@ -1284,6 +1296,68 @@ def create_app(
                 status="failed",
                 step="failed",
                 error="La cola de procesamiento se cerró antes de aceptar el trabajo.",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Inténtalo de nuevo.",
+            ) from error
+        return {"project_id": project_id, "status": "queued"}
+
+    @application.post(
+        "/api/projects/{project_id}/retry-failed-clips", status_code=202
+    )
+    async def retry_failed_clips(project_id: str) -> dict[str, str]:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409, detail="Este proyecto ya se está procesando."
+            )
+        failed_ids = {
+            str(clip["id"])
+            for clip in project.get("clips") or []
+            if clip.get("status") == "failed"
+        }
+        proposals = (project.get("metadata") or {}).get("clip_proposals") or []
+        proposal_ids = {
+            str(proposal["id"])
+            for proposal in proposals
+            if isinstance(proposal, dict) and proposal.get("id")
+        }
+        if not failed_ids.intersection(proposal_ids):
+            raise HTTPException(
+                status_code=409,
+                detail="No hay clips fallidos con una propuesta guardada que se pueda reintentar.",
+            )
+        if not database.queue_project(
+            app_settings.database_path,
+            project_id,
+            project["config"],
+            preserve_clips=True,
+        ):
+            raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
+        processing_queue: ProjectProcessingQueue | None = getattr(
+            application.state, "processing_queue", None
+        )
+        if processing_queue is None:
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Reinicia la aplicación.",
+            )
+        try:
+            await processing_queue.submit(
+                project_id,
+                None,
+                retry_failed_only=True,
+            )
+        except RuntimeError as error:
+            database.update_project(
+                app_settings.database_path,
+                project_id,
+                status="failed",
+                step="failed",
+                error="La cola de procesamiento se cerró antes de aceptar el reintento.",
             )
             raise HTTPException(
                 status_code=503,
