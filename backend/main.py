@@ -67,7 +67,7 @@ from .integrations import (
     provider_missing_credentials,
 )
 from .llm import LLMConfigurationError, resolve_llm
-from .media import MediaProcessingError
+from .media import MediaProcessingError, format_subtitles
 from .pipeline import process_project
 from .process_queue import ProjectProcessingQueue
 from .scheduler import schedule_worker
@@ -1640,6 +1640,46 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @application.get(
+        "/api/projects/{project_id}/clips/{clip_id}/subtitles/{format_name}"
+    )
+    def download_clip_subtitles(
+        project_id: str,
+        clip_id: str,
+        format_name: Literal["srt", "vtt"],
+    ) -> Response:
+        _, clip = editable_project_clip(project_id, clip_id)
+        if clip.get("status") == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="No se pueden exportar subtítulos de un clip fallido.",
+            )
+        transcript = clip.get("transcript")
+        if not isinstance(transcript, list) or not transcript:
+            raise HTTPException(
+                status_code=409,
+                detail="El clip no tiene una transcripción con marcas de tiempo.",
+            )
+        try:
+            content = format_subtitles(transcript, format_name)
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail="La transcripción guardada no tiene tiempos válidos para exportar.",
+            ) from error
+        media_type = (
+            "text/vtt; charset=utf-8"
+            if format_name == "vtt"
+            else "application/x-subrip; charset=utf-8"
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{clip_id}.{format_name}"'
+            },
+        )
 
     def clip_file(project_id: str, clip_id: str) -> Path:
         project = database.get_project(app_settings.database_path, project_id)

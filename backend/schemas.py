@@ -40,6 +40,18 @@ class EditOptions(BaseModel):
     face_tracking: bool = True
 
 
+class SubtitleStyle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    font_family: (
+        Literal["Arial", "Arial Black", "Georgia", "Tahoma", "Verdana"] | None
+    ) = None
+    font_size: int | None = Field(default=None, ge=16, le=100)
+    font_color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    highlight_color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    position: Literal["top", "center", "bottom"] | None = None
+
+
 class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -66,6 +78,7 @@ class ProjectConfig(BaseModel):
         "zh",
     ] = "auto"
     subtitle_template: str = Field(default="Default", min_length=1, max_length=100)
+    subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
     options: EditOptions = Field(default_factory=EditOptions)
     moment: str = Field(default="", max_length=500)
     whisper_model: Literal["tiny", "small", "medium", "large-v3"] = "small"
@@ -147,6 +160,7 @@ class ClipEditRequest(BaseModel):
 
     ratio: Ratio
     subtitle_template: str = Field(min_length=1, max_length=100)
+    subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
     phrases: list[EditablePhrase] = Field(max_length=120)
 
     @model_validator(mode="after")

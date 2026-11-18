@@ -269,6 +269,81 @@ def _create_completed_project_with_clip(
     return project_id, clip_id, clip_path
 
 
+def test_clip_subtitle_endpoint_exports_srt_and_vtt_with_render_times(
+    video_with_audio: Path,
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    with TestClient(create_app(settings)) as client:
+        project_id, clip_id, _clip_path = _create_completed_project_with_clip(
+            client, settings, video_with_audio
+        )
+        project = database.get_project(settings.database_path, project_id)
+        assert project is not None
+        clip = project["clips"][0]
+        clip["transcript"] = [
+            {
+                "start": 1.0,
+                "end": 1.4,
+                "preview_start": 0.25,
+                "preview_end": 0.6,
+                "text": "Hola",
+            },
+            {
+                "start": 1.5,
+                "end": 1.9,
+                "preview_start": 0.65,
+                "preview_end": 1.0,
+                "text": "mundo",
+            },
+        ]
+        database.update_project(
+            settings.database_path, project_id, clips=[clip]
+        )
+
+        srt = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/subtitles/srt"
+        )
+        vtt = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/subtitles/vtt"
+        )
+        editor = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/edit"
+        )
+        editor_payload = editor.json()
+        editor_payload["subtitle_style"] = {
+            "font_family": "Georgia",
+            "font_size": 72,
+            "font_color": "#ff0000",
+            "highlight_color": "#00ff00",
+            "position": "top",
+        }
+        saved_style = client.put(
+            f"/api/projects/{project_id}/clips/{clip_id}/edit",
+            json=editor_payload,
+        )
+        restored_editor = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/edit"
+        )
+
+    assert srt.status_code == vtt.status_code == 200
+    assert srt.text == "1\n00:00:00,250 --> 00:00:01,000\nHola mundo\n"
+    assert vtt.text == "WEBVTT\n\n00:00:00.250 --> 00:00:01.000\nHola mundo\n"
+    assert srt.headers["content-disposition"].endswith(f'"{clip_id}.srt"')
+    assert vtt.headers["content-disposition"].endswith(f'"{clip_id}.vtt"')
+    assert saved_style.status_code == 200
+    assert saved_style.json()["subtitle_style"]["font_size"] == 72
+    assert restored_editor.json()["subtitle_style"]["font_color"] == "#ff0000"
+
+
 def test_clip_render_succeeds_when_subtitle_directory_contains_apostrophe(
     video_with_audio: Path,
     tmp_path: Path,

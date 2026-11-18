@@ -115,6 +115,9 @@ Whisper reutiliza en memoria el último modelo seleccionado y procesa con
 inferencia por lotes en CPU, conservando timestamps por palabra. El idioma se
 detecta automáticamente o se fija por proyecto; la primera descarga muestra
 progreso real y se almacena en la caché local de Hugging Face.
+Los B-rolls se insertan como cortes a pantalla completa con el audio original.
+En resultados puedes descargar subtítulos SRT o WebVTT; la fuente, tamaño,
+colores y posición se pueden ajustar en la configuración y en el editor.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
 

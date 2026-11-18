@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import re
 import subprocess
@@ -487,8 +488,53 @@ def _caption_groups(
     return groups
 
 
+def _subtitle_timestamp(seconds: float, separator: str) -> str:
+    milliseconds = max(0, round(seconds * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return (
+        f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}"
+        f"{separator}{milliseconds:03d}"
+    )
+
+
+def format_subtitles(
+    words: list[dict[str, object]],
+    format_name: str,
+) -> str:
+    if format_name not in {"srt", "vtt"}:
+        raise ValueError("El formato debe ser SRT o WebVTT.")
+    separator = "," if format_name == "srt" else "."
+    entries: list[str] = []
+    for index, group in enumerate(_caption_groups(words), start=1):
+        start = float(group[0]["preview_start"])
+        end = max(start + 0.08, float(group[-1]["preview_end"]))
+        text = " ".join(str(word["text"]).strip() for word in group)
+        if format_name == "vtt":
+            text = html.escape(text, quote=False)
+        timing = (
+            f"{_subtitle_timestamp(start, separator)} --> "
+            f"{_subtitle_timestamp(end, separator)}"
+        )
+        entries.append(
+            f"{index}\n{timing}\n{text}"
+            if format_name == "srt"
+            else f"{timing}\n{text}"
+        )
+    prefix = "WEBVTT\n\n" if format_name == "vtt" else ""
+    return prefix + "\n\n".join(entries) + ("\n" if entries else "")
+
+
 def _caption_max_chars(width: int, font_size: int, margin: int = 48) -> int:
     return max(12, int((width - 2 * margin) / (font_size * 0.68)))
+
+
+def _ass_color(color: str | None) -> str | None:
+    if color is None:
+        return None
+    red, green, blue = color[1:3], color[3:5], color[5:7]
+    return f"&H00{blue}{green}{red}".upper()
 
 
 def _write_ass(
@@ -513,6 +559,16 @@ def _write_ass(
         "Neón": ("Arial Black", 60, "&H00FFFF66", "&H00FFFFFF", 4, 1, 2),
     }.get(config.subtitle_template, ("Arial", 58, "&H00FFFFFF", "&H0000FFFF", 3, 1, 2))
     font, size, primary, secondary, outline, shadow, alignment = style
+    overrides = config.subtitle_style
+    font = overrides.font_family or font
+    size = overrides.font_size or size
+    primary = _ass_color(overrides.font_color) or primary
+    secondary = _ass_color(overrides.highlight_color) or secondary
+    alignment = {
+        "top": 8,
+        "center": 5,
+        "bottom": 2,
+    }.get(overrides.position, alignment)
     size = round(size * scale)
     caption_max_chars = _caption_max_chars(width, size)
     header = f"""[Script Info]
@@ -562,7 +618,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for keyword in proposal.palabras_clave
                 if keyword
             ):
-                parts.append(r"{\c&H0000FFFF&}" + text + r"{\c&H00FFFFFF&}")
+                parts.append(
+                    "{\\c"
+                    + secondary
+                    + "&}"
+                    + text
+                    + "{\\c"
+                    + primary
+                    + "&}"
+                )
             else:
                 parts.append(f"{{\\kf{word_duration}}}{text}")
         caption = " ".join(parts)
@@ -582,6 +646,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def _filter_time(value: float) -> str:
     return f"{max(0.0, value):.3f}"
+
+
+def _broll_cut_ranges(duration: float) -> list[tuple[float, float]]:
+    if duration <= 0:
+        return []
+    cut_duration = min(4.0, max(1.0, duration * 0.2))
+    if duration <= 8:
+        start = (duration - cut_duration) / 2
+        return [(start, start + cut_duration)]
+    ranges: list[tuple[float, float]] = []
+    start = 4.0
+    while start + cut_duration <= duration:
+        ranges.append((start, start + cut_duration))
+        start += 12.0
+    if not ranges:
+        start = (duration - cut_duration) / 2
+        ranges.append((start, start + cut_duration))
+    return ranges
 
 
 def _crop_coordinate_expression(
@@ -701,22 +783,27 @@ def _build_filter(
             + f"concat=n={len(intervals)}:v=1:a=1[vcat][acat]"
         )
         video_input, audio_input = "[vcat]", "[acat]"
+    if include_broll:
+        cut_ranges = _broll_cut_ranges(clip_duration)
+        if cut_ranges:
+            enable = "+".join(
+                f"between(t,{_filter_time(start)},{_filter_time(end)})"
+                for start, end in cut_ranges
+            )
+            parts.append(
+                f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},trim=duration={_filter_time(clip_duration)},"
+                "setpts=PTS-STARTPTS,setsar=1[broll]"
+            )
+            parts.append(
+                f"{video_input}[broll]overlay=shortest=0:eof_action=repeat:"
+                f"enable='{enable}'[brollbase]"
+            )
+            video_input = "[brollbase]"
     parts.append(
         f"{video_input}subtitles=filename='{subtitle_path.name}'[vout]"
     )
     video_output = "[vout]"
-    if include_broll:
-        broll_width = max(160, width // 3)
-        broll_height = max(90, (round(broll_width * 9 / 16) // 2) * 2)
-        parts.append(
-            f"[1:v]scale={broll_width}:{broll_height}:force_original_aspect_ratio=decrease,"
-            f"pad={broll_width}:{broll_height}:(ow-iw)/2:(oh-ih)/2,"
-            f"trim=duration={_filter_time(clip_duration)},setpts=PTS-STARTPTS,setsar=1[broll]"
-        )
-        parts.append(
-            "[vout][broll]overlay=x=W-w-24:y=24:eof_action=repeat:shortest=0[vbroll]"
-        )
-        video_output = "[vbroll]"
     if censor_ranges:
         enable = "+".join(
             f"between(t,{_filter_time(start)},{_filter_time(end)})"

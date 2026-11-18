@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
 import {
   AlertCircle, ArrowLeft, ArrowRight, AudioLines, CalendarDays, Check, ChevronDown,
-  ChevronLeft, ChevronRight, Circle, CloudUpload, Download, FileVideo2, Link2, LoaderCircle,
+  ChevronLeft, ChevronRight, Circle, CloudUpload, Download, FileText, FileVideo2, Link2, LoaderCircle,
   LockKeyhole, LogOut, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Trash2, Video, WandSparkles, X,
 } from 'lucide-react';
 import { accessToken, apiFetch, getSupabase, initializeSupabase, signOut, streamApiEvents, syncMediaCookie } from './auth';
@@ -56,9 +56,24 @@ type EditablePhrase = {
   text: string;
   removed: boolean;
 };
+type SubtitleStyleState = {
+  font_family: string | null;
+  font_size: number | null;
+  font_color: string | null;
+  highlight_color: string | null;
+  position: 'top' | 'center' | 'bottom' | null;
+};
+const DEFAULT_SUBTITLE_STYLE: SubtitleStyleState = {
+  font_family: null,
+  font_size: null,
+  font_color: null,
+  highlight_color: null,
+  position: null,
+};
 type ClipEditorState = {
   ratio: string;
   subtitle_template: string;
+  subtitle_style: SubtitleStyleState;
   phrases: EditablePhrase[];
 };
 type ClipResult = {
@@ -115,6 +130,7 @@ type ProjectResult = {
       | 'uk'
       | 'zh';
     subtitle_template: string;
+    subtitle_style?: SubtitleStyleState;
     options: Record<string, boolean>;
     moment: string;
     schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
@@ -529,6 +545,7 @@ function App() {
   const [settingsProvider, setSettingsProvider] = useState('Groq');
   const [whisperModel, setWhisperModel] = useState('small');
   const [whisperLanguage, setWhisperLanguage] = useState('auto');
+  const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyleState>(DEFAULT_SUBTITLE_STYLE);
   const [linkProject, setLinkProject] = useState<ProjectResult | null>(null);
   const [project, setProject] = useState<ProjectResult | null>(null);
   const [projectError, setProjectError] = useState('');
@@ -996,6 +1013,7 @@ function App() {
       duration,
       framing,
       subtitle_template: activeTemplate,
+      subtitle_style: subtitleStyle,
       options,
       moment,
       whisper_model: whisperModel,
@@ -1133,6 +1151,7 @@ function App() {
           setFraming(loaded.config.framing ?? 'speaker');
           setWhisperLanguage(loaded.config.whisper_language ?? 'auto');
           setActiveTemplate(loaded.config.subtitle_template);
+          setSubtitleStyle(loaded.config.subtitle_style ?? DEFAULT_SUBTITLE_STYLE);
           setOptions({
             emojis: true,
             keywords: true,
@@ -1600,6 +1619,7 @@ function App() {
                   </select>
                   <small>Se guarda en el proyecto; automático conserva la detección de Whisper.</small>
                 </label>
+                <SubtitleStyleControls value={subtitleStyle} onChange={setSubtitleStyle} />
               </section>
 
               <section className="config-card moment-card">
@@ -2012,6 +2032,20 @@ function ResultsPage({
       setBusyAction('');
     }
   };
+  const downloadSubtitles = async (clipId: string, format: 'srt' | 'vtt') => {
+    if (!project) return;
+    setNotice('');
+    try {
+      const response = await apiFetch(
+        `${API_BASE}/api/projects/${project.id}/clips/${clipId}/subtitles/${format}`,
+      );
+      if (!response.ok) throw new Error(await responseError(response));
+      triggerDownload(await response.blob(), `${clipId}.${format}`);
+      setNotice(`Subtítulos ${format.toUpperCase()} descargados.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudieron descargar los subtítulos.');
+    }
+  };
   const changeResolution = async (clip: ClipResult, resolution: 720 | 1080) => {
     if (!project || resolution === (clip.resolution ?? 720)) return;
     setBusyAction(clip.id);
@@ -2266,6 +2300,12 @@ function ResultsPage({
                 <div className="clip-actions">
                   <button type="button" className="clip-action primary" onClick={() => void saveProjectFiles(false, [clip.id])} disabled={busyAction === 'archive'}>
                     {busyAction === 'archive' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />} Descargar
+                  </button>
+                  <button type="button" className="clip-action" onClick={() => void downloadSubtitles(clip.id, 'srt')}>
+                    <FileText size={15} /> SRT
+                  </button>
+                  <button type="button" className="clip-action" onClick={() => void downloadSubtitles(clip.id, 'vtt')}>
+                    <FileText size={15} /> VTT
                   </button>
                   <button type="button" className="clip-action" disabled={busyAction === 'publish'} onClick={() => void publishClips([clip.id])}><ArrowRight size={15} /> Publicar</button>
                   <button
@@ -2558,6 +2598,14 @@ function ClipEditorPage({
                   ))}
                 </select>
               </label>
+              <SubtitleStyleControls
+                value={editor.subtitle_style}
+                onChange={(subtitle_style) => {
+                  setEditor({ ...editor, subtitle_style });
+                  setPreviewUrl('');
+                  setMessage('');
+                }}
+              />
               <div className="editor-tip">
                 <strong>{editor.phrases.filter((phrase) => phrase.removed).length} frases marcadas</strong>
                 <span>Los cambios se aplican al exportar desde el video original.</span>
@@ -2641,6 +2689,86 @@ function Option({ checked, onClick, title, description, premium = false }: { che
       <span className={`fake-checkbox ${checked ? 'checked' : ''}`}>{checked && <Check size={12} strokeWidth={3} />}</span>
       <span className="option-copy"><span className="option-title">{title}{premium && <span className="diamond"> ◆</span>}</span><span className="option-description">{description}</span></span>
     </button>
+  );
+}
+
+function SubtitleStyleControls({
+  value,
+  onChange,
+}: {
+  value: SubtitleStyleState;
+  onChange: (style: SubtitleStyleState) => void;
+}) {
+  const update = <Key extends keyof SubtitleStyleState>(
+    key: Key,
+    nextValue: SubtitleStyleState[Key],
+  ) => onChange({ ...value, [key]: nextValue });
+
+  return (
+    <div className="subtitle-style-grid">
+      <label className="config-field">
+        <span>Fuente de subtítulos</span>
+        <select className="text-input" value={value.font_family ?? ''} onChange={(event) => {
+          update('font_family', event.target.value || null);
+        }}>
+          <option value="">Usar fuente de plantilla</option>
+          <option value="Arial">Arial</option>
+          <option value="Arial Black">Arial Black</option>
+          <option value="Georgia">Georgia</option>
+          <option value="Tahoma">Tahoma</option>
+          <option value="Verdana">Verdana</option>
+        </select>
+      </label>
+      <label className="config-field">
+        <span>Tamaño de fuente</span>
+        <select className="text-input" value={value.font_size ?? ''} onChange={(event) => {
+          update('font_size', event.target.value ? Number(event.target.value) : null);
+        }}>
+          <option value="">Usar tamaño de plantilla</option>
+          <option value="32">Pequeño</option>
+          <option value="48">Mediano</option>
+          <option value="64">Grande</option>
+          <option value="80">Muy grande</option>
+        </select>
+      </label>
+      <div className="subtitle-color-control">
+        <label htmlFor="subtitle-font-color">Color de texto</label>
+        <input
+          id="subtitle-font-color"
+          type="color"
+          value={value.font_color ?? '#ffffff'}
+          onChange={(event) => update('font_color', event.target.value)}
+        />
+        <button type="button" onClick={() => update('font_color', null)}>Usar plantilla</button>
+      </div>
+      <div className="subtitle-color-control">
+        <label htmlFor="subtitle-highlight-color">Color de resaltado</label>
+        <input
+          id="subtitle-highlight-color"
+          type="color"
+          value={value.highlight_color ?? '#ffff00'}
+          onChange={(event) => update('highlight_color', event.target.value)}
+        />
+        <button type="button" onClick={() => update('highlight_color', null)}>Usar plantilla</button>
+      </div>
+      <label className="config-field">
+        <span>Posición</span>
+        <select className="text-input" value={value.position ?? ''} onChange={(event) => {
+          const position = event.target.value;
+          update(
+            'position',
+            position === 'top' || position === 'center' || position === 'bottom'
+              ? position
+              : null,
+          );
+        }}>
+          <option value="">Usar posición de plantilla</option>
+          <option value="top">Arriba</option>
+          <option value="center">Centro</option>
+          <option value="bottom">Abajo</option>
+        </select>
+      </label>
+    </div>
   );
 }
 
