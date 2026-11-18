@@ -37,7 +37,7 @@ try {
     Pop-Location
 }
 
-& $python -m pip install -r (Join-Path $root 'requirements-desktop.txt')
+& $python -m pip install --require-hashes -r (Join-Path $root 'requirements-desktop.lock')
 if ($LASTEXITCODE -ne 0) { throw 'No se pudieron instalar las dependencias de escritorio.' }
 
 if (-not (Test-Path $ffmpegArchive)) {

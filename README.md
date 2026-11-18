@@ -33,8 +33,19 @@ Desde la carpeta del proyecto:
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.lock
 Copy-Item .env.example .env
+```
+
+`requirements.txt` contiene dependencias de ejecución; `requirements-dev.txt`
+añade pruebas y herramientas. Los archivos `requirements.lock`,
+`requirements-dev.lock` y `requirements-desktop.lock` fijan dependencias
+transitivas con hashes SHA-256. Para actualizarlos, activa `.venv` y ejecuta:
+
+```powershell
+.\.venv\Scripts\pip-compile.exe --generate-hashes --output-file=requirements.lock requirements.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --output-file=requirements-dev.lock requirements-dev.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --output-file=requirements-desktop.lock requirements-desktop.txt
 ```
 
 El `.env.example` incluido ya configura el proyecto Supabase de kellyClipAi
