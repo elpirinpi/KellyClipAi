@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from backend import database
@@ -155,3 +156,59 @@ def test_invalid_clip_proposals_are_logged_and_retried_once(monkeypatch, caplog)
     assert any("duración" in error for error in feedback[1])
     assert "Solapado" in caplog.text
     assert "Fuera de rango" in caplog.text
+
+
+def test_project_list_omits_transcript_but_project_detail_retains_it(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    _create_project(settings.database_path, "project-with-transcript", "ready")
+    transcript = [
+        {"start": 0.0, "end": 1.0, "text": "Transcripción privada", "words": []}
+    ]
+    database.update_project(
+        settings.database_path,
+        "project-with-transcript",
+        transcript=transcript,
+    )
+
+    with TestClient(create_app(settings, auth_required=False)) as client:
+        listed = client.get("/api/projects")
+        detailed = client.get("/api/projects/project-with-transcript")
+
+    assert listed.status_code == 200
+    assert "transcript" not in listed.json()[0]
+    assert detailed.status_code == 200
+    assert detailed.json()["transcript"] == transcript
+
+
+def test_project_middleware_and_sse_use_lightweight_status_queries(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    _create_project(settings.database_path, "completed-project", "ready")
+    database.update_project(
+        settings.database_path, "completed-project", status="completed"
+    )
+    database.publish_event(
+        settings.database_path,
+        "completed-project",
+        "progress",
+        {"status": "completed", "message": "Listo"},
+    )
+    monkeypatch.setattr(
+        database,
+        "get_project",
+        lambda *_args, **_kwargs: pytest.fail(
+            "The middleware and SSE polling must not load the full project."
+        ),
+    )
+
+    with TestClient(create_app(settings, auth_required=False)) as client:
+        response = client.get("/api/projects/completed-project/events")
+
+    assert response.status_code == 200
+    assert "Listo" in response.text

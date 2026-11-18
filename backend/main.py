@@ -122,8 +122,10 @@ def _parse_config(value: str) -> ProjectConfig:
         raise HTTPException(status_code=422, detail=f"Configuración de proyecto no válida: {error}") from error
 
 
-def _serialize_project(project: dict) -> dict:
+def _serialize_project(project: dict, *, include_transcript: bool = False) -> dict:
     project.pop("owner_id", None)
+    if not include_transcript:
+        project.pop("transcript", None)
     project_id = project["id"]
     project["thumbnail_url"] = (
         f"/api/projects/{project_id}/thumbnail" if project.get("metadata") else None
@@ -414,9 +416,9 @@ def create_app(
         path_parts = path.strip("/").split("/")
         if len(path_parts) >= 3 and path_parts[1] == "projects":
             project_id = path_parts[2]
-            if project_id != "from-url" and database.get_project(
+            if project_id != "from-url" and not database.project_exists(
                 app_settings.database_path, project_id, user_id
-            ) is None:
+            ):
                 return JSONResponse(
                     {"detail": "No se encontró el proyecto."},
                     status_code=404,
@@ -746,7 +748,7 @@ def create_app(
 
     @application.get("/api/projects/{project_id}/scheduled")
     def project_schedule(project_id: str, request: Request) -> list[dict]:
-        if database.get_project(app_settings.database_path, project_id) is None:
+        if not database.project_exists(app_settings.database_path, project_id):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         return [
             serialize_schedule_job(job)
@@ -1146,12 +1148,12 @@ def create_app(
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
-        return _serialize_project(project)
+        return _serialize_project(project, include_transcript=True)
 
     @application.get("/api/projects/{project_id}/thumbnail")
     def get_thumbnail(project_id: str) -> FileResponse:
         project_dir = app_settings.data_dir / "projects" / project_id
-        if database.get_project(app_settings.database_path, project_id) is None:
+        if not database.project_exists(app_settings.database_path, project_id):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         thumbnail = project_dir / "thumbnail.jpg"
         if not thumbnail.is_file():
@@ -1248,7 +1250,7 @@ def create_app(
 
     @application.get("/api/projects/{project_id}/events")
     async def project_events(project_id: str, request: Request) -> EventSourceResponse:
-        if database.get_project(app_settings.database_path, project_id) is None:
+        if not database.project_exists(app_settings.database_path, project_id):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         try:
             after_id = int(request.headers.get("last-event-id", "0"))
@@ -1267,8 +1269,10 @@ def create_app(
                         "event": event["event"],
                         "data": json.dumps(event["data"], ensure_ascii=False),
                     }
-                project = database.get_project(app_settings.database_path, project_id)
-                if project is None or project["status"] in {"completed", "failed"}:
+                status = database.get_project_status(
+                    app_settings.database_path, project_id
+                )
+                if status is None or status in {"completed", "failed"}:
                     break
                 if await request.is_disconnected():
                     break

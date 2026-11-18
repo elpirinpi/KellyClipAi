@@ -507,11 +507,36 @@ def get_project(
     return project_from_row(row) if row else None
 
 
+def project_exists(
+    database_path: Path,
+    project_id: str,
+    owner_id: str | None = None,
+) -> bool:
+    query = "SELECT 1 FROM projects WHERE id = ?"
+    parameters: tuple[Any, ...] = (project_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
+    with connection(database_path) as conn:
+        return conn.execute(query, parameters).fetchone() is not None
+
+
+def get_project_status(database_path: Path, project_id: str) -> str | None:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+    return str(row["status"]) if row else None
+
+
 def list_projects(
     database_path: Path,
     owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    query = "SELECT * FROM projects"
+    query = (
+        "SELECT id, owner_id, title, input_path, status, step, progress, error, "
+        "config_json, metadata_json, clips_json, created_at, updated_at FROM projects"
+    )
     parameters: tuple[Any, ...] = ()
     if owner_id is not None:
         query += " WHERE owner_id = ?"
@@ -519,13 +544,20 @@ def list_projects(
     query += " ORDER BY created_at DESC"
     with connection(database_path) as conn:
         rows = conn.execute(query, parameters).fetchall()
-    return [project_from_row(row) for row in rows]
+    return [project_from_row(row, include_transcript=False) for row in rows]
 
 
-def project_from_row(row: sqlite3.Row) -> dict[str, Any]:
+def project_from_row(
+    row: sqlite3.Row,
+    *,
+    include_transcript: bool = True,
+) -> dict[str, Any]:
     item = dict(row)
     for column in _JSON_COLUMNS:
         json_key = f"{column}_json"
+        if column == "transcript" and not include_transcript:
+            item.pop(json_key, None)
+            continue
         item[column] = json.loads(item.pop(json_key)) if item.get(json_key) is not None else None
     item.pop("input_path", None)
     return item
