@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import uuid
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from . import database
 from .integrations import IntegrationError, download_broll
 from .llm import (
+    ResolvedLLM,
     propose_clips,
     resolve_llm,
 )
@@ -18,6 +22,9 @@ from .settings import AppSettings, get_settings
 
 class ProjectNotFoundError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 def _publish(
@@ -61,27 +68,109 @@ def _duration_bounds(choice: str) -> tuple[float, float]:
 
 
 def _validate_proposals(
-    proposals: list[ClipProposal],
+    proposals: list[object],
     duration: float,
     choice: str,
-) -> None:
+) -> tuple[list[ClipProposal], list[str]]:
     minimum, maximum = _duration_bounds(choice)
     if choice != "Cualquiera" and duration + 0.05 < minimum:
         raise MediaProcessingError(
             f"El video dura {duration:.1f} segundos y no alcanza la duración mínima de {choice}."
         )
-    previous_end = -1.0
-    for proposal in sorted(proposals, key=lambda clip: clip.inicio):
-        clip_duration = proposal.fin - proposal.inicio
+    valid: list[ClipProposal] = []
+    errors: list[str] = []
+    for index, candidate in enumerate(proposals[:10], start=1):
+        label = (
+            str(candidate.get("titulo") or f"#{index}")
+            if isinstance(candidate, dict)
+            else f"#{index}"
+        )
+        try:
+            proposal = ClipProposal.model_validate(candidate)
+        except (ValidationError, TypeError) as error:
+            reason = f"clip {label}: estructura inválida ({str(error).splitlines()[0][:240]})"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
+
         if proposal.fin > duration + 0.05:
-            raise MediaProcessingError("El modelo propuso un clip fuera de la duración del video.")
-        if clip_duration < minimum - 0.05 or clip_duration > min(maximum, duration) + 0.05:
-            raise MediaProcessingError(
-                f"El modelo propuso un clip fuera del rango de duración {choice}."
-            )
+            reason = f"clip {label}: el fin supera la duración del video"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
+        if proposal.fin > duration:
+            proposal = proposal.model_copy(update={"fin": duration})
+
+        clip_duration = proposal.fin - proposal.inicio
+        if (
+            clip_duration < minimum - 0.05
+            or clip_duration > min(maximum, duration) + 0.05
+        ):
+            reason = f"clip {label}: duración fuera del rango solicitado ({choice})"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
+        valid.append(proposal)
+
+    previous_end = -1.0
+    non_overlapping: list[ClipProposal] = []
+    for proposal in sorted(valid, key=lambda clip: clip.inicio):
         if proposal.inicio < previous_end:
-            raise MediaProcessingError("El modelo propuso clips que se solapan.")
+            reason = f"clip {proposal.titulo}: se solapa con otro clip"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
         previous_end = proposal.fin
+        non_overlapping.append(proposal)
+    return non_overlapping, errors
+
+
+def _validate_and_complete_proposals(
+    candidates: list[object],
+    transcript: list[TranscriptSegment],
+    duration: float,
+    choice: str,
+) -> tuple[list[ClipProposal], list[str]]:
+    proposals, errors = _validate_proposals(candidates, duration, choice)
+    if not proposals:
+        return [], errors
+    completed = _complete_clip_ends(proposals, transcript, duration, choice)
+    completed, completion_errors = _validate_proposals(completed, duration, choice)
+    return completed, errors + completion_errors
+
+
+def _propose_valid_clips(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    llm: ResolvedLLM,
+) -> list[ClipProposal]:
+    candidates = propose_clips(transcript, project, duration, llm)
+    proposals, errors = _validate_and_complete_proposals(
+        candidates, transcript, duration, project.duration
+    )
+    if errors:
+        retry_candidates = propose_clips(
+            transcript,
+            project,
+            duration,
+            llm,
+            validation_feedback=errors,
+        )
+        retried, retry_errors = _validate_and_complete_proposals(
+            retry_candidates, transcript, duration, project.duration
+        )
+        proposals, merge_errors = _validate_proposals(
+            [*proposals, *retried], duration, project.duration
+        )
+        errors.extend(retry_errors)
+        errors.extend(merge_errors)
+    if not proposals and errors:
+        raise MediaProcessingError(
+            "El modelo no propuso clips válidos tras un reintento. "
+            + "; ".join(errors[:5])
+        )
+    return proposals
 
 
 def _ends_sentence(text: str) -> bool:
@@ -373,22 +462,11 @@ def process_project(
                 transcript=transcript_data,
             )
         _progress_for_llm(settings, project_id, llm.provider)
-        proposals = propose_clips(
+        proposals = _propose_valid_clips(
             transcript,
             project_config,
             float(metadata["duration"]),
             llm,
-        )
-        proposals = _complete_clip_ends(
-            proposals,
-            transcript,
-            float(metadata["duration"]),
-            project_config.duration,
-        )
-        _validate_proposals(
-            proposals,
-            float(metadata["duration"]),
-            project_config.duration,
         )
         if not proposals:
             database.update_project(settings.database_path, project_id, clips=[])

@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment
+from .schemas import LLMConfig, ProjectConfig, TranscriptSegment
 from .settings import AppSettings
 
 _DEFAULT_MODELS = {
@@ -131,8 +131,15 @@ def propose_clips(
     project: ProjectConfig,
     duration: float,
     llm: ResolvedLLM,
-) -> list[ClipProposal]:
+    validation_feedback: list[str] | None = None,
+) -> list[object]:
     system, user = _prompt(transcript, project, duration)
+    if validation_feedback:
+        user += (
+            "\nLa respuesta anterior contenía propuestas inválidas. Corrige estos errores "
+            "y devuelve una lista revisada de clips:\n"
+            + "\n".join(f"- {error}" for error in validation_feedback)
+        )
     timeout = httpx.Timeout(150, connect=15)
     with httpx.Client(timeout=timeout) as client:
         if llm.provider == "Anthropic":
@@ -163,9 +170,7 @@ def propose_clips(
                 json={
                     "model": llm.model,
                     "temperature": 0.2,
-                    "response_format": {"type": "json_object"}
-                    if "local" in llm.model.lower()
-                    else {"type": "json_object"},
+                    "response_format": {"type": "json_object"},
                     "messages": [
                         {"role": "system", "content": system},
                         {
@@ -190,4 +195,4 @@ def propose_clips(
         parsed = parsed.get("clips")
     if not isinstance(parsed, list):
         raise ValueError("La respuesta LLM no contiene una lista de clips.")
-    return [ClipProposal.model_validate(item) for item in parsed[:10]]
+    return parsed[:10]

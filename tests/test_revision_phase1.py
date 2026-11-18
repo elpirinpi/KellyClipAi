@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 from backend import database
+from backend import llm as llm_module
+from backend import pipeline
 from backend.main import create_app
+from backend.schemas import ProjectConfig
+from backend.llm import ResolvedLLM
 from backend.settings import AppSettings
 
 
@@ -72,3 +78,80 @@ def test_startup_fails_projects_interrupted_by_restart(tmp_path: Path) -> None:
     ready_project = database.get_project(settings.database_path, "ready-project")
     assert ready_project is not None
     assert ready_project["status"] == "ready"
+
+
+def test_llm_keeps_individual_candidates_for_pipeline_validation(
+    monkeypatch,
+) -> None:
+    valid = {
+        "inicio": 10,
+        "fin": 30,
+        "titulo": "Momento válido",
+        "puntuacion": 8,
+        "razon_viral": "Gancho claro.",
+        "palabras_clave": [],
+        "emojis": [],
+    }
+    invalid = {**valid, "dato_inesperado": "se debe descartar en el pipeline"}
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"clips": [valid, invalid]})}}
+                ]
+            },
+        )
+    )
+    client = httpx.Client(transport=transport)
+    monkeypatch.setattr(llm_module.httpx, "Client", lambda **_kwargs: client)
+
+    proposals = llm_module.propose_clips(
+        [],
+        ProjectConfig(),
+        60,
+        ResolvedLLM("OpenAI", "test-token", "gpt-4o-mini", "https://llm.example"),
+    )
+
+    assert proposals == [valid, invalid]
+
+
+def test_invalid_clip_proposals_are_logged_and_retried_once(monkeypatch, caplog) -> None:
+    valid = {
+        "inicio": 10,
+        "fin": 30,
+        "titulo": "Primer clip",
+        "puntuacion": 8,
+        "razon_viral": "Gancho claro.",
+        "palabras_clave": [],
+        "emojis": [],
+    }
+    overlapping = {**valid, "inicio": 20, "fin": 40, "titulo": "Solapado"}
+    out_of_range = {**valid, "inicio": 75, "fin": 90, "titulo": "Fuera de rango"}
+    retried = {**valid, "inicio": 32, "fin": 52, "titulo": "Clip corregido"}
+    responses = [[valid, overlapping, out_of_range], [retried]]
+    feedback: list[list[str] | None] = []
+
+    def propose_clips(*_args, validation_feedback=None):
+        feedback.append(validation_feedback)
+        return responses.pop(0)
+
+    monkeypatch.setattr(pipeline, "propose_clips", propose_clips)
+    proposals = pipeline._propose_valid_clips(
+        [],
+        ProjectConfig(),
+        60,
+        ResolvedLLM("OpenAI", "test-token", "gpt-4o-mini", "https://llm.example"),
+    )
+
+    assert [proposal.titulo for proposal in proposals] == [
+        "Primer clip",
+        "Clip corregido",
+    ]
+    assert len(feedback) == 2
+    assert feedback[0] is None
+    assert feedback[1]
+    assert any("solapa" in error for error in feedback[1])
+    assert any("duración" in error for error in feedback[1])
+    assert "Solapado" in caplog.text
+    assert "Fuera de rango" in caplog.text
