@@ -47,6 +47,7 @@ def test_oauth_tokens_are_encrypted_and_legacy_tokens_migrate(tmp_path: Path) ->
                 database.utc_now(),
             ),
         )
+        connection.execute("PRAGMA user_version = 0")
 
     database.initialize(database_path)
     with database.connection(database_path) as connection:

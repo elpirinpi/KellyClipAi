@@ -66,6 +66,9 @@ no se guarda en Supabase ni se devuelve al navegador. No se puede descifrar al
 mover la base de datos a otro equipo o a otra cuenta de Windows.
 Al actualizar una instalación con datos anteriores, esos proyectos locales se
 asignan al primer usuario que inicie sesión en esa instalación.
+Los cambios de esquema de SQLite se aplican mediante migraciones numeradas en
+`PRAGMA user_version`; las bases creadas por versiones anteriores se actualizan
+al iniciar la aplicación.
 
 Instala el frontend con las versiones fijadas en `app/package-lock.json`:
 

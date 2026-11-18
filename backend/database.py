@@ -17,6 +17,7 @@ from .credential_store import (
 )
 
 _lock = threading.RLock()
+_LATEST_SCHEMA_VERSION = 1
 _JSON_COLUMNS = {"config", "metadata", "transcript", "clips"}
 _PROJECT_COLUMNS = {
     "title",
@@ -54,6 +55,12 @@ def connection(database_path: Path) -> Iterator[sqlite3.Connection]:
 
 def initialize(database_path: Path) -> None:
     with _lock, connection(database_path) as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > _LATEST_SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(
+                f"Database has newer schema version {version}; "
+                f"this application supports up to {_LATEST_SCHEMA_VERSION}."
+            )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
@@ -173,81 +180,95 @@ def initialize(database_path: Path) -> None:
             );
             """
         )
-        schedule_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(scheduled_jobs)")
+        _run_migrations(conn)
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    migrations = {1: _migrate_schema_v1}
+    for next_version in range(version + 1, _LATEST_SCHEMA_VERSION + 1):
+        conn.execute("BEGIN IMMEDIATE")
+        migrations[next_version](conn)
+        conn.execute(f"PRAGMA user_version = {next_version}")
+        conn.commit()
+
+
+def _migrate_schema_v1(conn: sqlite3.Connection) -> None:
+    schedule_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(scheduled_jobs)")
+    }
+    if "visibility" not in schedule_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_jobs ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'"
+        )
+    if "external_url" not in schedule_columns:
+        conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
+    share_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(clip_shares)")
+    }
+    if "expires_at" not in share_columns:
+        conn.execute("ALTER TABLE clip_shares ADD COLUMN expires_at TEXT")
+    if "revoked_at" not in share_columns:
+        conn.execute("ALTER TABLE clip_shares ADD COLUMN revoked_at TEXT")
+    conn.execute(
+        """
+        UPDATE clip_shares
+        SET expires_at = datetime(created_at, '+30 days')
+        WHERE expires_at IS NULL
+        """
+    )
+    for table in ("staged_media", "projects", "oauth_states"):
+        columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
         }
-        if "visibility" not in schedule_columns:
-            conn.execute(
-                "ALTER TABLE scheduled_jobs ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'"
-            )
-        if "external_url" not in schedule_columns:
-            conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
-        share_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(clip_shares)")
-        }
-        if "expires_at" not in share_columns:
-            conn.execute("ALTER TABLE clip_shares ADD COLUMN expires_at TEXT")
-        if "revoked_at" not in share_columns:
-            conn.execute("ALTER TABLE clip_shares ADD COLUMN revoked_at TEXT")
-        conn.execute(
-            """
-            UPDATE clip_shares
-            SET expires_at = datetime(created_at, '+30 days')
-            WHERE expires_at IS NULL
-            """
+        if "owner_id" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+    _migrate_owned_table(
+        conn,
+        "custom_templates",
+        """
+        CREATE TABLE custom_templates (
+            owner_id TEXT NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            base_template TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (owner_id, name)
         )
-        for table in ("staged_media", "projects", "oauth_states"):
-            columns = {
-                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
-            }
-            if "owner_id" not in columns:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
-        _migrate_owned_table(
-            conn,
-            "custom_templates",
-            """
-            CREATE TABLE custom_templates (
-                owner_id TEXT NOT NULL,
-                name TEXT NOT NULL COLLATE NOCASE,
-                base_template TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (owner_id, name)
-            )
-            """,
-            "INSERT INTO custom_templates (owner_id, name, base_template, created_at) "
-            "SELECT 'legacy', name, base_template, created_at FROM custom_templates_legacy",
+        """,
+        "INSERT INTO custom_templates (owner_id, name, base_template, created_at) "
+        "SELECT 'legacy', name, base_template, created_at FROM custom_templates_legacy",
+    )
+    _migrate_owned_table(
+        conn,
+        "connected_accounts",
+        """
+        CREATE TABLE connected_accounts (
+            owner_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            expires_at TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (owner_id, provider)
         )
-        _migrate_owned_table(
-            conn,
-            "connected_accounts",
-            """
-            CREATE TABLE connected_accounts (
-                owner_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                account_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                access_token TEXT NOT NULL,
-                refresh_token TEXT,
-                expires_at TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (owner_id, provider)
-            )
-            """,
-            "INSERT INTO connected_accounts (owner_id, provider, account_id, display_name, "
-            "access_token, refresh_token, expires_at, metadata_json, updated_at) "
-            "SELECT 'legacy', provider, account_id, display_name, access_token, refresh_token, "
-            "expires_at, metadata_json, updated_at FROM connected_accounts_legacy",
-        )
-        _migrate_oauth_tokens(conn)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS projects_owner_created "
-            "ON projects(owner_id, created_at DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
-            "ON staged_media(owner_id, source_type, created_at DESC)"
-        )
+        """,
+        "INSERT INTO connected_accounts (owner_id, provider, account_id, display_name, "
+        "access_token, refresh_token, expires_at, metadata_json, updated_at) "
+        "SELECT 'legacy', provider, account_id, display_name, access_token, refresh_token, "
+        "expires_at, metadata_json, updated_at FROM connected_accounts_legacy",
+    )
+    _migrate_oauth_tokens(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS projects_owner_created "
+        "ON projects(owner_id, created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
+        "ON staged_media(owner_id, source_type, created_at DESC)"
+    )
 
 
 def _migrate_owned_table(
