@@ -262,6 +262,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .scheduled-job strong { overflow: hidden; color: #3c4659; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 500; text-transform: capitalize; }
 .scheduled-job small, .scheduled-job p { margin: 0; color: #838b9c; font-size: 10px; }
 .scheduled-job p { grid-column: 1 / -1; line-height: 1.5; }
+.overdue-job-actions { grid-column: 1 / -1; display: flex !important; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.overdue-job-actions p { flex-basis: 100%; }
 .job-status { color: #6e788e; font-size: 10px; }
 .job-status.published { color: #188345; }
 .job-status.failed { color: #a23c31; }

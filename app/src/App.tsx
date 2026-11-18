@@ -134,6 +134,7 @@ type ScheduleJob = {
   platform: string;
   scheduled_at: string;
   status: string;
+  confirmation_required: boolean;
   visibility: string;
   external_id?: string | null;
   external_url: string | null;
@@ -1851,9 +1852,29 @@ function ResultsPage({
     }
   }, [project]);
 
+  const resolveOverdueScheduleJob = async (
+    jobId: string,
+    action: 'publish_now' | 'discard',
+  ) => {
+    setBusyAction(`overdue:${jobId}`);
+    try {
+      const response = await apiFetch(`${API_BASE}/api/scheduled-jobs/${jobId}/resolve-overdue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      await refreshScheduleJobs();
+    } catch (error) {
+      setScheduleError(error instanceof Error ? error.message : 'No se pudo resolver la publicación vencida.');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
   useEffect(() => {
     setScheduleJobs([]);
-    if (project?.status === 'completed') void refreshScheduleJobs();
+    if (project) void refreshScheduleJobs();
   }, [project?.id, project?.status, refreshScheduleJobs]);
 
   useEffect(() => {
@@ -2074,6 +2095,27 @@ function ResultsPage({
                   downloadError instanceof Error ? downloadError.message : 'No se pudo descargar el video.',
                 ))}>Descargar MP4</button>}
                 {job.error && <p role="status">{job.error}</p>}
+                {job.confirmation_required && (
+                  <div className="overdue-job-actions">
+                    <p role="status">La app se cerró antes de publicar. Elige si quieres publicar ahora o descartar esta tarea.</p>
+                    <button
+                      type="button"
+                      className="job-link"
+                      disabled={busyAction === `overdue:${job.id}`}
+                      onClick={() => void resolveOverdueScheduleJob(job.id, 'publish_now')}
+                    >
+                      Publicar ahora
+                    </button>
+                    <button
+                      type="button"
+                      className="job-link"
+                      disabled={busyAction === `overdue:${job.id}`}
+                      onClick={() => void resolveOverdueScheduleJob(job.id, 'discard')}
+                    >
+                      Descartar
+                    </button>
+                  </div>
+                )}
               </article>
             ))}
           </div>

@@ -179,6 +179,10 @@ class PublishClipsRequest(ClipArchiveRequest):
         return self
 
 
+class OverdueScheduleResolution(BaseModel):
+    action: Literal["publish_now", "discard"]
+
+
 class ClipResolutionRequest(BaseModel):
     resolution: Literal[720, 1080]
 

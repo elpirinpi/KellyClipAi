@@ -663,3 +663,74 @@ def test_delete_project_rejects_active_processing(
 
     assert response.status_code == 409
     assert database.get_project(settings.database_path, project_id) is not None
+
+
+def test_startup_holds_overdue_publications_for_user_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    database.initialize(settings.database_path)
+    project_id = "overdue-publish-project"
+    config = ProjectConfig()
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Overdue project",
+        tmp_path / "source.mp4",
+        config.model_dump(mode="json"),
+        "test-user",
+    )
+    jobs = database.enqueue_schedule_jobs(
+        settings.database_path,
+        project_id,
+        ["clip-publish", "clip-discard"],
+        "youtube",
+        "2000-01-01T00:00:00+00:00",
+        "private",
+    )
+    jobs_by_clip = {job["clip_id"]: job for job in jobs}
+    assert len(database.due_schedule_jobs(settings.database_path, database.utc_now())) == 2
+
+    async def idle_schedule_worker(_settings: AppSettings) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_module, "schedule_worker", idle_schedule_worker)
+    with TestClient(main_module.create_app(settings, auth_required=False)) as client:
+        listed = client.get("/api/scheduled-jobs")
+        published = client.post(
+            f"/api/scheduled-jobs/{jobs_by_clip['clip-publish']['id']}/resolve-overdue",
+            json={"action": "publish_now"},
+        )
+        discarded = client.post(
+            f"/api/scheduled-jobs/{jobs_by_clip['clip-discard']['id']}/resolve-overdue",
+            json={"action": "discard"},
+        )
+        held = database.due_schedule_jobs(
+            settings.database_path, database.utc_now()
+        )
+        current_jobs = database.list_schedule_jobs(
+            settings.database_path, owner_id="test-user"
+        )
+
+    assert listed.status_code == 200
+    assert all(job["confirmation_required"] for job in listed.json())
+    assert published.status_code == 200
+    assert discarded.status_code == 200
+    assert [job["clip_id"] for job in held] == ["clip-publish"]
+    assert next(job for job in current_jobs if job["clip_id"] == "clip-publish")[
+        "confirmation_required"
+    ] is False
+    discarded_job = next(
+        job for job in current_jobs if job["clip_id"] == "clip-discard"
+    )
+    assert discarded_job["status"] == "failed"
+    assert "se descart" in discarded_job["error"].casefold()

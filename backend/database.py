@@ -165,6 +165,10 @@ def initialize(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS scheduled_jobs_due
                 ON scheduled_jobs(status, scheduled_at);
+            CREATE TABLE IF NOT EXISTS schedule_job_confirmations (
+                job_id TEXT PRIMARY KEY REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+                detected_at TEXT NOT NULL
+            );
             """
         )
         schedule_columns = {
@@ -1033,7 +1037,19 @@ def enqueue_schedule_jobs(
 
 
 def schedule_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row)
+    job = dict(row)
+    job["confirmation_required"] = bool(job.get("confirmation_required", False))
+    return job
+
+
+def _schedule_job_select() -> str:
+    return """
+        scheduled_jobs.*,
+        EXISTS(
+            SELECT 1 FROM schedule_job_confirmations
+            WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
+        ) AS confirmation_required
+    """
 
 
 def list_schedule_jobs(
@@ -1044,8 +1060,8 @@ def list_schedule_jobs(
     with connection(database_path) as conn:
         if project_id and owner_id:
             rows = conn.execute(
-                """
-                SELECT scheduled_jobs.* FROM scheduled_jobs
+                f"""
+                SELECT {_schedule_job_select()} FROM scheduled_jobs
                 JOIN projects ON projects.id = scheduled_jobs.project_id
                 WHERE scheduled_jobs.project_id = ? AND projects.owner_id = ?
                 ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
@@ -1054,13 +1070,13 @@ def list_schedule_jobs(
             ).fetchall()
         elif project_id:
             rows = conn.execute(
-                "SELECT * FROM scheduled_jobs WHERE project_id = ? ORDER BY scheduled_at, created_at",
+                f"SELECT {_schedule_job_select()} FROM scheduled_jobs WHERE project_id = ? ORDER BY scheduled_at, created_at",
                 (project_id,),
             ).fetchall()
         elif owner_id:
             rows = conn.execute(
-                """
-                SELECT scheduled_jobs.* FROM scheduled_jobs
+                f"""
+                SELECT {_schedule_job_select()} FROM scheduled_jobs
                 JOIN projects ON projects.id = scheduled_jobs.project_id
                 WHERE projects.owner_id = ?
                 ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
@@ -1069,7 +1085,7 @@ def list_schedule_jobs(
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM scheduled_jobs ORDER BY scheduled_at, created_at"
+                f"SELECT {_schedule_job_select()} FROM scheduled_jobs ORDER BY scheduled_at, created_at"
             ).fetchall()
     return [schedule_job_from_row(row) for row in rows]
 
@@ -1079,7 +1095,7 @@ def get_schedule_job(
     job_id: str,
     owner_id: str | None = None,
 ) -> dict[str, Any] | None:
-    query = "SELECT scheduled_jobs.* FROM scheduled_jobs"
+    query = f"SELECT {_schedule_job_select()} FROM scheduled_jobs"
     parameters: tuple[Any, ...] = (job_id,)
     if owner_id is not None:
         query += " JOIN projects ON projects.id = scheduled_jobs.project_id"
@@ -1099,11 +1115,76 @@ def due_schedule_jobs(database_path: Path, now: str) -> list[dict[str, Any]]:
             SELECT scheduled_jobs.*, projects.owner_id FROM scheduled_jobs
             JOIN projects ON projects.id = scheduled_jobs.project_id
             WHERE scheduled_jobs.status = 'scheduled' AND scheduled_jobs.scheduled_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM schedule_job_confirmations
+                  WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
+              )
             ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
             """,
             (now,),
         ).fetchall()
     return [schedule_job_from_row(row) for row in rows]
+
+
+def hold_overdue_schedule_jobs(database_path: Path, now: str) -> int:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO schedule_job_confirmations (job_id, detected_at)
+            SELECT id, ?
+            FROM scheduled_jobs
+            WHERE status = 'scheduled' AND scheduled_at <= ?
+            """,
+            (now, now),
+        )
+    return cursor.rowcount
+
+
+def resolve_overdue_schedule_job(
+    database_path: Path,
+    job_id: str,
+    action: str,
+) -> bool:
+    if action not in {"publish_now", "discard"}:
+        raise ValueError(f"Acción de publicación vencida no válida: {action}")
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT scheduled_jobs.id FROM scheduled_jobs
+            JOIN schedule_job_confirmations
+              ON schedule_job_confirmations.job_id = scheduled_jobs.id
+            WHERE scheduled_jobs.id = ? AND scheduled_jobs.status = 'scheduled'
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if action == "publish_now":
+            conn.execute(
+                """
+                UPDATE scheduled_jobs
+                SET scheduled_at = ?, error = NULL, updated_at = ?
+                WHERE id = ? AND status = 'scheduled'
+                """,
+                (now, now, job_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE scheduled_jobs
+                SET status = 'failed',
+                    error = 'La publicación vencida se descartó al reabrir la aplicación.',
+                    updated_at = ?
+                WHERE id = ? AND status = 'scheduled'
+                """,
+                (now, job_id),
+            )
+        conn.execute(
+            "DELETE FROM schedule_job_confirmations WHERE job_id = ?",
+            (job_id,),
+        )
+    return True
 
 
 def fail_interrupted_schedule_jobs(database_path: Path) -> int:
@@ -1128,6 +1209,10 @@ def claim_schedule_job(database_path: Path, job_id: str) -> bool:
             UPDATE scheduled_jobs
             SET status = 'processing', error = NULL, updated_at = ?
             WHERE id = ? AND status = 'scheduled'
+              AND NOT EXISTS (
+                  SELECT 1 FROM schedule_job_confirmations
+                  WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
+              )
             """,
             (utc_now(), job_id),
         )

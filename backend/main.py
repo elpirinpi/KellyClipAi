@@ -78,6 +78,7 @@ from .schemas import (
     CustomTemplateRequest,
     LLMConfig,
     LLMSettingsRequest,
+    OverdueScheduleResolution,
     ProcessRequest,
     ProjectConfig,
     PublishClipsRequest,
@@ -428,6 +429,10 @@ def create_app(
         database.fail_interrupted_staged_media(app_settings.database_path)
         _cleanup_expired_staging(app_settings)
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
+        database.hold_overdue_schedule_jobs(
+            app_settings.database_path,
+            database.utc_now(),
+        )
         processing_queue = ProjectProcessingQueue(
             app_settings.processing_concurrency,
             lambda project_id, llm_config, retry_failed_only: asyncio.to_thread(
@@ -882,6 +887,37 @@ def create_app(
                 owner_id=request_user_id(request),
             )
         ]
+
+    @application.post("/api/scheduled-jobs/{job_id}/resolve-overdue")
+    def resolve_overdue_schedule_job(
+        job_id: str,
+        resolution: OverdueScheduleResolution,
+        request: Request,
+    ) -> dict:
+        job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        if not job.get("confirmation_required") or not database.resolve_overdue_schedule_job(
+            app_settings.database_path,
+            job_id,
+            resolution.action,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="La publicación ya no está pendiente de confirmación.",
+            )
+        updated_job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if updated_job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        return serialize_schedule_job(updated_job)
 
     @application.get("/api/scheduled-jobs/{job_id}/download")
     def download_scheduled_export(job_id: str, request: Request) -> FileResponse:
