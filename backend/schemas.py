@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -20,7 +20,7 @@ class ScheduledPublishing(BaseModel):
     def require_timezone_and_normalize(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("La fecha programada debe incluir zona horaria.")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
     @model_validator(mode="after")
     def validate_visibility(self) -> ScheduledPublishing:

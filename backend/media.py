@@ -5,8 +5,9 @@ import re
 import subprocess
 import textwrap
 import threading
+from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
-from typing import Callable
 
 from .face_tracking import (
     FaceCropKeyframe,
@@ -468,8 +469,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for index, group in enumerate(groups):
         begin = float(group[0]["preview_start"])
         end = max(float(group[-1]["preview_end"]), begin + 0.08)
-        if end > clip_duration:
-            end = clip_duration
+        end = min(end, clip_duration)
         parts: list[str] = []
         for word in group:
             text = _ass_escape(str(word["text"]))
@@ -523,7 +523,7 @@ def _crop_coordinate_expression(
         raise ValueError(f"Coordenada de recorte no válida: {coordinate}.")
 
     expression = f"{getattr(points[-1], coordinate):.3f}"
-    for current, following in reversed(list(zip(points, points[1:], strict=False))):
+    for current, following in reversed(list(pairwise(points))):
         duration = following.time - current.time
         if duration <= 0:
             continue
@@ -599,7 +599,7 @@ def _build_filter(
             f"trim=duration={_filter_time(clip_duration)},setpts=PTS-STARTPTS,setsar=1[broll]"
         )
         parts.append(
-            f"[vout][broll]overlay=x=W-w-24:y=24:eof_action=repeat:shortest=0[vbroll]"
+            "[vout][broll]overlay=x=W-w-24:y=24:eof_action=repeat:shortest=0[vbroll]"
         )
         video_output = "[vbroll]"
     if censor_ranges:

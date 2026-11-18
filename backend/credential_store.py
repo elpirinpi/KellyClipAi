@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import ctypes
 import os
-from ctypes import POINTER, Structure, byref, c_ubyte, c_void_p, cast, create_string_buffer
+from ctypes import (
+    POINTER,
+    Structure,
+    byref,
+    c_ubyte,
+    c_void_p,
+    cast,
+    create_string_buffer,
+)
 from ctypes.wintypes import BOOL, DWORD
 
 

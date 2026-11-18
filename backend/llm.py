@@ -197,5 +197,5 @@ def propose_clips(
     if isinstance(parsed, dict):
         parsed = parsed.get("clips")
     if not isinstance(parsed, list):
-        raise ValueError("La respuesta LLM no contiene una lista de clips.")
+        raise TypeError("La respuesta LLM no contiene una lista de clips.")
     return parsed[:10]

@@ -5,29 +5,38 @@ import ipaddress
 import json
 import logging
 import secrets
-import sqlite3
 import shutil
 import socket
+import sqlite3
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import yt_dlp
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import ValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 from starlette.types import Scope
 
 from . import database
@@ -55,8 +64,8 @@ from .integrations import (
     download_zoom_recording,
     integration_status,
     list_zoom_recordings,
-    publish_clip,
     provider_missing_credentials,
+    publish_clip,
 )
 from .llm import LLMConfigurationError, resolve_llm
 from .media import MediaProcessingError
@@ -436,14 +445,18 @@ def create_app(
                 {"detail": "No se encontró la importación."},
                 status_code=404,
             )
-        elif len(path_parts) >= 3 and path_parts[1] == "scheduled-jobs":
-            if database.get_schedule_job(
+        elif (
+            len(path_parts) >= 3
+            and path_parts[1] == "scheduled-jobs"
+            and database.get_schedule_job(
                 app_settings.database_path, path_parts[2], user_id
-            ) is None:
-                return JSONResponse(
-                    {"detail": "No se encontró la tarea programada."},
-                    status_code=404,
-                )
+            )
+            is None
+        ):
+            return JSONResponse(
+                {"detail": "No se encontró la tarea programada."},
+                status_code=404,
+            )
         return await call_next(request)
 
     def request_user_id(request: Request) -> str:
@@ -634,7 +647,7 @@ def create_app(
             app_settings.database_path,
             state,
             provider,
-            (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             owner_id,
         )
         return {"authorization_url": target}
@@ -649,7 +662,7 @@ def create_app(
         saved_state = database.consume_oauth_state_record(
             app_settings.database_path,
             state,
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ) if state else None
         result = "error"
         detail = "La autorización no se pudo validar. Inicia de nuevo la conexión."
@@ -1081,7 +1094,7 @@ def create_app(
     @application.post("/api/projects", status_code=201)
     def create_uploaded_project(
         request: Request,
-        file: UploadFile = File(...),
+        file: Annotated[UploadFile, File(...)],
         config: str = Form(...),
     ) -> dict:
         project_config = _parse_config(config)
@@ -1214,7 +1227,7 @@ def create_app(
                 status_code=409,
                 detail="Este proyecto tiene publicaciones pendientes. Espera a que se resuelvan antes de reprocesarlo.",
             )
-        if stored_config.schedule and stored_config.schedule.scheduled_at <= datetime.now(timezone.utc):
+        if stored_config.schedule and stored_config.schedule.scheduled_at <= datetime.now(UTC):
             raise HTTPException(
                 status_code=422,
                 detail="La fecha programada ya pasó. Elige una fecha futura antes de procesar.",

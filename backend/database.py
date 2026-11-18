@@ -4,10 +4,11 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 _lock = threading.RLock()
 _JSON_COLUMNS = {"config", "metadata", "transcript", "clips"}
@@ -26,7 +27,7 @@ _PROJECT_COLUMNS = {
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @contextmanager

@@ -12,10 +12,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 _RELEASE_URL = "https://api.github.com/repos/elpirinpi/KellyClipAi/releases/latest"
 _MAX_INSTALLER_SIZE = 1024 * 1024 * 1024
 _VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+logger = logging.getLogger(__name__)
 
 
 class UpdateError(RuntimeError):
@@ -162,8 +162,8 @@ class UpdateManager:
         except UpdateError as error:
             with self._lock:
                 self._status.update(state="error", error=str(error))
-        except Exception as error:
-            logging.exception("Falló la comprobación de actualizaciones")
+        except Exception:
+            logger.exception("Falló la comprobación de actualizaciones")
             with self._lock:
                 self._status.update(
                     state="error",
@@ -241,9 +241,9 @@ class UpdateManager:
                     error=f"No se pudo descargar el instalador: {error}",
                     progress=0,
                 )
-        except Exception as error:
+        except Exception:
             temporary.unlink(missing_ok=True)
-            logging.exception("Falló la descarga de la actualización")
+            logger.exception("Falló la descarga de la actualización")
             with self._lock:
                 self._status.update(
                     state="error",

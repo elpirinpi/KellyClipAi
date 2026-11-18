@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
@@ -195,7 +195,7 @@ def _expires_at(expires_in: object) -> str | None:
         return None
     if seconds <= 0:
         return None
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
 
 
 def complete_oauth(
@@ -578,7 +578,7 @@ def _access_token(
             expiry = datetime.fromisoformat(expires_at)
         except ValueError as error:
             raise IntegrationError(f"La fecha de sesión de {provider} no es válida; vuelve a conectar.") from error
-        if expiry <= datetime.now(timezone.utc) + timedelta(minutes=2):
+        if expiry <= datetime.now(UTC) + timedelta(minutes=2):
             account = _refresh_account(settings, provider, account, owner_id)
     return account["access_token"], account
 
@@ -850,7 +850,7 @@ def list_zoom_recordings(
     owner_id: str = "legacy",
 ) -> list[dict[str, Any]]:
     token, _ = _access_token(settings, "zoom", owner_id)
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     start = today - timedelta(days=30)
     with httpx.Client(timeout=30, follow_redirects=True) as client:
         payload = _request_json(
@@ -1039,16 +1039,20 @@ def download_broll(
     target_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
     try:
-        with httpx.Client(timeout=httpx.Timeout(30, read=300), follow_redirects=True) as client:
-            with client.stream("GET", download_url) as response:
-                if response.is_error:
-                    raise IntegrationError(f"{provider.title()} no pudo descargar el B-roll (HTTP {response.status_code}).")
-                with target_path.open("wb") as target:
-                    for chunk in response.iter_bytes(1024 * 1024):
-                        written += len(chunk)
-                        if written > 250 * 1024 * 1024:
-                            raise IntegrationError("El B-roll supera el límite local de 250 MB.")
-                        target.write(chunk)
+        with (
+            httpx.Client(
+                timeout=httpx.Timeout(30, read=300), follow_redirects=True
+            ) as client,
+            client.stream("GET", download_url) as response,
+        ):
+            if response.is_error:
+                raise IntegrationError(f"{provider.title()} no pudo descargar el B-roll (HTTP {response.status_code}).")
+            with target_path.open("wb") as target:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    written += len(chunk)
+                    if written > 250 * 1024 * 1024:
+                        raise IntegrationError("El B-roll supera el límite local de 250 MB.")
+                    target.write(chunk)
     except httpx.RequestError as error:
         target_path.unlink(missing_ok=True)
         raise IntegrationError(f"No se pudo descargar el B-roll desde {provider.title()}.") from error

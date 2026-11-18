@@ -15,7 +15,13 @@ from .llm import (
     propose_clips,
     resolve_llm,
 )
-from .media import MediaProcessingError, create_thumbnail, probe_media, render_clip, transcribe
+from .media import (
+    MediaProcessingError,
+    create_thumbnail,
+    probe_media,
+    render_clip,
+    transcribe,
+)
 from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment
 from .settings import AppSettings, get_settings
 
@@ -524,6 +530,7 @@ def process_project(
             completion_message,
         )
     except Exception as error:
+        logger.exception("Fallo inesperado al procesar el proyecto %s", project_id)
         if output_dir.exists():
             shutil.rmtree(output_dir)
         message = str(error).strip() or "Error inesperado durante el procesamiento."
