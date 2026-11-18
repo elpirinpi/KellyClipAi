@@ -507,11 +507,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return censor_ranges
 
 
-def _filter_path(path: Path) -> str:
-    value = path.resolve().as_posix().replace(":", r"\:")
-    return value.replace("'", r"\'")
-
-
 def _filter_time(value: float) -> str:
     return f"{max(0.0, value):.3f}"
 
@@ -589,7 +584,9 @@ def _build_filter(
             + f"concat=n={len(intervals)}:v=1:a=1[vcat][acat]"
         )
         video_input, audio_input = "[vcat]", "[acat]"
-    parts.append(f"{video_input}subtitles=filename='{_filter_path(subtitle_path)}'[vout]")
+    parts.append(
+        f"{video_input}subtitles=filename='{subtitle_path.name}'[vout]"
+    )
     video_output = "[vout]"
     if include_broll:
         broll_width = max(160, width // 3)
@@ -693,12 +690,12 @@ def _render_clip(
         "-ss",
         f"{proposal.inicio:.3f}",
         "-i",
-        str(input_path),
+        str(input_path.resolve()),
     ]
     if broll_path is not None:
         if not broll_path.is_file():
             raise MediaProcessingError("No se encontró el archivo de B-roll descargado.")
-        arguments.extend(["-stream_loop", "-1", "-i", str(broll_path)])
+        arguments.extend(["-stream_loop", "-1", "-i", str(broll_path.resolve())])
     arguments.extend([
         "-t",
         f"{source_duration:.3f}",
@@ -724,7 +721,7 @@ def _render_clip(
         "pipe:1",
         "-nostats",
         "-y",
-        str(output_path),
+        str(output_path.resolve()),
     ])
     try:
         process = subprocess.Popen(
@@ -734,6 +731,7 @@ def _render_clip(
             text=True,
             encoding="utf-8",
             errors="replace",
+            cwd=subtitle_path.resolve().parent,
         )
         last_lines: list[str] = []
         if process.stdout is None:

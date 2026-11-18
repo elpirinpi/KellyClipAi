@@ -269,6 +269,37 @@ def _create_completed_project_with_clip(
     return project_id, clip_id, clip_path
 
 
+def test_clip_render_succeeds_when_subtitle_directory_contains_apostrophe(
+    video_with_audio: Path,
+    tmp_path: Path,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg
+    output_dir = tmp_path / "O'Brien"
+    output_dir.mkdir()
+    proposal = ClipProposal(
+        inicio=0.1,
+        fin=1.8,
+        titulo="Prueba de ruta",
+        puntuacion=7,
+        razon_viral="Una frase de prueba.",
+    )
+
+    duration, _ = render_clip(
+        video_with_audio,
+        output_dir / "clip.mp4",
+        output_dir / "clip.ass",
+        proposal,
+        ProjectConfig(options={"face_tracking": False}),
+        [],
+        ffmpeg,
+        lambda _percent: None,
+    )
+
+    assert duration == pytest.approx(1.7)
+    assert (output_dir / "clip.mp4").is_file()
+
+
 def test_archive_and_public_share_serve_selected_real_clip(
     video_with_audio: Path, tmp_path: Path
 ) -> None:
