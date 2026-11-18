@@ -21,7 +21,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from sse_starlette.sse import EventSourceResponse
@@ -31,6 +31,16 @@ from starlette.background import BackgroundTask
 from starlette.types import Scope
 
 from . import database
+from .auth import (
+    AuthenticationError,
+    AuthenticationUnavailable,
+    SupabaseAuthVerifier,
+)
+from .credential_store import (
+    CredentialStoreError,
+    decrypt_api_key,
+    encrypt_api_key,
+)
 from .editor import (
     editor_preview_path,
     editor_state,
@@ -57,6 +67,8 @@ from .schemas import (
     ClipEditRequest,
     ClipResolutionRequest,
     CustomTemplateRequest,
+    LLMConfig,
+    LLMSettingsRequest,
     ProcessRequest,
     ProjectConfig,
     PublishClipsRequest,
@@ -108,6 +120,7 @@ def _parse_config(value: str) -> ProjectConfig:
 
 
 def _serialize_project(project: dict) -> dict:
+    project.pop("owner_id", None)
     project_id = project["id"]
     project["thumbnail_url"] = (
         f"/api/projects/{project_id}/thumbnail" if project.get("metadata") else None
@@ -289,8 +302,21 @@ def _serialize_staged_media(staged: dict[str, Any]) -> dict[str, Any]:
 def create_app(
     settings: AppSettings | None = None,
     web_dir: Path | None = None,
+    *,
+    auth_required: bool = True,
+    auth_verifier: Any | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
+    verifier = auth_verifier
+    if (
+        verifier is None
+        and app_settings.supabase_url
+        and app_settings.supabase_anon_key
+    ):
+        verifier = SupabaseAuthVerifier(
+            app_settings.supabase_url,
+            app_settings.supabase_anon_key,
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -307,38 +333,242 @@ def create_app(
                 await scheduler_task
             except asyncio.CancelledError:
                 pass
+            if isinstance(verifier, SupabaseAuthVerifier):
+                await verifier.close()
 
-    application = FastAPI(title="kellyClipAi API", version="1.0.2", lifespan=lifespan)
+    application = FastAPI(title="kellyClipAi API", version="1.0.3", lifespan=lifespan)
     application.state.settings = app_settings
+    application.state.auth_required = auth_required
+    application.state.auth_verifier = verifier
+    application.state.claimed_legacy_users = set()
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(app_settings.cors_origins),
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["DELETE", "GET", "POST", "PUT"],
-        allow_headers=["Content-Type", "Last-Event-ID"],
+        allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
     )
+
+    @application.middleware("http")
+    async def authenticate_api_request(request: Request, call_next):
+        path = request.url.path
+        if not path.startswith("/api/") or request.method == "OPTIONS":
+            return await call_next(request)
+        if (
+            path in {"/api/health", "/api/auth/config"}
+            or path.startswith("/api/shares/")
+            or (
+                path.startswith("/api/integrations/")
+                and path.endswith("/callback")
+            )
+        ):
+            return await call_next(request)
+
+        user_id: str
+        if not application.state.auth_required:
+            user_id = "test-user"
+        else:
+            authorization = request.headers.get("authorization", "")
+            token = (
+                authorization[7:].strip()
+                if authorization.lower().startswith("bearer ")
+                else ""
+            )
+            if not token and _is_media_request(request):
+                token = request.cookies.get("kellyclip_media", "")
+            if not token:
+                return JSONResponse(
+                    {"detail": "Inicia sesión para continuar."},
+                    status_code=401,
+                )
+            current_verifier = application.state.auth_verifier
+            if current_verifier is None:
+                return JSONResponse(
+                    {
+                        "detail": (
+                            "Supabase no está configurado. Añade SUPABASE_URL y "
+                            "SUPABASE_ANON_KEY al archivo .env."
+                        )
+                    },
+                    status_code=503,
+                )
+            try:
+                authenticated = await current_verifier.verify(token)
+            except AuthenticationUnavailable as error:
+                return JSONResponse({"detail": str(error)}, status_code=503)
+            except AuthenticationError as error:
+                return JSONResponse({"detail": str(error)}, status_code=401)
+            user_id = authenticated.id
+
+        request.state.user_id = user_id
+        if user_id not in application.state.claimed_legacy_users:
+            database.claim_legacy_data(app_settings.database_path, user_id)
+            application.state.claimed_legacy_users.add(user_id)
+
+        path_parts = path.strip("/").split("/")
+        if len(path_parts) >= 3 and path_parts[1] == "projects":
+            project_id = path_parts[2]
+            if project_id != "from-url" and database.get_project(
+                app_settings.database_path, project_id, user_id
+            ) is None:
+                return JSONResponse(
+                    {"detail": "No se encontró el proyecto."},
+                    status_code=404,
+                )
+        elif (
+            len(path_parts) >= 3
+            and path_parts[1] == "staged-media"
+            and path_parts[2] not in {"latest", "uploads", "downloads"}
+            and database.get_staged_media(
+                app_settings.database_path, path_parts[2], user_id
+            )
+            is None
+        ):
+            return JSONResponse(
+                {"detail": "No se encontró la importación."},
+                status_code=404,
+            )
+        elif len(path_parts) >= 3 and path_parts[1] == "scheduled-jobs":
+            if database.get_schedule_job(
+                app_settings.database_path, path_parts[2], user_id
+            ) is None:
+                return JSONResponse(
+                    {"detail": "No se encontró la tarea programada."},
+                    status_code=404,
+                )
+        return await call_next(request)
+
+    def request_user_id(request: Request) -> str:
+        user_id = getattr(request.state, "user_id", None)
+        if not isinstance(user_id, str):
+            raise HTTPException(status_code=401, detail="Inicia sesión para continuar.")
+        return user_id
+
+    def _is_media_request(request: Request) -> bool:
+        if request.method != "GET":
+            return False
+        path = request.url.path
+        return (
+            path.endswith(("/file", "/download", "/thumbnail", "/edit/preview"))
+            or (
+                path.startswith("/api/scheduled-jobs/")
+                and path.endswith("/download")
+            )
+        )
 
     @application.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @application.get("/api/settings")
-    def settings_status() -> dict:
+    @application.get("/api/auth/config")
+    def auth_config() -> dict[str, str | bool]:
+        configured = bool(app_settings.supabase_url and app_settings.supabase_anon_key)
         return {
-            "provider": app_settings.llm_provider,
-            "model": app_settings.llm_model,
-            "base_url": app_settings.llm_base_url,
-            "has_llm_key": bool(app_settings.llm_api_key.strip()),
-            "whisper_model": app_settings.whisper_model,
-            "integrations": integration_status(app_settings, app_settings.database_path),
+            "configured": configured,
+            "supabase_url": app_settings.supabase_url if configured else "",
+            "supabase_anon_key": app_settings.supabase_anon_key if configured else "",
         }
 
+    @application.post("/api/auth/media-cookie", status_code=204)
+    def set_media_cookie(request: Request, response: Response) -> Response:
+        authorization = request.headers.get("authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if not token:
+            raise HTTPException(status_code=401, detail="La sesión no está disponible.")
+        response.set_cookie(
+            "kellyclip_media",
+            token,
+            max_age=3600,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="lax",
+            path="/api",
+        )
+        response.status_code = 204
+        return response
+
+    @application.delete("/api/auth/media-cookie", status_code=204)
+    def clear_media_cookie() -> Response:
+        response = Response(status_code=204)
+        response.delete_cookie("kellyclip_media", path="/api", samesite="lax")
+        return response
+
+    @application.get("/api/settings")
+    def settings_status(request: Request) -> dict:
+        user_id = request_user_id(request)
+        credentials = database.get_llm_credentials(app_settings.database_path, user_id)
+        return {
+            "provider": credentials["provider"] if credentials else app_settings.llm_provider,
+            "model": credentials["model"] if credentials else app_settings.llm_model,
+            "base_url": credentials["base_url"] if credentials else app_settings.llm_base_url,
+            "has_llm_key": credentials is not None or bool(app_settings.llm_api_key),
+            "has_saved_llm_key": credentials is not None,
+            "has_env_llm_key": bool(app_settings.llm_api_key),
+            "whisper_model": app_settings.whisper_model,
+            "integrations": integration_status(
+                app_settings,
+                app_settings.database_path,
+                user_id,
+            ),
+        }
+
+    @application.put("/api/settings/llm-key")
+    def save_llm_settings(request: Request, payload: LLMSettingsRequest) -> dict[str, Any]:
+        user_id = request_user_id(request)
+        current = database.get_llm_credentials(app_settings.database_path, user_id)
+        api_key = payload.api_key.strip()
+        keep_current_key = bool(
+            not api_key and current is not None and current["provider"] == payload.provider
+        )
+        copy_environment_key = bool(
+            not api_key
+            and current is None
+            and app_settings.llm_api_key
+            and app_settings.llm_provider == payload.provider
+        )
+        if not api_key and not keep_current_key and not copy_environment_key:
+            raise HTTPException(
+                status_code=422,
+                detail="Introduce tu clave API para guardarla de forma segura.",
+            )
+        try:
+            if api_key:
+                encrypted = encrypt_api_key(api_key)
+            elif keep_current_key and current is not None:
+                encrypted = bytes(current["encrypted_api_key"])
+            else:
+                encrypted = encrypt_api_key(app_settings.llm_api_key)
+            database.save_llm_credentials(
+                app_settings.database_path,
+                user_id,
+                payload.provider,
+                encrypted,
+                payload.model.strip(),
+                payload.base_url.strip(),
+            )
+        except CredentialStoreError as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+        return {"saved": True, "has_api_key": True}
+
+    @application.delete("/api/settings/llm-key", status_code=204)
+    def delete_llm_settings(request: Request) -> Response:
+        database.delete_llm_credentials(
+            app_settings.database_path,
+            request_user_id(request),
+        )
+        return Response(status_code=204)
+
     @application.get("/api/integrations")
-    def integrations_status() -> dict:
-        return integration_status(app_settings, app_settings.database_path)
+    def integrations_status(request: Request) -> dict:
+        return integration_status(
+            app_settings,
+            app_settings.database_path,
+            request_user_id(request),
+        )
 
     @application.get("/api/integrations/{provider}/connect")
-    def connect_integration(provider: str) -> dict[str, str]:
+    def connect_integration(provider: str, request: Request) -> dict[str, str]:
+        owner_id = request_user_id(request)
         state = secrets.token_urlsafe(32)
         try:
             target = authorization_url(app_settings, provider, state)
@@ -349,6 +579,7 @@ def create_app(
             state,
             provider,
             (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            owner_id,
         )
         return {"authorization_url": target}
 
@@ -359,14 +590,14 @@ def create_app(
         code: str = "",
         error: str = "",
     ) -> RedirectResponse:
-        saved_provider = database.consume_oauth_state(
+        saved_state = database.consume_oauth_state_record(
             app_settings.database_path,
             state,
             datetime.now(timezone.utc).isoformat(),
         ) if state else None
         result = "error"
         detail = "La autorización no se pudo validar. Inicia de nuevo la conexión."
-        if saved_provider == provider and not error and code:
+        if saved_state and saved_state["provider"] == provider and not error and code:
             try:
                 account = complete_oauth(app_settings, provider, code)
                 database.save_connected_account(
@@ -378,6 +609,7 @@ def create_app(
                     account.get("refresh_token"),
                     account.get("expires_at"),
                     account.get("metadata") or {},
+                    saved_state["owner_id"],
                 )
                 result = "connected"
                 detail = ""
@@ -385,7 +617,7 @@ def create_app(
                 detail = str(integration_error)
         elif error:
             detail = f"El proveedor rechazó la autorización: {error[:160]}."
-        elif saved_provider and saved_provider != provider:
+        elif saved_state and saved_state["provider"] != provider:
             detail = "El proveedor no coincide con la autorización iniciada."
         query = urlencode({"integration": provider, "status": result, "message": detail})
         return RedirectResponse(
@@ -394,21 +626,29 @@ def create_app(
         )
 
     @application.post("/api/integrations/{provider}/disconnect")
-    def disconnect_integration(provider: str) -> dict[str, str]:
+    def disconnect_integration(provider: str, request: Request) -> dict[str, str]:
         if provider not in {"youtube", "tiktok", "instagram", "zoom"}:
             raise HTTPException(status_code=404, detail="No se reconoce esa integración.")
-        database.disconnect_account(app_settings.database_path, provider)
+        database.disconnect_account(
+            app_settings.database_path,
+            provider,
+            request_user_id(request),
+        )
         return {"status": "disconnected"}
 
     @application.get("/api/integrations/zoom/recordings")
-    def zoom_recordings() -> list[dict]:
+    def zoom_recordings(request: Request) -> list[dict]:
         try:
-            return list_zoom_recordings(app_settings)
+            return list_zoom_recordings(
+                app_settings,
+                request_user_id(request),
+            )
         except IntegrationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     @application.post("/api/integrations/zoom/import", status_code=201)
-    async def import_zoom_recording(request: ZoomImportRequest) -> dict:
+    async def import_zoom_recording(payload: ZoomImportRequest, request: Request) -> dict:
+        owner_id = request_user_id(request)
         project_id = str(uuid.uuid4())
         project_dir = app_settings.data_dir / "projects" / project_id
         input_path = project_dir / "source"
@@ -416,16 +656,18 @@ def create_app(
             await asyncio.to_thread(
                 download_zoom_recording,
                 app_settings,
-                request.meeting_id,
-                request.file_id,
+                payload.meeting_id,
+                payload.file_id,
                 input_path,
+                owner_id,
             )
             database.create_project(
                 app_settings.database_path,
                 project_id,
                 "Grabación de Zoom",
                 input_path,
-                request.config.model_dump(mode="json"),
+                payload.config.model_dump(mode="json"),
+                owner_id,
             )
         except IntegrationError as error:
             shutil.rmtree(project_dir, ignore_errors=True)
@@ -439,7 +681,7 @@ def create_app(
         return {
             key: value
             for key, value in job.items()
-            if key != "output_path"
+            if key not in {"output_path", "owner_id"}
         } | {
             "download_url": (
                 f"/api/scheduled-jobs/{job['id']}/download"
@@ -449,24 +691,35 @@ def create_app(
         }
 
     @application.get("/api/projects/{project_id}/scheduled")
-    def project_schedule(project_id: str) -> list[dict]:
+    def project_schedule(project_id: str, request: Request) -> list[dict]:
         if database.get_project(app_settings.database_path, project_id) is None:
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         return [
             serialize_schedule_job(job)
-            for job in database.list_schedule_jobs(app_settings.database_path, project_id)
+            for job in database.list_schedule_jobs(
+                app_settings.database_path,
+                project_id,
+                request_user_id(request),
+            )
         ]
 
     @application.get("/api/scheduled-jobs")
-    def scheduled_jobs() -> list[dict]:
+    def scheduled_jobs(request: Request) -> list[dict]:
         return [
             serialize_schedule_job(job)
-            for job in database.list_schedule_jobs(app_settings.database_path)
+            for job in database.list_schedule_jobs(
+                app_settings.database_path,
+                owner_id=request_user_id(request),
+            )
         ]
 
     @application.get("/api/scheduled-jobs/{job_id}/download")
-    def download_scheduled_export(job_id: str) -> FileResponse:
-        job = database.get_schedule_job(app_settings.database_path, job_id)
+    def download_scheduled_export(job_id: str, request: Request) -> FileResponse:
+        job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
         if job is None or not job.get("output_path"):
             raise HTTPException(status_code=404, detail="No hay un MP4 exportado para esta tarea.")
         export_root = (app_settings.data_dir / "exports").resolve()
@@ -480,16 +733,20 @@ def create_app(
         )
 
     @application.get("/api/templates")
-    def templates() -> list[dict[str, str]]:
-        return database.list_custom_templates(app_settings.database_path)
+    def templates(request: Request) -> list[dict[str, str]]:
+        return database.list_custom_templates(
+            app_settings.database_path,
+            request_user_id(request),
+        )
 
     @application.post("/api/templates", status_code=201)
-    def create_template(template: CustomTemplateRequest) -> dict[str, str]:
+    def create_template(template: CustomTemplateRequest, request: Request) -> dict[str, str]:
         try:
             return database.save_custom_template(
                 app_settings.database_path,
                 template.name,
                 template.base_template,
+                request_user_id(request),
             )
         except sqlite3.IntegrityError as error:
             raise HTTPException(
@@ -498,17 +755,31 @@ def create_app(
             ) from error
 
     @application.get("/api/projects")
-    def projects() -> list[dict]:
-        return [_serialize_project(project) for project in database.list_projects(app_settings.database_path)]
+    def projects(request: Request) -> list[dict]:
+        return [
+            _serialize_project(project)
+            for project in database.list_projects(
+                app_settings.database_path,
+                request_user_id(request),
+            )
+        ]
 
     @application.get("/api/staged-media/latest")
-    def latest_staged_media(source: Literal["upload", "url"]) -> dict | None:
-        staged = database.latest_staged_media(app_settings.database_path, source)
+    def latest_staged_media(
+        source: Literal["upload", "url"],
+        request: Request,
+    ) -> dict | None:
+        staged = database.latest_staged_media(
+            app_settings.database_path,
+            source,
+            request_user_id(request),
+        )
         return _serialize_staged_media(staged) if staged else None
 
     @application.post("/api/staged-media/uploads", status_code=201)
-    def create_staged_upload(request: StagedUploadRequest) -> dict:
-        filename = Path(request.filename.replace("\\", "/")).name
+    def create_staged_upload(payload: StagedUploadRequest, request: Request) -> dict:
+        owner_id = request_user_id(request)
+        filename = Path(payload.filename.replace("\\", "/")).name
         suffix = Path(filename).suffix.lower()
         if not filename or suffix not in _STAGED_SUFFIXES:
             raise HTTPException(
@@ -523,11 +794,12 @@ def create_app(
             "upload",
             "receiving",
             filename,
-            file_size=request.file_size,
-            duration=request.duration,
-            width=request.width,
-            height=request.height,
-            kind=request.kind,
+            file_size=payload.file_size,
+            duration=payload.duration,
+            width=payload.width,
+            height=payload.height,
+            kind=payload.kind,
+            owner_id=owner_id,
         )
         return _serialize_staged_media(
             database.get_staged_media(app_settings.database_path, staged_id)
@@ -624,10 +896,12 @@ def create_app(
 
     @application.post("/api/staged-media/downloads", status_code=202)
     def create_staged_download(
-        request: StagedDownloadRequest,
+        payload: StagedDownloadRequest,
         background_tasks: BackgroundTasks,
+        request: Request,
     ) -> dict:
-        validated_url = _validate_download_url(request.url)
+        owner_id = request_user_id(request)
+        validated_url = _validate_download_url(payload.url)
         staged_id = str(uuid.uuid4())
         (app_settings.data_dir / "staging").mkdir(parents=True, exist_ok=True)
         database.create_staged_media(
@@ -636,7 +910,8 @@ def create_app(
             "url",
             "downloading",
             "Descarga de enlace",
-            config=request.config.model_dump(mode="json"),
+            config=payload.config.model_dump(mode="json"),
+            owner_id=owner_id,
         )
         background_tasks.add_task(
             _download_staged_media,
@@ -726,6 +1001,7 @@ def create_app(
                 staged["title"] or staged["filename"],
                 input_path,
                 config,
+                staged["owner_id"],
             )
             database.update_staged_media(
                 app_settings.database_path,
@@ -748,6 +1024,7 @@ def create_app(
 
     @application.post("/api/projects", status_code=201)
     def create_uploaded_project(
+        request: Request,
         file: UploadFile = File(...),
         config: str = Form(...),
     ) -> dict:
@@ -771,6 +1048,7 @@ def create_app(
                 filename.name,
                 input_path,
                 project_config.model_dump(mode="json"),
+                request_user_id(request),
             )
         except Exception:
             shutil.rmtree(project_dir, ignore_errors=True)
@@ -779,6 +1057,7 @@ def create_app(
 
     @application.post("/api/projects/from-url", status_code=201)
     def create_link_project(
+        request: Request,
         url: str = Form(...),
         config: str = Form(...),
     ) -> dict:
@@ -798,6 +1077,7 @@ def create_app(
                 title,
                 input_path,
                 project_config.model_dump(mode="json"),
+                request_user_id(request),
             )
         except HTTPException:
             shutil.rmtree(project_dir, ignore_errors=True)
@@ -836,13 +1116,43 @@ def create_app(
         if project["status"] in {"processing", "queued"}:
             raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
         stored_config = request.config or ProjectConfig.model_validate(project["config"])
+        credentials = database.get_llm_credentials(
+            app_settings.database_path,
+            project["owner_id"],
+        )
+        if credentials is None and not app_settings.llm_api_key:
+            raise HTTPException(
+                status_code=422,
+                detail="Falta la clave API. Guárdala en Ajustes antes de procesar el video.",
+            )
         try:
-            resolve_llm(request.llm, app_settings)
+            llm_config = (
+                LLMConfig(
+                    provider=credentials["provider"],
+                    api_key=decrypt_api_key(bytes(credentials["encrypted_api_key"])),
+                    model=credentials["model"],
+                    base_url=credentials["base_url"],
+                )
+                if credentials is not None
+                else LLMConfig(
+                    provider=app_settings.llm_provider,
+                    api_key=app_settings.llm_api_key,
+                    model=app_settings.llm_model,
+                    base_url=app_settings.llm_base_url,
+                )
+            )
+            resolve_llm(llm_config, app_settings)
+        except CredentialStoreError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         except LLMConfigurationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         if any(
             job["status"] in {"scheduled", "processing"}
-            for job in database.list_schedule_jobs(app_settings.database_path, project_id)
+            for job in database.list_schedule_jobs(
+                app_settings.database_path,
+                project_id,
+                project["owner_id"],
+            )
         ):
             raise HTTPException(
                 status_code=409,
@@ -879,7 +1189,7 @@ def create_app(
             project["config"],
         ):
             raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
-        background_tasks.add_task(process_project, project_id, request.llm, app_settings)
+        background_tasks.add_task(process_project, project_id, llm_config, app_settings)
         return {"project_id": project_id, "status": "queued"}
 
     @application.get("/api/projects/{project_id}/events")
@@ -1005,7 +1315,11 @@ def create_app(
                 status_code=422,
                 detail=f"Faltan credenciales en .env: {', '.join(missing)}.",
             )
-        if not database.get_connected_account(app_settings.database_path, request.platform):
+        if not database.get_connected_account(
+            app_settings.database_path,
+            request.platform,
+            project["owner_id"],
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=f"Conecta una cuenta de {request.platform} desde Ajustes antes de publicar.",
@@ -1025,6 +1339,7 @@ def create_app(
                     clip,
                     clip_file(project_id, clip_id),
                     request.visibility,
+                    project["owner_id"],
                 )
             except IntegrationError as error:
                 failed = {"clip_id": clip_id, "error": str(error)}

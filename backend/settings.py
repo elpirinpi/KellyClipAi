@@ -22,6 +22,8 @@ class AppSettings:
     llm_model: str
     llm_base_url: str
     whisper_model: str
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
     oauth_redirect_base_url: str = "http://127.0.0.1:8000"
     frontend_base_url: str = "http://127.0.0.1:5173"
     youtube_client_id: str = ""
@@ -61,6 +63,8 @@ def get_settings() -> AppSettings:
         llm_model=os.getenv("LLM_MODEL", ""),
         llm_base_url=os.getenv("LLM_BASE_URL", ""),
         whisper_model=os.getenv("WHISPER_MODEL", "small"),
+        supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
+        supabase_anon_key=os.getenv("SUPABASE_ANON_KEY", ""),
         oauth_redirect_base_url=os.getenv(
             "KELLYCLIP_OAUTH_REDIRECT_BASE_URL", "http://127.0.0.1:8000"
         ).rstrip("/"),

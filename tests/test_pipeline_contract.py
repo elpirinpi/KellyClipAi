@@ -16,12 +16,25 @@ from fastapi.testclient import TestClient
 
 import backend.main as backend_main
 from backend import database
-from backend.llm import LLMConfigurationError, resolve_llm
-from backend.main import _validate_download_url, create_app
-from backend.media import _subtract_intervals, create_thumbnail, probe_media, render_clip
+from backend.llm import LLMConfigurationError, _prompt, resolve_llm
+from backend.main import _validate_download_url, create_app as create_application
+from backend.media import (
+    _caption_groups,
+    _caption_max_chars,
+    _subtract_intervals,
+    _write_ass,
+    create_thumbnail,
+    probe_media,
+    render_clip,
+)
+from backend.pipeline import _complete_clip_ends
 from backend.scheduler import process_schedule_job
-from backend.schemas import ClipProposal, LLMConfig, ProjectConfig
+from backend.schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment, Word
 from backend.settings import AppSettings
+
+
+def create_app(settings: AppSettings, web_dir: Path | None = None):
+    return create_application(settings, web_dir=web_dir, auth_required=False)
 
 
 def test_faster_whisper_decodes_audio_with_installed_pyav(
@@ -41,6 +54,95 @@ def test_subtract_intervals_cuts_removed_phrases_from_video_ranges() -> None:
         (4.0, 5.0),
         (6.0, 8.0),
     ]
+
+
+def test_clip_end_extends_through_the_last_complete_spoken_sentence() -> None:
+    proposal = ClipProposal(
+        inicio=0,
+        fin=2,
+        titulo="Idea completa",
+        puntuacion=8,
+        razon_viral="La frase termina con una conclusión.",
+    )
+    transcript = [
+        TranscriptSegment(
+            start=0,
+            end=4,
+            text="Esta idea continúa hasta su final completo.",
+            words=[
+                Word(start=1.5, end=1.8, text="idea"),
+                Word(start=1.9, end=2.2, text="continúa"),
+                Word(start=2.3, end=2.7, text="hasta"),
+                Word(start=2.8, end=3.1, text="el"),
+                Word(start=3.2, end=3.6, text="final."),
+            ],
+        )
+    ]
+
+    completed = _complete_clip_ends([proposal], transcript, 4, "Cualquiera")
+
+    assert completed[0].fin == pytest.approx(3.85)
+
+
+def test_clip_prompt_prefers_complete_moments_instead_of_short_fragments() -> None:
+    system, user = _prompt([], ProjectConfig(), 120)
+
+    assert "no cortes una oración" in system
+    assert "Prefiere clips de 15 a 45 segundos" in user
+    assert "Evita clips menores de 12 segundos" in user
+
+
+def test_vertical_subtitles_wrap_within_the_video_width(tmp_path: Path) -> None:
+    proposal = ClipProposal(
+        inicio=0,
+        fin=2,
+        titulo="Subtítulos verticales",
+        puntuacion=8,
+        razon_viral="Las líneas deben permanecer dentro del cuadro.",
+    )
+    words = [
+        {
+            "start": 0.1,
+            "end": 0.8,
+            "preview_start": 0.1,
+            "preview_end": 0.8,
+            "text": "supercalifragilisticexpialidocious",
+        }
+    ]
+    subtitle_path = tmp_path / "vertical.ass"
+
+    _write_ass(
+        subtitle_path,
+        words,
+        proposal,
+        ProjectConfig(ratio="9:16"),
+        2,
+        [(0, 2)],
+    )
+    subtitle = subtitle_path.read_text(encoding="utf-8")
+
+    assert _caption_max_chars(720, 58) < 36
+    groups = _caption_groups(
+        [
+            {
+                "text": "voz",
+                "preview_start": index * 0.2,
+                "preview_end": index * 0.2 + 0.1,
+            }
+            for index in range(6)
+        ],
+        _caption_max_chars(720, 58),
+    )
+    assert all(
+        sum(len(str(word["text"])) for word in group) + len(group) - 1
+        <= _caption_max_chars(720, 58)
+        for group in groups
+    )
+    assert "PlayResX: 720\nPlayResY: 1280" in subtitle
+    assert "WrapStyle: 0" in subtitle
+    assert "48,48,96,1" in subtitle
+    assert r"\N" in subtitle
+    assert r"supercalifragil\Nisticexpialidoc\Nious" in subtitle
 
 
 @pytest.fixture(scope="session")
@@ -297,7 +399,7 @@ def test_custom_templates_are_persistent_and_resolve_to_saved_style(
         assert created.status_code == 201
         assert client.get("/api/templates").json() == [created.json()]
         assert database.resolve_subtitle_template(
-            settings.database_path, "Mi estilo cálido"
+            settings.database_path, "Mi estilo cálido", owner_id="test-user"
         ) == "Modern"
         assert client.post(
             "/api/templates",

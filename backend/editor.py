@@ -189,7 +189,9 @@ def render_editor_version(
             update={
                 "ratio": edit.ratio,
                 "subtitle_template": database.resolve_subtitle_template(
-                    settings.database_path, edit.subtitle_template
+                    settings.database_path,
+                    edit.subtitle_template,
+                    str(project["owner_id"]),
                 ),
             }
         )

@@ -84,6 +84,82 @@ def _validate_proposals(
         previous_end = proposal.fin
 
 
+def _ends_sentence(text: str) -> bool:
+    return text.rstrip("\"'”’)]}").endswith(
+        (".", "!", "?", "…", "。", "！", "？")
+    )
+
+
+def _complete_clip_ends(
+    proposals: list[ClipProposal],
+    transcript: list[TranscriptSegment],
+    duration: float,
+    choice: str,
+) -> list[ClipProposal]:
+    _, maximum = _duration_bounds(choice)
+    words = sorted(
+        (word for segment in transcript for word in segment.words),
+        key=lambda word: (word.start, word.end),
+    )
+    ordered = sorted(proposals, key=lambda clip: clip.inicio)
+    completed: list[ClipProposal] = []
+
+    for index, proposal in enumerate(ordered):
+        end_limit = min(duration, proposal.inicio + maximum)
+        if index + 1 < len(ordered):
+            end_limit = min(end_limit, ordered[index + 1].inicio)
+        if end_limit <= proposal.fin:
+            completed.append(proposal)
+            continue
+
+        relevant = [
+            word
+            for word in words
+            if proposal.inicio < word.end and word.start < end_limit
+        ]
+        words_before_end = [word for word in relevant if word.start < proposal.fin]
+        if words_before_end and _ends_sentence(words_before_end[-1].text):
+            completed.append(proposal)
+            continue
+
+        boundary: float | None = None
+        for word_index, word in enumerate(relevant):
+            if word.end <= proposal.fin or word.end > min(end_limit, proposal.fin + 10):
+                continue
+            has_sentence_end = _ends_sentence(word.text)
+            has_pause = (
+                word_index + 1 < len(relevant)
+                and relevant[word_index + 1].start - word.end >= 0.8
+            )
+            if has_sentence_end or has_pause:
+                boundary = word.end
+                break
+
+        if boundary is None:
+            next_word = next(
+                (
+                    word
+                    for word in relevant
+                    if proposal.fin < word.end <= min(end_limit, proposal.fin + 2)
+                ),
+                None,
+            )
+            if next_word is not None:
+                boundary = next_word.end
+
+        if boundary is None:
+            completed.append(proposal)
+            continue
+
+        completed_end = min(end_limit, boundary + 0.25)
+        if completed_end <= proposal.fin:
+            completed.append(proposal)
+            continue
+        completed.append(proposal.model_copy(update={"fin": completed_end}))
+
+    return completed
+
+
 def _progress_for_llm(
     settings: AppSettings,
     project_id: str,
@@ -107,6 +183,7 @@ def _render_projects(
     proposals: list[ClipProposal],
     transcript: list[TranscriptSegment],
     ffmpeg_path: str,
+    owner_id: str,
 ) -> list[dict[str, Any]]:
     project_dir = input_path.parent
     output_dir = project_dir / "clips"
@@ -137,7 +214,9 @@ def _render_projects(
         render_config = project_config.model_copy(
             update={
                 "subtitle_template": database.resolve_subtitle_template(
-                    settings.database_path, project_config.subtitle_template
+                    settings.database_path,
+                    project_config.subtitle_template,
+                    owner_id,
                 )
             }
         )
@@ -300,6 +379,12 @@ def process_project(
             float(metadata["duration"]),
             llm,
         )
+        proposals = _complete_clip_ends(
+            proposals,
+            transcript,
+            float(metadata["duration"]),
+            project_config.duration,
+        )
         _validate_proposals(
             proposals,
             float(metadata["duration"]),
@@ -333,6 +418,7 @@ def process_project(
             proposals,
             transcript,
             ffmpeg_path,
+            str(stored["owner_id"]),
         )
         database.update_project(settings.database_path, project_id, clips=clips)
         scheduled_count = 0

@@ -51,6 +51,7 @@ def initialize(database_path: Path) -> None:
             """
             CREATE TABLE IF NOT EXISTS staged_media (
                 id TEXT PRIMARY KEY,
+                owner_id TEXT,
                 source_type TEXT NOT NULL CHECK (source_type IN ('upload', 'url')),
                 status TEXT NOT NULL CHECK (status IN ('receiving', 'downloading', 'ready', 'failed', 'finalizing', 'deleting', 'completed')),
                 filename TEXT NOT NULL,
@@ -74,6 +75,7 @@ def initialize(database_path: Path) -> None:
                 ON staged_media(source_type, created_at DESC);
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY,
+                owner_id TEXT,
                 title TEXT NOT NULL,
                 input_path TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -97,9 +99,11 @@ def initialize(database_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS project_events_project_id_id
                 ON project_events(project_id, id);
             CREATE TABLE IF NOT EXISTS custom_templates (
-                name TEXT PRIMARY KEY COLLATE NOCASE,
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL COLLATE NOCASE,
                 base_template TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, name)
             );
             CREATE TABLE IF NOT EXISTS clip_shares (
                 token TEXT PRIMARY KEY,
@@ -110,18 +114,29 @@ def initialize(database_path: Path) -> None:
             );
             CREATE TABLE IF NOT EXISTS oauth_states (
                 state TEXT PRIMARY KEY,
+                owner_id TEXT,
                 provider TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS connected_accounts (
-                provider TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
                 account_id TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 access_token TEXT NOT NULL,
                 refresh_token TEXT,
                 expires_at TEXT,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, provider)
+            );
+            CREATE TABLE IF NOT EXISTS llm_credentials (
+                owner_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                encrypted_api_key BLOB NOT NULL,
+                model TEXT NOT NULL,
+                base_url TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
@@ -153,7 +168,91 @@ def initialize(database_path: Path) -> None:
             )
         if "external_url" not in schedule_columns:
             conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
+        for table in ("staged_media", "projects", "oauth_states"):
+            columns = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if "owner_id" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+        _migrate_owned_table(
+            conn,
+            "custom_templates",
+            """
+            CREATE TABLE custom_templates (
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL COLLATE NOCASE,
+                base_template TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, name)
+            )
+            """,
+            "INSERT INTO custom_templates (owner_id, name, base_template, created_at) "
+            "SELECT 'legacy', name, base_template, created_at FROM custom_templates_legacy",
+        )
+        _migrate_owned_table(
+            conn,
+            "connected_accounts",
+            """
+            CREATE TABLE connected_accounts (
+                owner_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                expires_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, provider)
+            )
+            """,
+            "INSERT INTO connected_accounts (owner_id, provider, account_id, display_name, "
+            "access_token, refresh_token, expires_at, metadata_json, updated_at) "
+            "SELECT 'legacy', provider, account_id, display_name, access_token, refresh_token, "
+            "expires_at, metadata_json, updated_at FROM connected_accounts_legacy",
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS projects_owner_created "
+            "ON projects(owner_id, created_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
+            "ON staged_media(owner_id, source_type, created_at DESC)"
+        )
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_owned_table(
+    conn: sqlite3.Connection,
+    table_name: str,
+    create_sql: str,
+    copy_sql: str,
+) -> None:
+    columns = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")
+    }
+    if "owner_id" in columns:
+        return
+    legacy_name = f"{table_name}_legacy"
+    conn.execute(f"ALTER TABLE {table_name} RENAME TO {legacy_name}")
+    conn.execute(create_sql)
+    conn.execute(copy_sql)
+    conn.execute(f"DROP TABLE {legacy_name}")
+
+
+def claim_legacy_data(database_path: Path, owner_id: str) -> None:
+    with _lock, connection(database_path) as conn:
+        for table in (
+            "projects",
+            "staged_media",
+            "custom_templates",
+            "connected_accounts",
+            "oauth_states",
+        ):
+            conn.execute(
+                f"UPDATE {table} SET owner_id = ? WHERE owner_id IS NULL OR owner_id = 'legacy'",
+                (owner_id,),
+            )
 
 
 def fail_interrupted_staged_media(database_path: Path) -> None:
@@ -183,18 +282,20 @@ def create_staged_media(
     height: int = 0,
     kind: str = "video",
     config: dict[str, Any] | None = None,
+    owner_id: str | None = None,
 ) -> None:
     now = utc_now()
     with _lock, connection(database_path) as conn:
         conn.execute(
             """
             INSERT INTO staged_media (
-                id, source_type, status, filename, file_size, duration, width,
+                id, owner_id, source_type, status, filename, file_size, duration, width,
                 height, kind, config_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 staged_id,
+                owner_id,
                 source_type,
                 status,
                 filename,
@@ -210,27 +311,37 @@ def create_staged_media(
         )
 
 
-def get_staged_media(database_path: Path, staged_id: str) -> dict[str, Any] | None:
+def get_staged_media(
+    database_path: Path,
+    staged_id: str,
+    owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = "SELECT * FROM staged_media WHERE id = ?"
+    parameters: tuple[Any, ...] = (staged_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
     with connection(database_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM staged_media WHERE id = ?", (staged_id,)
-        ).fetchone()
+        row = conn.execute(query, parameters).fetchone()
     return staged_media_from_row(row) if row else None
 
 
 def latest_staged_media(
-    database_path: Path, source_type: str
+    database_path: Path,
+    source_type: str,
+    owner_id: str | None = None,
 ) -> dict[str, Any] | None:
+    query = """
+        SELECT * FROM staged_media
+        WHERE source_type = ? AND status IN ('receiving', 'downloading', 'ready', 'failed')
+    """
+    parameters: tuple[Any, ...] = (source_type,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
+    query += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
     with connection(database_path) as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM staged_media
-            WHERE source_type = ? AND status IN ('receiving', 'downloading', 'ready', 'failed')
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT 1
-            """,
-            (source_type,),
-        ).fetchone()
+        row = conn.execute(query, parameters).fetchone()
     return staged_media_from_row(row) if row else None
 
 
@@ -312,17 +423,26 @@ def create_project(
     title: str,
     input_path: Path,
     config: dict[str, Any],
+    owner_id: str | None = None,
 ) -> None:
     now = utc_now()
     with _lock, connection(database_path) as conn:
         conn.execute(
             """
             INSERT INTO projects (
-                id, title, input_path, status, step, progress, config_json,
+                id, owner_id, title, input_path, status, step, progress, config_json,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 'ready', 'project', 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'ready', 'project', 0, ?, ?, ?)
             """,
-            (project_id, title, str(input_path), json.dumps(config, ensure_ascii=False), now, now),
+            (
+                project_id,
+                owner_id,
+                title,
+                str(input_path),
+                json.dumps(config, ensure_ascii=False),
+                now,
+                now,
+            ),
         )
         append_event(
             conn,
@@ -337,15 +457,33 @@ def create_project(
         )
 
 
-def get_project(database_path: Path, project_id: str) -> dict[str, Any] | None:
+def get_project(
+    database_path: Path,
+    project_id: str,
+    owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = "SELECT * FROM projects WHERE id = ?"
+    parameters: tuple[Any, ...] = (project_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
     with connection(database_path) as conn:
-        row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        row = conn.execute(query, parameters).fetchone()
     return project_from_row(row) if row else None
 
 
-def list_projects(database_path: Path) -> list[dict[str, Any]]:
+def list_projects(
+    database_path: Path,
+    owner_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = "SELECT * FROM projects"
+    parameters: tuple[Any, ...] = ()
+    if owner_id is not None:
+        query += " WHERE owner_id = ?"
+        parameters = (owner_id,)
+    query += " ORDER BY created_at DESC"
     with connection(database_path) as conn:
-        rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(query, parameters).fetchall()
     return [project_from_row(row) for row in rows]
 
 
@@ -452,10 +590,15 @@ def events_after(database_path: Path, project_id: str, after_id: int) -> list[di
     ]
 
 
-def list_custom_templates(database_path: Path) -> list[dict[str, str]]:
+def list_custom_templates(
+    database_path: Path,
+    owner_id: str = "legacy",
+) -> list[dict[str, str]]:
     with connection(database_path) as conn:
         rows = conn.execute(
-            "SELECT name, base_template FROM custom_templates ORDER BY created_at, name"
+            "SELECT name, base_template FROM custom_templates "
+            "WHERE owner_id = ? ORDER BY created_at, name",
+            (owner_id,),
         ).fetchall()
     return [{"name": row["name"], "base_template": row["base_template"]} for row in rows]
 
@@ -464,23 +607,28 @@ def save_custom_template(
     database_path: Path,
     name: str,
     base_template: str,
+    owner_id: str = "legacy",
 ) -> dict[str, str]:
     with _lock, connection(database_path) as conn:
         conn.execute(
             """
-            INSERT INTO custom_templates (name, base_template, created_at)
-            VALUES (?, ?, ?)
+            INSERT INTO custom_templates (owner_id, name, base_template, created_at)
+            VALUES (?, ?, ?, ?)
             """,
-            (name, base_template, utc_now()),
+            (owner_id, name, base_template, utc_now()),
         )
     return {"name": name, "base_template": base_template}
 
 
-def resolve_subtitle_template(database_path: Path, name: str) -> str:
+def resolve_subtitle_template(
+    database_path: Path,
+    name: str,
+    owner_id: str = "legacy",
+) -> str:
     with connection(database_path) as conn:
         row = conn.execute(
-            "SELECT base_template FROM custom_templates WHERE name = ?",
-            (name,),
+            "SELECT base_template FROM custom_templates WHERE owner_id = ? AND name = ?",
+            (owner_id, name),
         ).fetchone()
     return str(row["base_template"]) if row else name
 
@@ -522,24 +670,35 @@ def save_oauth_state(
     state: str,
     provider: str,
     expires_at: str,
+    owner_id: str = "legacy",
 ) -> None:
     with _lock, connection(database_path) as conn:
         conn.execute(
-            "INSERT INTO oauth_states (state, provider, expires_at, created_at) VALUES (?, ?, ?, ?)",
-            (state, provider, expires_at, utc_now()),
+            "INSERT INTO oauth_states (state, owner_id, provider, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (state, owner_id, provider, expires_at, utc_now()),
         )
 
 
-def consume_oauth_state(database_path: Path, state: str, now: str) -> str | None:
+def consume_oauth_state_record(
+    database_path: Path,
+    state: str,
+    now: str,
+) -> dict[str, str] | None:
     with _lock, connection(database_path) as conn:
         row = conn.execute(
-            "SELECT provider, expires_at FROM oauth_states WHERE state = ?",
+            "SELECT owner_id, provider, expires_at FROM oauth_states WHERE state = ?",
             (state,),
         ).fetchone()
         conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
     if row and row["expires_at"] > now:
-        return str(row["provider"])
+        return {"owner_id": str(row["owner_id"]), "provider": str(row["provider"])}
     return None
+
+
+def consume_oauth_state(database_path: Path, state: str, now: str) -> str | None:
+    record = consume_oauth_state_record(database_path, state, now)
+    return record["provider"] if record else None
 
 
 def save_connected_account(
@@ -551,15 +710,16 @@ def save_connected_account(
     refresh_token: str | None,
     expires_at: str | None,
     metadata: dict[str, Any],
+    owner_id: str = "legacy",
 ) -> None:
     with _lock, connection(database_path) as conn:
         conn.execute(
             """
             INSERT INTO connected_accounts (
-                provider, account_id, display_name, access_token, refresh_token,
+                owner_id, provider, account_id, display_name, access_token, refresh_token,
                 expires_at, metadata_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id, provider) DO UPDATE SET
                 account_id = excluded.account_id,
                 display_name = excluded.display_name,
                 access_token = excluded.access_token,
@@ -569,6 +729,7 @@ def save_connected_account(
                 updated_at = excluded.updated_at
             """,
             (
+                owner_id,
                 provider,
                 account_id,
                 display_name,
@@ -584,11 +745,12 @@ def save_connected_account(
 def get_connected_account(
     database_path: Path,
     provider: str,
+    owner_id: str = "legacy",
 ) -> dict[str, Any] | None:
     with connection(database_path) as conn:
         row = conn.execute(
-            "SELECT * FROM connected_accounts WHERE provider = ?",
-            (provider,),
+            "SELECT * FROM connected_accounts WHERE owner_id = ? AND provider = ?",
+            (owner_id, provider),
         ).fetchone()
     if row is None:
         return None
@@ -597,9 +759,59 @@ def get_connected_account(
     return result
 
 
-def disconnect_account(database_path: Path, provider: str) -> None:
+def disconnect_account(
+    database_path: Path,
+    provider: str,
+    owner_id: str = "legacy",
+) -> None:
     with _lock, connection(database_path) as conn:
-        conn.execute("DELETE FROM connected_accounts WHERE provider = ?", (provider,))
+        conn.execute(
+            "DELETE FROM connected_accounts WHERE owner_id = ? AND provider = ?",
+            (owner_id, provider),
+        )
+
+
+def save_llm_credentials(
+    database_path: Path,
+    owner_id: str,
+    provider: str,
+    encrypted_api_key: bytes,
+    model: str,
+    base_url: str,
+) -> None:
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO llm_credentials (
+                owner_id, provider, encrypted_api_key, model, base_url, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id) DO UPDATE SET
+                provider = excluded.provider,
+                encrypted_api_key = excluded.encrypted_api_key,
+                model = excluded.model,
+                base_url = excluded.base_url,
+                updated_at = excluded.updated_at
+            """,
+            (owner_id, provider, encrypted_api_key, model, base_url, utc_now()),
+        )
+
+
+def get_llm_credentials(
+    database_path: Path,
+    owner_id: str,
+) -> dict[str, Any] | None:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT owner_id, provider, encrypted_api_key, model, base_url, updated_at "
+            "FROM llm_credentials WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_llm_credentials(database_path: Path, owner_id: str) -> None:
+    with _lock, connection(database_path) as conn:
+        conn.execute("DELETE FROM llm_credentials WHERE owner_id = ?", (owner_id,))
 
 
 def enqueue_schedule_jobs(
@@ -649,12 +861,33 @@ def schedule_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
 def list_schedule_jobs(
     database_path: Path,
     project_id: str | None = None,
+    owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
     with connection(database_path) as conn:
-        if project_id:
+        if project_id and owner_id:
+            rows = conn.execute(
+                """
+                SELECT scheduled_jobs.* FROM scheduled_jobs
+                JOIN projects ON projects.id = scheduled_jobs.project_id
+                WHERE scheduled_jobs.project_id = ? AND projects.owner_id = ?
+                ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
+                """,
+                (project_id, owner_id),
+            ).fetchall()
+        elif project_id:
             rows = conn.execute(
                 "SELECT * FROM scheduled_jobs WHERE project_id = ? ORDER BY scheduled_at, created_at",
                 (project_id,),
+            ).fetchall()
+        elif owner_id:
+            rows = conn.execute(
+                """
+                SELECT scheduled_jobs.* FROM scheduled_jobs
+                JOIN projects ON projects.id = scheduled_jobs.project_id
+                WHERE projects.owner_id = ?
+                ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
+                """,
+                (owner_id,),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -663,12 +896,21 @@ def list_schedule_jobs(
     return [schedule_job_from_row(row) for row in rows]
 
 
-def get_schedule_job(database_path: Path, job_id: str) -> dict[str, Any] | None:
+def get_schedule_job(
+    database_path: Path,
+    job_id: str,
+    owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = "SELECT scheduled_jobs.* FROM scheduled_jobs"
+    parameters: tuple[Any, ...] = (job_id,)
+    if owner_id is not None:
+        query += " JOIN projects ON projects.id = scheduled_jobs.project_id"
+    query += " WHERE scheduled_jobs.id = ?"
+    if owner_id is not None:
+        query += " AND projects.owner_id = ?"
+        parameters += (owner_id,)
     with connection(database_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM scheduled_jobs WHERE id = ?",
-            (job_id,),
-        ).fetchone()
+        row = conn.execute(query, parameters).fetchone()
     return schedule_job_from_row(row) if row else None
 
 
@@ -676,9 +918,10 @@ def due_schedule_jobs(database_path: Path, now: str) -> list[dict[str, Any]]:
     with connection(database_path) as conn:
         rows = conn.execute(
             """
-            SELECT * FROM scheduled_jobs
-            WHERE status = 'scheduled' AND scheduled_at <= ?
-            ORDER BY scheduled_at, created_at
+            SELECT scheduled_jobs.*, projects.owner_id FROM scheduled_jobs
+            JOIN projects ON projects.id = scheduled_jobs.project_id
+            WHERE scheduled_jobs.status = 'scheduled' AND scheduled_jobs.scheduled_at <= ?
+            ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
             """,
             (now,),
         ).fetchall()

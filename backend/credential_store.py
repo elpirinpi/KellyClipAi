@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import ctypes
+import os
+from ctypes import POINTER, Structure, byref, c_ubyte, c_void_p, cast, create_string_buffer
+from ctypes.wintypes import BOOL, DWORD
+
+
+class CredentialStoreError(RuntimeError):
+    pass
+
+
+class _DataBlob(Structure):
+    _fields_ = [("cbData", DWORD), ("pbData", POINTER(c_ubyte))]
+
+
+_ENTROPY = b"kellyClipAi:llm-api-key:v1"
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+
+def _windows_api():
+    if os.name != "nt":
+        raise CredentialStoreError("El almacenamiento cifrado requiere Windows.")
+    crypt32 = ctypes.WinDLL("Crypt32.dll", use_last_error=True)
+    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    return crypt32, kernel32
+
+
+def _blob(data: bytes):
+    buffer = create_string_buffer(data)
+    return _DataBlob(len(data), cast(buffer, POINTER(c_ubyte))), buffer
+
+
+def _protect(data: bytes, decrypt: bool) -> bytes:
+    crypt32, kernel32 = _windows_api()
+    input_blob, input_buffer = _blob(data)
+    entropy_blob, entropy_buffer = _blob(_ENTROPY)
+    output_blob = _DataBlob()
+    function = (
+        crypt32.CryptUnprotectData
+        if decrypt
+        else crypt32.CryptProtectData
+    )
+    if decrypt:
+        function.argtypes = [
+            POINTER(_DataBlob),
+            c_void_p,
+            POINTER(_DataBlob),
+            c_void_p,
+            c_void_p,
+            DWORD,
+            POINTER(_DataBlob),
+        ]
+        function.restype = BOOL
+        succeeded = function(
+            byref(input_blob),
+            None,
+            byref(entropy_blob),
+            None,
+            None,
+            _CRYPTPROTECT_UI_FORBIDDEN,
+            byref(output_blob),
+        )
+    else:
+        function.argtypes = [
+            POINTER(_DataBlob),
+            ctypes.c_wchar_p,
+            POINTER(_DataBlob),
+            c_void_p,
+            c_void_p,
+            DWORD,
+            POINTER(_DataBlob),
+        ]
+        function.restype = BOOL
+        succeeded = function(
+            byref(input_blob),
+            None,
+            byref(entropy_blob),
+            None,
+            None,
+            _CRYPTPROTECT_UI_FORBIDDEN,
+            byref(output_blob),
+        )
+    if not succeeded:
+        raise CredentialStoreError(
+            "Windows no pudo proteger o recuperar la clave. Inicia sesión en la misma cuenta de Windows."
+        )
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        kernel32.LocalFree.argtypes = [c_void_p]
+        kernel32.LocalFree.restype = c_void_p
+        kernel32.LocalFree(output_blob.pbData)
+        del input_buffer, entropy_buffer
+
+
+def encrypt_api_key(api_key: str) -> bytes:
+    if not api_key.strip():
+        raise CredentialStoreError("La clave API no puede estar vacía.")
+    return _protect(api_key.encode("utf-8"), decrypt=False)
+
+
+def decrypt_api_key(ciphertext: bytes) -> str:
+    try:
+        return _protect(ciphertext, decrypt=True).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise CredentialStoreError(
+            "La clave guardada no se pudo recuperar. Vuelve a introducirla."
+        ) from error

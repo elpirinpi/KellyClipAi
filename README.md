@@ -9,8 +9,7 @@ se obtiene del video y la transcripción del proyecto.
 - Windows 10/11, PowerShell y Node.js.
 - Python 3.13 de 64 bits (recomendado para las ruedas de `faster-whisper`).
 - FFmpeg y ffprobe en `PATH`.
-- Una clave válida para el proveedor LLM elegido. También se puede configurar
-  en Ajustes durante la sesión del navegador.
+- Un proyecto Supabase para registro e inicio de sesión.
 
 Comprueba los ejecutables:
 
@@ -38,10 +37,24 @@ py -3.13 -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Edita `.env` y configura `LLM_API_KEY`, `LLM_PROVIDER` y, si corresponde,
-`LLM_MODEL`/`LLM_BASE_URL`. Las claves guardadas en Ajustes se conservan solo
-en la sesión del navegador y se envían al backend local al iniciar el análisis;
-no se escriben en SQLite.
+El `.env.example` incluido ya configura el proyecto Supabase de kellyClipAi
+con su clave publicable. Si usas otro proyecto, reemplaza `SUPABASE_URL` y
+`SUPABASE_ANON_KEY` por la URL y clave publicable (o clave `anon` heredada).
+**No uses una clave `service_role`.** En Supabase, habilita Email/Password y
+permite las redirecciones a `http://127.0.0.1:5173`,
+`http://localhost:5173` y `http://127.0.0.1:8000`. El registro requiere
+verificar el correo. En la app instalada, edita
+`%LOCALAPPDATA%\kellyClipAi\.env` antes de abrirla por primera vez y reinicia
+la aplicación después de cambiar su configuración.
+
+La app muestra una pantalla de acceso antes de permitir usar los proyectos.
+Los videos y proyectos siguen guardándose localmente, asociados al usuario
+autenticado en la base SQLite del dispositivo. En **Ajustes**, la clave LLM se
+cifra con Windows DPAPI y se conserva localmente para esa cuenta de Windows;
+no se guarda en Supabase ni se devuelve al navegador. No se puede descifrar al
+mover la base de datos a otro equipo o a otra cuenta de Windows.
+Al actualizar una instalación con datos anteriores, esos proyectos locales se
+asignan al primer usuario que inicie sesión en esa instalación.
 
 Instala el frontend con las versiones fijadas en `app/package-lock.json`:
 
@@ -63,7 +76,7 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.2.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.0.3.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador requiere internet para instalar
 WebView2 si hace falta; el modelo Whisper `small` se descarga la primera vez
@@ -126,7 +139,7 @@ parámetros de la plantilla seleccionada.
 ## Integraciones y publicaciones
 
 Las credenciales de YouTube, TikTok, Instagram, Zoom, Pexels y Pixabay se
-configuran únicamente en `.env`; nunca las compartas en el chat ni en capturas.
+configuran en `.env`; nunca las compartas en el chat ni en capturas.
 Después de editarlas, reinicia el backend. Registra en cada consola OAuth las
 URLs locales que aparecen comentadas en `.env.example`. En **Ajustes**, la app
 indica qué variables faltan y solo inicia OAuth cuando están configuradas.
@@ -167,6 +180,13 @@ Endpoints del Hito 4: `POST /api/projects/{id}/clips/archive`,
 `POST /api/projects/{id}/clips/{clip_id}/quality`,
 `POST /api/projects/{id}/clips/{clip_id}/improve` y
 `GET/POST /api/templates`.
+
+Endpoints de autenticación y clave LLM: `GET /api/auth/config`,
+`POST/DELETE /api/auth/media-cookie`, `GET /api/settings`,
+`PUT/DELETE /api/settings/llm-key`. La API comprueba las sesiones con Supabase
+y filtra los proyectos por usuario; los enlaces compartidos permanecen
+públicos por diseño. Las claves de API de usuario se cifran en el dispositivo
+con DPAPI antes de guardarse en SQLite.
 
 ## Verificación
 

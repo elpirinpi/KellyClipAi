@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import textwrap
 from pathlib import Path
 from typing import Callable
 
@@ -384,7 +385,10 @@ def _censored(text: str) -> bool:
     return normalized in _CENSORED_WORDS
 
 
-def _caption_groups(words: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+def _caption_groups(
+    words: list[dict[str, object]],
+    max_chars: int = 36,
+) -> list[list[dict[str, object]]]:
     groups: list[list[dict[str, object]]] = []
     current: list[dict[str, object]] = []
     current_chars = 0
@@ -392,7 +396,7 @@ def _caption_groups(words: list[dict[str, object]]) -> list[list[dict[str, objec
         text = str(word["text"])
         if current and (
             len(current) >= 6
-            or current_chars + len(text) > 36
+            or current_chars + len(text) > max_chars
             or float(word["preview_start"]) - float(current[0]["preview_start"]) > 2.5
         ):
             groups.append(current)
@@ -402,6 +406,10 @@ def _caption_groups(words: list[dict[str, object]]) -> list[list[dict[str, objec
     if current:
         groups.append(current)
     return groups
+
+
+def _caption_max_chars(width: int, font_size: int, margin: int = 48) -> int:
+    return max(12, int((width - 2 * margin) / (font_size * 0.68)))
 
 
 def _write_ass(
@@ -427,16 +435,17 @@ def _write_ass(
     }.get(config.subtitle_template, ("Arial", 58, "&H00FFFFFF", "&H0000FFFF", 3, 1, 2))
     font, size, primary, secondary, outline, shadow, alignment = style
     size = round(size * scale)
+    caption_max_chars = _caption_max_chars(width, size)
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
 PlayResY: {height}
 ScaledBorderAndShadow: yes
-WrapStyle: 2
+WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,{font},{size},{primary},{secondary},&H00101010,&H99000000,-1,0,1,{outline},{shadow},{alignment},36,36,90,1
+Style: Caption,{font},{size},{primary},{secondary},&H00101010,&H99000000,-1,0,1,{outline},{shadow},{alignment},48,48,96,1
 Style: Watermark,Arial,{round(20 * scale)},&H00FFFFFF,&H00FFFFFF,&H66000000,&H55000000,0,0,1,1,0,3,18,18,18,1
 
 [Events]
@@ -448,7 +457,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if _censored(str(word["text"])) and config.options.censor:
             censor_ranges.append((float(word["preview_start"]), float(word["preview_end"])))
             word["text"] = "****"
-    groups = _caption_groups(words)
+    groups = _caption_groups(words, caption_max_chars)
     for index, group in enumerate(groups):
         begin = float(group[0]["preview_start"])
         end = max(float(group[-1]["preview_end"]), begin + 0.08)
@@ -457,6 +466,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         parts: list[str] = []
         for word in group:
             text = _ass_escape(str(word["text"]))
+            if len(text) > caption_max_chars:
+                text = r"\N".join(
+                    textwrap.wrap(
+                        text,
+                        width=caption_max_chars,
+                        break_long_words=True,
+                        break_on_hyphens=False,
+                    )
+                )
             word_duration = max(
                 1,
                 round((float(word["preview_end"]) - float(word["preview_start"])) * 100),

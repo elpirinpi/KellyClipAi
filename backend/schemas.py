@@ -60,8 +60,22 @@ class LLMConfig(BaseModel):
     base_url: str | None = Field(default=None, max_length=500)
 
 
+class LLMSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal[
+        "Groq",
+        "OpenAI",
+        "Anthropic",
+        "OpenRouter",
+        "Servidor local compatible",
+    ]
+    api_key: str = Field(default="", max_length=4096)
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(default="", max_length=500)
+
+
 class ProcessRequest(BaseModel):
-    llm: LLMConfig | None = None
     config: ProjectConfig | None = None
 
 

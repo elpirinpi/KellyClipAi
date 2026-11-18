@@ -51,7 +51,12 @@ def process_schedule_job(settings: AppSettings, job: dict[str, Any]) -> None:
         raise FileNotFoundError("No se encontró el clip de esta publicación programada.")
 
     missing = provider_missing_credentials(str(job["platform"]), settings)
-    account = database.get_connected_account(settings.database_path, str(job["platform"]))
+    owner_id = str(project["owner_id"])
+    account = database.get_connected_account(
+        settings.database_path,
+        str(job["platform"]),
+        owner_id,
+    )
     if missing or account is None:
         exported = _export_clip(settings, job, clip)
         reason = (
@@ -79,6 +84,7 @@ def process_schedule_job(settings: AppSettings, job: dict[str, Any]) -> None:
             / "clips"
             / str(clip["filename"]),
             str(job["visibility"]),
+            owner_id,
         )
     except IntegrationError as error:
         exported = _export_clip(settings, job, clip)

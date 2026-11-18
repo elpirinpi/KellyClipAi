@@ -57,6 +57,17 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .app-shell { min-height: 100vh; display: flex; flex-direction: column; background: #f6f7fb; }
 .developer-credit { margin-top: auto; padding: 18px 16px 20px; border-top: 1px solid #e9eaf0; background: #fff; color: #6e788e; text-align: center; font-size: 11px; letter-spacing: .12px; }
 .developer-credit strong { margin-left: 3px; color: #5b42b6; font-weight: 600; }
+.auth-page { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px 16px 0; background: #f6f7fb; }
+.auth-card { width: min(440px, 100%); margin: auto; padding: 32px; border: 1px solid #e9eaf0; border-radius: 16px; background: #fff; box-shadow: 0 12px 36px #1f24300b; }
+.auth-brand { display: flex; align-items: center; justify-content: center; gap: 9px; margin-bottom: 28px; }
+.auth-card h1 { margin: 0; color: #1f2430; text-align: center; font-size: 24px; font-weight: 600; letter-spacing: -.5px; }
+.auth-intro { margin: 9px 0 24px; color: #6e788e; text-align: center; font-size: 13px; line-height: 1.6; }
+.auth-form { display: flex; flex-direction: column; gap: 16px; }
+.auth-submit { min-height: 44px; margin-top: 4px; border: 0; border-radius: 9px; background: #e7e1fb; color: #6844e9; font-weight: 600; cursor: pointer; }
+.auth-submit:hover { background: #ded5fa; }
+.auth-submit:disabled { opacity: .6; cursor: wait; }
+.auth-switch { display: block; margin: 18px auto 0; border: 0; background: transparent; color: #7354dc; font-size: 12px; cursor: pointer; }
+.auth-page > .developer-credit { width: calc(100% + 32px); margin-top: 24px; }
 .topbar { height: 56px; padding: 0 18px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #f6f6f8; background: #fff; }
 .brand { padding: 0; border: 0; background: transparent; display: inline-flex; align-items: center; gap: 9px; cursor: pointer; color: var(--text-main); }
 .brand-mark { width: 34px; height: 34px; border-radius: 10px; background: #f0eaff; display: flex; align-items: center; justify-content: center; gap: 2px; transform: rotate(-8deg); }

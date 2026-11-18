@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, ty
 import {
   AlertCircle, ArrowLeft, ArrowRight, AudioLines, CalendarDays, Check, ChevronDown,
   ChevronLeft, ChevronRight, Circle, CloudUpload, Download, FileVideo2, Link2, LoaderCircle,
-  LockKeyhole, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Video, WandSparkles, X,
+  LockKeyhole, LogOut, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Video, WandSparkles, X,
 } from 'lucide-react';
+import { accessToken, apiFetch, getSupabase, initializeSupabase, signOut, streamApiEvents, syncMediaCookie } from './auth';
+import type { Session } from '@supabase/supabase-js';
 
 const API_BASE = __KELLYCLIP_API_BASE__;
 
@@ -36,7 +38,6 @@ type StagedMedia = {
   project_id: string | null;
 };
 type Template = { name: string; tone: string; sample: string; featured?: boolean; base_template?: string };
-type LLMSettings = { provider: string; apiKey: string; model: string; baseUrl: string };
 type ClipWord = { start: number; end: number; preview_start: number; preview_end: number; text: string };
 type EditablePhrase = {
   id: string;
@@ -129,21 +130,6 @@ type ScheduleJob = {
   download_url: string | null;
 };
 
-function readLLMSettings(): LLMSettings {
-  try {
-    const saved = sessionStorage.getItem('kellyclipai.llm-settings');
-    if (saved) return JSON.parse(saved) as LLMSettings;
-  } catch {
-    sessionStorage.removeItem('kellyclipai.llm-settings');
-  }
-  return {
-    provider: 'Groq',
-    apiKey: sessionStorage.getItem('kellyclipai.groq-api-key') ?? '',
-    model: 'openai/gpt-oss-120b',
-    baseUrl: '',
-  };
-}
-
 function defaultModelFor(provider: string): string {
   return {
     Groq: 'openai/gpt-oss-120b',
@@ -224,16 +210,19 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(unit > 0 && value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
-function uploadStagedFile(
+async function uploadStagedFile(
   stagedId: string,
   file: File,
   onProgress: (progress: number) => void,
   onRequest: (request: XMLHttpRequest | null) => void,
 ): Promise<void> {
+  const token = await accessToken();
+  if (!token) throw new Error('Inicia sesión antes de cargar un video.');
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open('POST', `${API_BASE}/api/staged-media/${stagedId}/content`);
     request.setRequestHeader('Content-Type', 'application/octet-stream');
+    request.setRequestHeader('Authorization', `Bearer ${token}`);
     request.upload.onprogress = (event) => {
       if (event.lengthComputable && event.total > 0) {
         onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
@@ -271,7 +260,7 @@ async function pollStagedMedia(
   active: () => boolean,
 ): Promise<StagedMedia> {
   while (active()) {
-    const response = await fetch(`${API_BASE}/api/staged-media/${stagedId}`);
+    const response = await apiFetch(`${API_BASE}/api/staged-media/${stagedId}`);
     if (!response.ok) throw new Error(await responseError(response));
     const staged = await response.json() as StagedMedia;
     onUpdate(staged);
@@ -340,8 +329,114 @@ function extensionOf(name: string): string {
   return name.split('.').pop()?.toLowerCase() ?? '';
 }
 
+function AuthPage({ configurationError }: { configurationError: string }) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    setMessage('');
+    try {
+      if (mode === 'register') {
+        const { data, error: signUpError } = await getSupabase().auth.signUp({
+          email: email.trim(),
+          password,
+          options: { emailRedirectTo: window.location.origin },
+        });
+        if (signUpError) throw signUpError;
+        if (!data.session) {
+          setMessage('Cuenta creada. Verifica tu correo y después inicia sesión.');
+        }
+      } else {
+        const { error: signInError } = await getSupabase().auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (signInError) throw signInError;
+      }
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'No se pudo completar la solicitud.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <main className="auth-page">
+      <section className="auth-card" aria-labelledby="auth-title">
+        <div className="auth-brand" aria-label="kellyClipAi">
+          <span className="brand-mark" aria-hidden="true"><span /><span /><span /></span>
+          <span className="brand-name">kelly<span>Clip</span><b>Ai</b></span>
+        </div>
+        <h1 id="auth-title">{mode === 'login' ? 'Inicia sesión' : 'Crea tu cuenta'}</h1>
+        <p className="auth-intro">
+          {mode === 'login'
+            ? 'Accede a tus proyectos y continúa creando clips.'
+            : 'Regístrate con tu correo para usar kellyClipAi.'}
+        </p>
+        {configurationError && <p className="error-message" role="alert">{configurationError}</p>}
+        {!configurationError && (
+          <form className="auth-form" onSubmit={(event) => void submit(event)}>
+            <label className="config-field">
+              <span>Correo electrónico</span>
+              <input
+                className="text-input"
+                type="email"
+                autoComplete="email"
+                required
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+            </label>
+            <label className="config-field">
+              <span>Contraseña</span>
+              <input
+                className="text-input"
+                type="password"
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                minLength={8}
+                required
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </label>
+            {error && <p className="error-message" role="alert">{error}</p>}
+            {message && <p className="connection-message success" role="status">{message}</p>}
+            <button type="submit" className="auth-submit" disabled={busy}>
+              {busy ? 'Un momento…' : mode === 'login' ? 'Entrar' : 'Registrarme'}
+            </button>
+          </form>
+        )}
+        {!configurationError && (
+          <button
+            type="button"
+            className="auth-switch"
+            onClick={() => {
+              setMode((current) => current === 'login' ? 'register' : 'login');
+              setMessage('');
+              setError('');
+            }}
+          >
+            {mode === 'login' ? '¿No tienes cuenta? Regístrate' : '¿Ya tienes cuenta? Inicia sesión'}
+          </button>
+        )}
+      </section>
+      <footer className="developer-credit">Desarrollado por <strong>KELLY BENJAMIN DE LA CRUZ</strong></footer>
+    </main>
+  );
+}
+
 function App() {
   const [route, setRoute] = useState(window.location.pathname);
+  const [authReady, setAuthReady] = useState(false);
+  const [authSession, setAuthSession] = useState<Session | null>(null);
+  const [authConfigurationError, setAuthConfigurationError] = useState('');
   const [fileInfo, setFileInfo] = useState<UploadInfo | null>(null);
   const [thumbnail, setThumbnail] = useState('');
   const [progress, setProgress] = useState<number | null>(null);
@@ -364,8 +459,8 @@ function App() {
   const [schedulePlatform, setSchedulePlatform] = useState('youtube');
   const [scheduleVisibility, setScheduleVisibility] = useState('private');
   const [notice, setNotice] = useState('');
-  const [settingsProvider, setSettingsProvider] = useState(() => readLLMSettings().provider);
-  const [whisperModel, setWhisperModel] = useState(() => sessionStorage.getItem('kellyclipai.whisper-model') ?? 'small');
+  const [settingsProvider, setSettingsProvider] = useState('Groq');
+  const [whisperModel, setWhisperModel] = useState('small');
   const [linkProject, setLinkProject] = useState<ProjectResult | null>(null);
   const [project, setProject] = useState<ProjectResult | null>(null);
   const [projectError, setProjectError] = useState('');
@@ -388,6 +483,53 @@ function App() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recordChunksRef = useRef<Blob[]>([]);
+  const currentUserId = authSession?.user.id;
+
+  useEffect(() => {
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+    const startAuth = async () => {
+      try {
+        const { client, session } = await initializeSupabase(API_BASE);
+        if (!active) return;
+        if (!client) {
+          setAuthConfigurationError(
+            'Falta configurar SUPABASE_URL y SUPABASE_ANON_KEY en el archivo .env local.',
+          );
+        } else {
+          setAuthSession(session);
+          if (session?.access_token) {
+            void syncMediaCookie(API_BASE, session.access_token).catch((error: unknown) => {
+              if (active) setNotice(error instanceof Error ? error.message : 'No se pudo preparar la sesión.');
+            });
+          }
+          const { data } = client.auth.onAuthStateChange((_event, nextSession) => {
+            if (!active) return;
+            setAuthSession(nextSession);
+            if (nextSession?.access_token) {
+              void syncMediaCookie(API_BASE, nextSession.access_token).catch((error: unknown) => {
+                if (active) setNotice(error instanceof Error ? error.message : 'No se pudo preparar la sesión.');
+              });
+            }
+          });
+          unsubscribe = () => data.subscription.unsubscribe();
+        }
+      } catch (error) {
+        if (active) {
+          setAuthConfigurationError(
+            error instanceof Error ? error.message : 'No se pudo iniciar la autenticación.',
+          );
+        }
+      } finally {
+        if (active) setAuthReady(true);
+      }
+    };
+    void startAuth();
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, []);
 
   const navigate = useCallback((next: string) => {
     window.history.pushState(null, '', next);
@@ -404,10 +546,11 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!authReady || !authSession) return;
     let active = true;
     const restoreUpload = async () => {
       try {
-        const response = await fetch(`${API_BASE}/api/staged-media/latest?source=upload`);
+        const response = await apiFetch(`${API_BASE}/api/staged-media/latest?source=upload`);
         if (!response.ok) throw new Error(await responseError(response));
         const latest = await response.json() as StagedMedia | null;
         if (!active || !latest) return;
@@ -449,11 +592,12 @@ function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [authReady, currentUserId]);
 
   useEffect(() => {
+    if (!authReady || !authSession) return;
     let active = true;
-    fetch(`${API_BASE}/api/templates`)
+    apiFetch(`${API_BASE}/api/templates`)
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response));
         return response.json() as Promise<Array<{ name: string; base_template: string }>>;
@@ -472,7 +616,7 @@ function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [authReady, currentUserId]);
 
   useEffect(() => {
     if (!recording) return;
@@ -507,7 +651,7 @@ function App() {
         setProgress(null);
         return;
       }
-      const createResponse = await fetch(`${API_BASE}/api/staged-media/uploads`, {
+      const createResponse = await apiFetch(`${API_BASE}/api/staged-media/uploads`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -523,7 +667,7 @@ function App() {
       if (!createResponse.ok) throw new Error(await responseError(createResponse));
       const staged = await createResponse.json() as StagedMedia;
       if (cancelImportRef.current || generation !== importGenerationRef.current) {
-        const deleteResponse = await fetch(`${API_BASE}/api/staged-media/${staged.id}`, { method: 'DELETE' });
+        const deleteResponse = await apiFetch(`${API_BASE}/api/staged-media/${staged.id}`, { method: 'DELETE' });
         if (!deleteResponse.ok) throw new Error(await responseError(deleteResponse));
         setProgress(null);
         return;
@@ -597,7 +741,7 @@ function App() {
     setDownloadProgress(null);
     setLinkMessage(`Descargando desde ${detectedPlatform.label} con yt-dlp. Solo importa contenido propio o autorizado.`);
     try {
-      const startResponse = await fetch(`${API_BASE}/api/staged-media/downloads`, {
+      const startResponse = await apiFetch(`${API_BASE}/api/staged-media/downloads`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: link.trim(), config: projectConfig() }),
@@ -612,7 +756,7 @@ function App() {
             setDownloadProgress,
             () => true,
           );
-      const projectResponse = await fetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
+      const projectResponse = await apiFetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -684,7 +828,7 @@ function App() {
     setSavingTemplate(true);
     setNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/templates`, {
+      const response = await apiFetch(`${API_BASE}/api/templates`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -729,24 +873,11 @@ function App() {
     };
   };
 
-  const llmRequest = () => {
-    if (!sessionStorage.getItem('kellyclipai.llm-settings') && !sessionStorage.getItem('kellyclipai.groq-api-key')) {
-      return null;
-    }
-    const saved = readLLMSettings();
-    return {
-      provider: saved.provider,
-      api_key: saved.apiKey || null,
-      model: saved.model || null,
-      base_url: saved.baseUrl || null,
-    };
-  };
-
   const beginProjectProcessing = async (projectId: string) => {
-    const response = await fetch(`${API_BASE}/api/projects/${projectId}/process`, {
+    const response = await apiFetch(`${API_BASE}/api/projects/${projectId}/process`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ llm: llmRequest(), config: projectConfig() }),
+      body: JSON.stringify({ config: projectConfig() }),
     });
     if (!response.ok) throw new Error(await responseError(response));
     navigate(`/p/${projectId}/processing`);
@@ -765,7 +896,7 @@ function App() {
       let target = linkProject;
       if (!target) {
         if (!fileInfo) throw new Error('No se encontró el video local. Vuelve a importarlo antes de procesar.');
-        const response = await fetch(`${API_BASE}/api/staged-media/${fileInfo.id}/project`, {
+        const response = await apiFetch(`${API_BASE}/api/staged-media/${fileInfo.id}/project`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ config: projectConfig() }),
@@ -785,11 +916,11 @@ function App() {
   };
 
   useEffect(() => {
-    if (window.location.pathname !== '/') return;
+    if (!authReady || !authSession || route !== '/') return;
     let active = true;
     const resumeDownload = async () => {
       try {
-        const latestResponse = await fetch(`${API_BASE}/api/staged-media/latest?source=url`);
+        const latestResponse = await apiFetch(`${API_BASE}/api/staged-media/latest?source=url`);
         if (!latestResponse.ok) throw new Error(await responseError(latestResponse));
         const latest = await latestResponse.json() as StagedMedia | null;
         if (!active || !latest) return;
@@ -806,7 +937,7 @@ function App() {
               if (active) setDownloadProgress(staged);
             }, () => active);
         if (!active) return;
-        const response = await fetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
+        const response = await apiFetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
@@ -831,7 +962,7 @@ function App() {
     return () => {
       active = false;
     };
-  }, [navigate]);
+  }, [authReady, currentUserId, navigate, route]);
 
   const isSettings = route === '/settings';
   const projectRoute = route.match(/^\/p\/([^/]+)(?:\/(configure|processing|edit\/([^/]+)))?$/);
@@ -842,17 +973,18 @@ function App() {
   const editClipId = projectRoute?.[3] ?? '';
 
   useEffect(() => {
+    if (!authReady || !authSession) return;
     if (!projectRouteId) {
       setProject(null);
       setProjectError('');
       return;
     }
     let active = true;
-    let events: EventSource | null = null;
+    let eventController: AbortController | null = null;
     const loadProject = async () => {
       setProjectError('');
       try {
-        const response = await fetch(`${API_BASE}/api/projects/${projectRouteId}`);
+        const response = await apiFetch(`${API_BASE}/api/projects/${projectRouteId}`);
         if (!response.ok) throw new Error(await responseError(response));
         const loaded = await response.json() as ProjectResult;
         if (!active) return;
@@ -874,46 +1006,29 @@ function App() {
         }
         if (loaded.status === 'processing' || loaded.status === 'queued') {
           if (projectRouteMode !== 'processing') navigate(`/p/${projectRouteId}/processing`);
-          events = new EventSource(`${API_BASE}/api/projects/${projectRouteId}/events`);
-          events.addEventListener('progress', (event) => {
-            const update = JSON.parse((event as MessageEvent<string>).data) as Partial<ProjectResult> & { message?: string };
-            setProject((current) => current ? { ...current, ...update } : current);
-            if (update.status === 'completed' || update.status === 'failed') {
-              events?.close();
-              void fetch(`${API_BASE}/api/projects/${projectRouteId}`)
-                .then((result) => result.json() as Promise<ProjectResult>)
-                .then((finalProject) => {
-                  if (active) {
-                    setProject(finalProject);
-                    navigate(`/p/${projectRouteId}`);
-                  }
-                })
-                .catch((error: unknown) => {
-                  if (active) setProjectError(error instanceof Error ? error.message : 'No se pudo recuperar el resultado.');
-                });
-            }
-          });
-          events.addEventListener('failed', (event) => {
-            const update = JSON.parse((event as MessageEvent<string>).data) as Partial<ProjectResult>;
-            setProject((current) => current ? { ...current, ...update } : current);
-            events?.close();
-            void fetch(`${API_BASE}/api/projects/${projectRouteId}`)
-              .then((result) => result.json() as Promise<ProjectResult>)
-              .then((finalProject) => {
+          eventController = new AbortController();
+          void streamApiEvents(
+            `${API_BASE}/api/projects/${projectRouteId}/events`,
+            async (eventName, data) => {
+              const update = JSON.parse(data) as Partial<ProjectResult> & { message?: string };
+              setProject((current) => current ? { ...current, ...update } : current);
+              if (eventName === 'failed' || update.status === 'completed' || update.status === 'failed') {
+                eventController?.abort();
+                const result = await apiFetch(`${API_BASE}/api/projects/${projectRouteId}`);
+                if (!result.ok) throw new Error(await responseError(result));
+                const finalProject = await result.json() as ProjectResult;
                 if (active) {
                   setProject(finalProject);
                   navigate(`/p/${projectRouteId}`);
                 }
-              })
-              .catch((error: unknown) => {
-                if (active) setProjectError(error instanceof Error ? error.message : 'No se pudo recuperar el proyecto.');
-              });
-          });
-          events.onerror = () => {
-            if (active && events?.readyState === EventSource.CLOSED) {
-              setProjectError('Se perdió la conexión con el progreso del procesamiento. Recarga para consultar el estado guardado.');
+              }
+            },
+            eventController.signal,
+          ).catch((error: unknown) => {
+            if (active && !eventController?.signal.aborted) {
+              setProjectError(error instanceof Error ? error.message : 'Se perdió la conexión con el progreso del procesamiento.');
             }
-          };
+          });
         } else if (projectRouteMode === 'processing') {
           navigate(`/p/${projectRouteId}`);
         }
@@ -924,9 +1039,9 @@ function App() {
     void loadProject();
     return () => {
       active = false;
-      events?.close();
+      eventController?.abort();
     };
-  }, [projectRouteId, projectRouteMode, navigate]);
+  }, [authReady, currentUserId, projectRouteId, projectRouteMode, navigate]);
 
   const retryProject = async () => {
     if (!project) return;
@@ -939,7 +1054,7 @@ function App() {
   };
 
   const refreshProject = async (projectId: string) => {
-    const response = await fetch(`${API_BASE}/api/projects/${projectId}`);
+    const response = await apiFetch(`${API_BASE}/api/projects/${projectId}`);
     if (!response.ok) throw new Error(await responseError(response));
     setProject(await response.json() as ProjectResult);
   };
@@ -950,7 +1065,7 @@ function App() {
     setZoomRecordings([]);
     setZoomLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/api/integrations/zoom/recordings`);
+      const response = await apiFetch(`${API_BASE}/api/integrations/zoom/recordings`);
       if (!response.ok) throw new Error(await responseError(response));
       setZoomRecordings(await response.json() as ZoomRecording[]);
     } catch (error) {
@@ -964,7 +1079,7 @@ function App() {
     setZoomLoading(true);
     setZoomError('');
     try {
-      const response = await fetch(`${API_BASE}/api/integrations/zoom/import`, {
+      const response = await apiFetch(`${API_BASE}/api/integrations/zoom/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ meeting_id: meetingId, file_id: fileId, config: projectConfig() }),
@@ -985,6 +1100,27 @@ function App() {
   const shareRoute = route.match(/^\/share\/([^/]+)$/);
   const shareToken = shareRoute?.[1] ?? '';
 
+  const handleSignOut = async () => {
+    try {
+      await signOut(API_BASE);
+      setAuthSession(null);
+      setFileInfo(null);
+      setProject(null);
+      setLinkProject(null);
+      setProgress(null);
+      navigate('/');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo cerrar la sesión.');
+    }
+  };
+
+  if (!shareToken && !authReady) {
+    return <main className="auth-page"><p role="status">Conectando con el servicio de autenticación…</p></main>;
+  }
+  if (!shareToken && !authSession) {
+    return <AuthPage configurationError={authConfigurationError} />;
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -1002,6 +1138,9 @@ function App() {
           {isSettings ? <ArrowLeft size={17} /> : <Settings2 size={17} />}
           <span>{isSettings ? 'Volver' : 'Ajustes'}</span>
         </button>
+        {!shareToken && <button className="settings-link" type="button" onClick={() => void handleSignOut()} aria-label="Cerrar sesión">
+          <LogOut size={17} /><span>Cerrar sesión</span>
+        </button>}
       </header>
 
       {shareToken ? (
@@ -1395,7 +1534,7 @@ function ResultsPage({
     setBusyAction('publish');
     setNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/publish`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/publish`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1431,7 +1570,7 @@ function ResultsPage({
   const refreshScheduleJobs = useCallback(async () => {
     if (!project) return;
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/scheduled`);
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/scheduled`);
       if (!response.ok) throw new Error(await responseError(response));
       setScheduleJobs(await response.json() as ScheduleJob[]);
       setScheduleError('');
@@ -1469,7 +1608,7 @@ function ResultsPage({
     setBusyAction('archive');
     setNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/clips/archive`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/archive`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ clip_ids: selectedClips.map((clip) => clip.id) }),
@@ -1493,7 +1632,7 @@ function ResultsPage({
     setBusyAction(clip.id);
     setNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/clips/${clip.id}/quality`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clip.id}/quality`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resolution }),
@@ -1512,7 +1651,7 @@ function ResultsPage({
     setBusyAction(clip.id);
     setNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/clips/${clip.id}/improve`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clip.id}/improve`, {
         method: 'POST',
       });
       if (!response.ok) throw new Error(await responseError(response));
@@ -1530,7 +1669,7 @@ function ResultsPage({
     setShareLink('');
     setNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/clips/${clipId}/share`, {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clipId}/share`, {
         method: 'POST',
       });
       if (!response.ok) throw new Error(await responseError(response));
@@ -1803,7 +1942,7 @@ function ClipEditorPage({
     const controller = new AbortController();
     setLoading(true);
     setError('');
-    fetch(endpoint, { signal: controller.signal })
+    apiFetch(endpoint, { signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response));
         return response.json() as Promise<ClipEditorState>;
@@ -1835,7 +1974,7 @@ function ClipEditorPage({
     setError('');
     setMessage('');
     try {
-      const response = await fetch(endpoint, {
+      const response = await apiFetch(endpoint, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(editor),
@@ -1856,7 +1995,7 @@ function ClipEditorPage({
     setError('');
     setMessage('');
     try {
-      const response = await fetch(`${endpoint}/preview`, {
+      const response = await apiFetch(`${endpoint}/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(editor),
@@ -1878,7 +2017,7 @@ function ClipEditorPage({
     setError('');
     setMessage('');
     try {
-      const response = await fetch(`${endpoint}/export`, {
+      const response = await apiFetch(`${endpoint}/export`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(editor),
@@ -2048,19 +2187,19 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
   notice: string;
 }) {
   const [saved, setSaved] = useState(false);
-  const [apiKey, setApiKey] = useState(() => readLLMSettings().apiKey);
-  const [model, setModel] = useState(() => readLLMSettings().model);
-  const [baseUrl, setBaseUrl] = useState(() => readLLMSettings().baseUrl);
+  const [apiKey, setApiKey] = useState('');
+  const [model, setModel] = useState(defaultModelFor(provider));
+  const [baseUrl, setBaseUrl] = useState('');
   const [checking, setChecking] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('');
+  const [hasSavedKey, setHasSavedKey] = useState(false);
   const [envKeyConfigured, setEnvKeyConfigured] = useState(false);
   const [integrations, setIntegrations] = useState<Record<string, IntegrationStatus>>({});
   const [integrationBusy, setIntegrationBusy] = useState('');
 
   useEffect(() => {
-    const hasBrowserSettings = Boolean(sessionStorage.getItem('kellyclipai.llm-settings'));
     let active = true;
-    fetch(`${API_BASE}/api/settings`)
+    apiFetch(`${API_BASE}/api/settings`)
       .then(async (response) => {
         if (!response.ok) throw new Error(await responseError(response));
         return response.json() as Promise<{
@@ -2068,19 +2207,20 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
           model: string;
           base_url: string;
           has_llm_key: boolean;
+          has_saved_llm_key: boolean;
+          has_env_llm_key: boolean;
           whisper_model: string;
           integrations: Record<string, IntegrationStatus>;
         }>;
       })
       .then((configuration) => {
         if (!active) return;
-        if (!hasBrowserSettings) {
-          setProvider(configuration.provider);
-          setModel(configuration.model || defaultModelFor(configuration.provider));
-          setBaseUrl(configuration.base_url);
-          setWhisper(configuration.whisper_model);
-        }
-        setEnvKeyConfigured(configuration.has_llm_key);
+        setProvider(configuration.provider);
+        setModel(configuration.model || defaultModelFor(configuration.provider));
+        setBaseUrl(configuration.base_url);
+        setWhisper(configuration.whisper_model);
+        setHasSavedKey(configuration.has_saved_llm_key);
+        setEnvKeyConfigured(configuration.has_env_llm_key);
         setIntegrations(configuration.integrations);
       })
       .catch((error: unknown) => {
@@ -2107,7 +2247,7 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
     setIntegrationBusy(integration);
     onNotice('');
     try {
-      const response = await fetch(`${API_BASE}/api/integrations/${integration}/connect`);
+      const response = await apiFetch(`${API_BASE}/api/integrations/${integration}/connect`);
       if (!response.ok) throw new Error(await responseError(response));
       const result = await response.json() as { authorization_url: string };
       window.location.assign(result.authorization_url);
@@ -2120,7 +2260,7 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
   const disconnectIntegration = async (integration: string) => {
     setIntegrationBusy(integration);
     try {
-      const response = await fetch(`${API_BASE}/api/integrations/${integration}/disconnect`, { method: 'POST' });
+      const response = await apiFetch(`${API_BASE}/api/integrations/${integration}/disconnect`, { method: 'POST' });
       if (!response.ok) throw new Error(await responseError(response));
       setIntegrations((current) => ({
         ...current,
@@ -2134,18 +2274,39 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
     }
   };
 
-  const saveSettings = () => {
-    sessionStorage.setItem('kellyclipai.llm-settings', JSON.stringify({
-      provider,
-      apiKey: apiKey.trim(),
-      model: model.trim(),
-      baseUrl: baseUrl.trim(),
-    }));
-    sessionStorage.setItem('kellyclipai.whisper-model', whisper);
-    if (provider === 'Groq' && apiKey.trim()) sessionStorage.setItem('kellyclipai.groq-api-key', apiKey.trim());
-    else sessionStorage.removeItem('kellyclipai.groq-api-key');
-    setSaved(true);
-    onNotice('Ajustes guardados solo en esta sesión. La clave se envía al backend local al procesar y no se guarda en SQLite.');
+  const saveSettings = async () => {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/settings/llm-key`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider,
+          api_key: apiKey.trim(),
+          model: model.trim(),
+          base_url: baseUrl.trim(),
+        }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      setApiKey('');
+      setHasSavedKey(true);
+      setSaved(true);
+      onNotice('Ajustes guardados. La clave se cifra con DPAPI de Windows y no vuelve a mostrarse.');
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : 'No se pudieron guardar los ajustes.');
+    }
+  };
+
+  const removeSavedKey = async () => {
+    try {
+      const response = await apiFetch(`${API_BASE}/api/settings/llm-key`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setHasSavedKey(false);
+      setApiKey('');
+      setSaved(false);
+      onNotice('Se eliminó la clave guardada para esta cuenta.');
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : 'No se pudo eliminar la clave guardada.');
+    }
   };
 
   const testGroqConnection = async () => {
@@ -2164,7 +2325,7 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
         const detail = await response.text();
         throw new Error(response.status === 401 ? 'Groq no aceptó la clave. Comprueba que sea correcta.' : `Groq respondió con error (${response.status}). ${detail.slice(0, 180)}`);
       }
-      setConnectionStatus('Conexión con Groq correcta. Guarda los ajustes para conservar la clave durante esta sesión.');
+      setConnectionStatus('Conexión con Groq correcta. Guarda los ajustes para conservar la clave cifrada en este dispositivo.');
     } catch (error) {
       setConnectionStatus(error instanceof Error ? error.message : 'No se pudo conectar con Groq. Comprueba tu conexión e inténtalo de nuevo.');
     } finally {
@@ -2181,14 +2342,17 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
           <label className="config-field"><span>Proveedor de IA</span><span className="select-wrap"><select value={provider} onChange={(event) => { setProvider(event.target.value); setModel(defaultModelFor(event.target.value)); setConnectionStatus(''); setSaved(false); }}><option>Groq</option><option>OpenAI</option><option>Anthropic</option><option>OpenRouter</option><option>Servidor local compatible</option></select><ChevronDown size={16} /></span></label>
           <label className="config-field"><span>Modelo LLM</span><input className="text-input" value={model} onChange={(event) => { setModel(event.target.value); setSaved(false); }} placeholder="Nombre del modelo del proveedor" /></label>
           {provider === 'Servidor local compatible' && <label className="config-field key-field"><span>URL del endpoint local compatible con OpenAI</span><input className="text-input" type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://localhost:1234/v1" /></label>}
-          <label className="config-field key-field"><span>Clave API de {provider}</span><input className="text-input" type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setConnectionStatus(''); setSaved(false); }} placeholder={envKeyConfigured ? 'Clave ya configurada en .env; dejar vacío para usarla' : 'Pega aquí tu clave; también puedes definirla en .env'} /></label>
+          <label className="config-field key-field"><span>Clave API de {provider}</span><input className="text-input" type="password" autoComplete="new-password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setConnectionStatus(''); setSaved(false); }} placeholder={hasSavedKey ? 'Clave guardada; deja vacío para conservarla' : envKeyConfigured ? 'Clave configurada en .env; pega otra para reemplazarla' : 'Pega aquí tu clave API'} /></label>
           <label className="config-field"><span>Modelo de Whisper</span><span className="select-wrap"><select value={whisper} onChange={(event) => { setWhisper(event.target.value); setSaved(false); }}><option value="tiny">tiny · rápido</option><option value="small">small · equilibrado</option><option value="medium">medium · preciso</option><option value="large-v3">large-v3 · máxima precisión</option></select><ChevronDown size={16} /></span></label>
         </div>
-        <p className="settings-explainer">Configura la clave aquí o en `.env`. La clave introducida en esta pantalla vive solo en la sesión del navegador y se envía únicamente al backend local al procesar; no se conserva en SQLite.</p>
+        <p className="settings-explainer">La clave se cifra con DPAPI de Windows y queda asociada a tu cuenta en este dispositivo. Nunca se devuelve al navegador ni se almacena en texto legible.</p>
         {provider === 'Groq' && <div className="key-actions"><button type="button" className="subtle-button" onClick={() => void testGroqConnection()} disabled={checking}>{checking && <LoaderCircle size={14} className="spin" />}{checking ? 'Probando…' : 'Probar conexión'}</button><a href="https://console.groq.com/keys" target="_blank" rel="noreferrer">Obtener clave en Groq</a></div>}
         {connectionStatus && <p className={`connection-message ${connectionStatus.startsWith('Conexión') ? 'success' : ''}`} role="status">{connectionStatus}</p>}
-        <button type="button" className="subtle-button save-settings" onClick={saveSettings}>Guardar ajustes</button>
-        {saved && <p className="form-message" role="status">Preferencias guardadas en esta sesión del navegador.</p>}
+        <div className="key-actions">
+          <button type="button" className="subtle-button save-settings" onClick={() => void saveSettings()}>Guardar ajustes</button>
+          {hasSavedKey && <button type="button" className="outline-action" onClick={() => void removeSavedKey()}>Eliminar clave guardada</button>}
+        </div>
+        {saved && <p className="form-message" role="status">Preferencias y clave guardadas para esta cuenta.</p>}
       </section>
       <section className="config-card integrations-list">
         <div className="card-heading"><div><h2>Cuentas e integraciones</h2><p>Las credenciales se configuran en `.env`; las cuentas se conectan mediante OAuth local.</p></div></div>

@@ -54,11 +54,12 @@ def provider_missing_credentials(provider: str, settings: AppSettings) -> list[s
 def integration_status(
     settings: AppSettings,
     database_path: Path,
+    owner_id: str = "legacy",
 ) -> dict[str, dict[str, Any]]:
     status: dict[str, dict[str, Any]] = {}
     for provider in _PROVIDER_ENV:
         missing = _missing_credentials(provider, settings)
-        account = database.get_connected_account(database_path, provider)
+        account = database.get_connected_account(database_path, provider, owner_id)
         status[provider] = {
             "configured": not missing,
             "missing": missing,
@@ -398,6 +399,7 @@ def _refresh_account(
     settings: AppSettings,
     provider: str,
     account: dict[str, Any],
+    owner_id: str = "legacy",
 ) -> dict[str, Any]:
     refresh_token = account.get("refresh_token")
     if provider == "instagram" and account.get("metadata", {}).get("user_access_token"):
@@ -518,12 +520,21 @@ def _refresh_account(
         refreshed.get("refresh_token"),
         refreshed.get("expires_at"),
         refreshed.get("metadata") or {},
+        owner_id,
     )
     return refreshed
 
 
-def _access_token(settings: AppSettings, provider: str) -> tuple[str, dict[str, Any]]:
-    account = database.get_connected_account(settings.database_path, provider)
+def _access_token(
+    settings: AppSettings,
+    provider: str,
+    owner_id: str = "legacy",
+) -> tuple[str, dict[str, Any]]:
+    account = database.get_connected_account(
+        settings.database_path,
+        provider,
+        owner_id,
+    )
     if account is None:
         raise IntegrationError(f"No hay una cuenta de {provider} conectada.")
     expires_at = account.get("expires_at")
@@ -533,7 +544,7 @@ def _access_token(settings: AppSettings, provider: str) -> tuple[str, dict[str, 
         except ValueError as error:
             raise IntegrationError(f"La fecha de sesión de {provider} no es válida; vuelve a conectar.") from error
         if expiry <= datetime.now(timezone.utc) + timedelta(minutes=2):
-            account = _refresh_account(settings, provider, account)
+            account = _refresh_account(settings, provider, account, owner_id)
     return account["access_token"], account
 
 
@@ -543,12 +554,13 @@ def publish_clip(
     clip: dict[str, Any],
     file_path: Path,
     visibility: str,
+    owner_id: str = "legacy",
 ) -> dict[str, str]:
     if platform not in {"youtube", "tiktok", "instagram"}:
         raise IntegrationError(f"Plataforma de publicación no admitida: {platform}.")
     if not file_path.is_file():
         raise IntegrationError("El MP4 del clip no está disponible para publicar.")
-    token, account = _access_token(settings, platform)
+    token, account = _access_token(settings, platform, owner_id)
     if platform == "youtube":
         return _publish_youtube(token, clip, file_path, visibility)
     if platform == "tiktok":
@@ -789,8 +801,11 @@ def _publish_instagram(
     return {"external_id": media_id, "url": ""}
 
 
-def list_zoom_recordings(settings: AppSettings) -> list[dict[str, Any]]:
-    token, _ = _access_token(settings, "zoom")
+def list_zoom_recordings(
+    settings: AppSettings,
+    owner_id: str = "legacy",
+) -> list[dict[str, Any]]:
+    token, _ = _access_token(settings, "zoom", owner_id)
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=30)
     with httpx.Client(timeout=30, follow_redirects=True) as client:
@@ -833,11 +848,12 @@ def download_zoom_recording(
     meeting_id: str,
     file_id: str,
     target_path: Path,
+    owner_id: str = "legacy",
 ) -> None:
     if len(meeting_id) > 256 or len(file_id) > 100:
         raise IntegrationError("El identificador de grabación de Zoom no es válido.")
-    token, _ = _access_token(settings, "zoom")
-    recordings = list_zoom_recordings(settings)
+    token, _ = _access_token(settings, "zoom", owner_id)
+    recordings = list_zoom_recordings(settings, owner_id)
     selected = next(
         (
             (meeting, file)
