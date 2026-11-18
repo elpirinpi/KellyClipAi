@@ -108,6 +108,9 @@ durante los segmentos de voz detectados; si no hay una señal fiable, vuelve al
 rostro dominante. También puedes elegir pantalla dividida, fondo desenfocado o
 encuadre centrado. Los modelos se incluyen localmente y ningún fotograma,
 detección ni cálculo de labios se envía a servicios externos.
+Las transcripciones de más de 15 minutos se analizan en ventanas de 15 minutos
+con 3 minutos de solape; los tiempos de cada clip se restauran a la línea
+temporal original y las propuestas duplicadas o solapadas se descartan.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
 

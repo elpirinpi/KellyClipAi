@@ -23,7 +23,7 @@ from .media import (
     render_clip,
     transcribe,
 )
-from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment
+from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment, Word
 from .settings import AppSettings, get_settings
 
 
@@ -32,6 +32,9 @@ class ProjectNotFoundError(RuntimeError):
 
 
 logger = logging.getLogger(__name__)
+
+_LLM_WINDOW_SECONDS = 15 * 60
+_LLM_WINDOW_OVERLAP_SECONDS = 3 * 60
 
 
 def _publish(
@@ -147,6 +150,108 @@ def _validate_and_complete_proposals(
 
 
 def _propose_valid_clips(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    llm: ResolvedLLM,
+) -> list[ClipProposal]:
+    if duration <= _LLM_WINDOW_SECONDS:
+        return _propose_valid_window(transcript, project, duration, llm)
+
+    stride = _LLM_WINDOW_SECONDS - _LLM_WINDOW_OVERLAP_SECONDS
+    proposals: list[ClipProposal] = []
+    errors: list[str] = []
+    window_start = 0.0
+    window_index = 0
+    while window_start < duration:
+        window_end = min(duration, window_start + _LLM_WINDOW_SECONDS)
+        window_transcript = _slice_transcript(transcript, window_start, window_end)
+        window_duration = window_end - window_start
+        try:
+            window_proposals = _propose_valid_window(
+                window_transcript, project, window_duration, llm
+            )
+        except MediaProcessingError as error:
+            errors.append(f"ventana {window_index + 1}: {error}")
+            logger.warning("Se omite una ventana de transcripción: %s", errors[-1])
+            window_proposals = []
+
+        owned_duration = (
+            window_duration
+            if window_end >= duration
+            else min(float(stride), window_duration)
+        )
+        proposals.extend(
+            proposal.model_copy(
+                update={
+                    "inicio": proposal.inicio + window_start,
+                    "fin": proposal.fin + window_start,
+                }
+            )
+            for proposal in window_proposals
+            if proposal.inicio < owned_duration
+        )
+        if window_end >= duration:
+            break
+        window_start += stride
+        window_index += 1
+
+    selected: list[ClipProposal] = []
+    for proposal in sorted(
+        proposals, key=lambda clip: (-clip.puntuacion, clip.inicio)
+    ):
+        if any(
+            proposal.inicio < existing.fin and existing.inicio < proposal.fin
+            for existing in selected
+        ):
+            logger.warning(
+                "Se descarta el clip %s por solaparse con otra ventana.",
+                proposal.titulo,
+            )
+            continue
+        selected.append(proposal)
+        if len(selected) == 10:
+            break
+    if not selected and errors:
+        raise MediaProcessingError(
+            "No se encontraron propuestas válidas en las ventanas analizadas. "
+            + "; ".join(errors[:3])
+        )
+    return sorted(selected, key=lambda clip: clip.inicio)
+
+
+def _slice_transcript(
+    transcript: list[TranscriptSegment],
+    start: float,
+    end: float,
+) -> list[TranscriptSegment]:
+    sliced: list[TranscriptSegment] = []
+    for segment in transcript:
+        segment_start = max(start, segment.start)
+        segment_end = min(end, segment.end)
+        if segment_end <= segment_start:
+            continue
+        words = [
+            Word(
+                start=max(start, word.start) - start,
+                end=min(end, word.end) - start,
+                text=word.text,
+            )
+            for word in segment.words
+            if word.start < end and word.end > start
+        ]
+        sliced.append(
+            TranscriptSegment(
+                start=segment_start - start,
+                end=segment_end - start,
+                text=segment.text,
+                words=words,
+            )
+        )
+    return sliced
+
+
+def _propose_valid_window(
     transcript: list[TranscriptSegment],
     project: ProjectConfig,
     duration: float,
