@@ -8,6 +8,7 @@ import threading
 from collections.abc import Callable
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 
 from .face_tracking import (
     FaceCropKeyframe,
@@ -39,6 +40,8 @@ _CENSORED_WORDS = {
     "verga",
 }
 _FFMPEG_RENDER_TIMEOUT_SECONDS = 600
+_WHISPER_PIPELINE_LOCK = threading.Lock()
+_WHISPER_PIPELINE_CACHE: tuple[str, Any] | None = None
 
 
 class MediaProcessingError(RuntimeError):
@@ -137,16 +140,21 @@ def transcribe(
     input_path: Path,
     model_name: str,
     on_progress: ProgressCallback,
+    language: str = "auto",
+    on_model_download_progress: ProgressCallback | None = None,
 ) -> tuple[list[TranscriptSegment], str]:
     try:
-        from faster_whisper import WhisperModel
-
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(
+        pipeline = _get_whisper_pipeline(
+            model_name, on_model_download_progress
+        )
+        segments, info = pipeline.transcribe(
             str(input_path),
+            language=None if language == "auto" else language,
             word_timestamps=True,
+            without_timestamps=False,
             vad_filter=True,
             beam_size=5,
+            batch_size=4,
         )
         transcript: list[TranscriptSegment] = []
         last_percent = -1
@@ -183,6 +191,69 @@ def transcribe(
         raise
     except Exception as error:
         raise MediaProcessingError(f"Falló la transcripción con faster-whisper: {error}") from error
+
+
+def _download_whisper_model(
+    model_name: str,
+    on_progress: ProgressCallback | None,
+) -> str:
+    from huggingface_hub import snapshot_download
+    from tqdm import tqdm
+
+    if on_progress is not None:
+        on_progress(0)
+
+    class ModelDownloadProgress(tqdm):
+        def update(self, n: int = 1) -> bool:
+            updated = super().update(n)
+            if self.total and on_progress is not None:
+                percent = min(95.0, self.n / self.total * 95)
+                on_progress(percent)
+            return updated
+
+    return str(
+        snapshot_download(
+            repo_id=f"Systran/faster-whisper-{model_name}",
+            allow_patterns=[
+                "config.json",
+                "preprocessor_config.json",
+                "model.bin",
+                "tokenizer.json",
+                "vocabulary.*",
+            ],
+            max_workers=1,
+            tqdm_class=ModelDownloadProgress,
+        )
+    )
+
+
+def _get_whisper_pipeline(
+    model_name: str,
+    on_download_progress: ProgressCallback | None,
+) -> Any:
+    global _WHISPER_PIPELINE_CACHE
+    with _WHISPER_PIPELINE_LOCK:
+        if (
+            _WHISPER_PIPELINE_CACHE is not None
+            and _WHISPER_PIPELINE_CACHE[0] == model_name
+        ):
+            return _WHISPER_PIPELINE_CACHE[1]
+
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
+
+        _WHISPER_PIPELINE_CACHE = None
+        model_path = _download_whisper_model(model_name, on_download_progress)
+        model = WhisperModel(
+            model_path,
+            device="cpu",
+            compute_type="int8",
+            num_workers=2,
+        )
+        pipeline = BatchedInferencePipeline(model=model)
+        _WHISPER_PIPELINE_CACHE = (model_name, pipeline)
+        if on_download_progress is not None:
+            on_download_progress(100)
+        return pipeline
 
 
 def _silence_intervals(

@@ -93,8 +93,8 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 Descarga `KellyClipAi-Setup-1.0.5.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador requiere internet para instalar
-WebView2 si hace falta; el modelo Whisper `small` se descarga la primera vez
-que procesas un video. No incluye credenciales LLM ni de redes sociales:
+WebView2 si hace falta; el modelo Whisper seleccionado se descarga la primera
+vez que procesas un video. No incluye credenciales LLM ni de redes sociales:
 configúralas en Ajustes o en `%LOCALAPPDATA%\kellyClipAi\.env`.
 
 Los proyectos, archivos y base SQLite de la versión instalada se guardan en
@@ -111,6 +111,10 @@ detección ni cálculo de labios se envía a servicios externos.
 Las transcripciones de más de 15 minutos se analizan en ventanas de 15 minutos
 con 3 minutos de solape; los tiempos de cada clip se restauran a la línea
 temporal original y las propuestas duplicadas o solapadas se descartan.
+Whisper reutiliza en memoria el último modelo seleccionado y procesa con
+inferencia por lotes en CPU, conservando timestamps por palabra. El idioma se
+detecta automáticamente o se fija por proyecto; la primera descarga muestra
+progreso real y se almacena en la caché local de Hugging Face.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
 

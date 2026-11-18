@@ -604,10 +604,23 @@ def process_project(
                     f"Transcribiendo el audio… {percent:.0f}%",
                 )
 
+            def on_whisper_download_progress(percent: float) -> None:
+                progress = min(100, max(0, round(percent)))
+                _publish(
+                    settings,
+                    project_id,
+                    "processing",
+                    "finding",
+                    progress,
+                    f"Descargando el modelo Whisper… {percent:.0f}%",
+                )
+
             transcript, language = transcribe(
                 input_path,
                 project_config.whisper_model or settings.whisper_model,
                 on_transcription_progress,
+                language=project_config.whisper_language,
+                on_model_download_progress=on_whisper_download_progress,
             )
             transcript_data = [segment.model_dump() for segment in transcript]
             metadata["language"] = language

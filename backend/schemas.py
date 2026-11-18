@@ -46,6 +46,25 @@ class ProjectConfig(BaseModel):
     ratio: Ratio = "9:16"
     duration: DurationChoice = "Cualquiera"
     framing: Literal["speaker", "split", "blur", "center"] = "speaker"
+    whisper_language: Literal[
+        "auto",
+        "ar",
+        "de",
+        "en",
+        "es",
+        "fr",
+        "hi",
+        "it",
+        "ja",
+        "ko",
+        "nl",
+        "pl",
+        "pt",
+        "ru",
+        "tr",
+        "uk",
+        "zh",
+    ] = "auto"
     subtitle_template: str = Field(default="Default", min_length=1, max_length=100)
     options: EditOptions = Field(default_factory=EditOptions)
     moment: str = Field(default="", max_length=500)

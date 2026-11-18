@@ -96,6 +96,24 @@ type ProjectResult = {
     ratio: string;
     duration: string;
     framing?: 'speaker' | 'split' | 'blur' | 'center';
+    whisper_language?:
+      | 'auto'
+      | 'ar'
+      | 'de'
+      | 'en'
+      | 'es'
+      | 'fr'
+      | 'hi'
+      | 'it'
+      | 'ja'
+      | 'ko'
+      | 'nl'
+      | 'pl'
+      | 'pt'
+      | 'ru'
+      | 'tr'
+      | 'uk'
+      | 'zh';
     subtitle_template: string;
     options: Record<string, boolean>;
     moment: string;
@@ -510,6 +528,7 @@ function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [settingsProvider, setSettingsProvider] = useState('Groq');
   const [whisperModel, setWhisperModel] = useState('small');
+  const [whisperLanguage, setWhisperLanguage] = useState('auto');
   const [linkProject, setLinkProject] = useState<ProjectResult | null>(null);
   const [project, setProject] = useState<ProjectResult | null>(null);
   const [projectError, setProjectError] = useState('');
@@ -980,6 +999,7 @@ function App() {
       options,
       moment,
       whisper_model: whisperModel,
+      whisper_language: whisperLanguage,
       schedule: schedule
         ? {
             scheduled_at: new Date(scheduleDate).toISOString(),
@@ -1111,6 +1131,7 @@ function App() {
           setRatio(loaded.config.ratio);
           setDuration(loaded.config.duration);
           setFraming(loaded.config.framing ?? 'speaker');
+          setWhisperLanguage(loaded.config.whisper_language ?? 'auto');
           setActiveTemplate(loaded.config.subtitle_template);
           setOptions({
             emojis: true,
@@ -1553,6 +1574,31 @@ function App() {
                     <option value="center">Centrado</option>
                   </select>
                   <small>El seguimiento del orador estima actividad labial durante la voz detectada, localmente.</small>
+                </label>
+                <label className="config-field">
+                  <span>Idioma de transcripción</span>
+                  <select className="text-input" value={whisperLanguage} onChange={(event) => {
+                    setWhisperLanguage(event.target.value);
+                  }}>
+                    <option value="auto">Detectar automáticamente</option>
+                    <option value="es">Español</option>
+                    <option value="en">Inglés</option>
+                    <option value="pt">Portugués</option>
+                    <option value="fr">Francés</option>
+                    <option value="de">Alemán</option>
+                    <option value="it">Italiano</option>
+                    <option value="ja">Japonés</option>
+                    <option value="zh">Chino</option>
+                    <option value="ko">Coreano</option>
+                    <option value="ru">Ruso</option>
+                    <option value="ar">Árabe</option>
+                    <option value="hi">Hindi</option>
+                    <option value="nl">Neerlandés</option>
+                    <option value="pl">Polaco</option>
+                    <option value="tr">Turco</option>
+                    <option value="uk">Ucraniano</option>
+                  </select>
+                  <small>Se guarda en el proyecto; automático conserva la detección de Whisper.</small>
                 </label>
               </section>
 
