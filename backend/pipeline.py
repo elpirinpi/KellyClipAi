@@ -342,6 +342,8 @@ def _render_projects(
                 "duration": clip_duration,
                 "score": proposal.puntuacion,
                 "viral_reason": proposal.razon_viral,
+                "description": proposal.descripcion,
+                "hashtags": proposal.hashtags,
                 "keywords": proposal.palabras_clave,
                 "emojis": proposal.emojis if project_config.options.emojis else [],
                 "width": metadata["width"],

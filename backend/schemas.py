@@ -245,6 +245,8 @@ class ClipProposal(BaseModel):
     titulo: str = Field(min_length=1, max_length=160)
     puntuacion: float = Field(ge=0, le=10)
     razon_viral: str = Field(min_length=1, max_length=1400)
+    descripcion: str = Field(default="", max_length=4000)
+    hashtags: dict[PublishingPlatform, list[str]] = Field(default_factory=dict)
     palabras_clave: list[str] = Field(default_factory=list, max_length=12)
     emojis: list[str] = Field(default_factory=list, max_length=8)
 

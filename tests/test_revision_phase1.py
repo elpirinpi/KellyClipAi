@@ -8,10 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import database
+from backend import integrations
 from backend import llm as llm_module
 from backend import pipeline
 from backend.main import create_app
-from backend.schemas import ProjectConfig
+from backend.llm import _prompt
+from backend.schemas import ClipProposal, ProjectConfig
 from backend.llm import ResolvedLLM
 from backend.settings import AppSettings
 
@@ -212,3 +214,150 @@ def test_project_middleware_and_sse_use_lightweight_status_queries(
 
     assert response.status_code == 200
     assert "Listo" in response.text
+
+
+def test_clip_proposal_includes_description_and_platform_hashtags() -> None:
+    proposal = ClipProposal.model_validate(
+        {
+            "inicio": 1,
+            "fin": 20,
+            "titulo": "Un consejo",
+            "puntuacion": 8,
+            "razon_viral": "Explica una idea útil.",
+            "descripcion": "Un consejo práctico para hoy.",
+            "hashtags": {
+                "youtube": ["#Consejos"],
+                "tiktok": ["#Aprender"],
+                "instagram": ["#Ideas"],
+            },
+        }
+    )
+    system, _user = _prompt([], ProjectConfig(), 30)
+
+    assert proposal.descripcion == "Un consejo práctico para hoy."
+    assert proposal.hashtags["youtube"] == ["#Consejos"]
+    assert proposal.hashtags["tiktok"] == ["#Aprender"]
+    assert proposal.hashtags["instagram"] == ["#Ideas"]
+    assert "descripcion" in system
+    assert "hashtags" in system
+
+
+def test_youtube_publishes_description_and_hashtags_not_viral_reason(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "clip.mp4"
+    file_path.write_bytes(b"mp4-data")
+    upload_requests: list[dict] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            upload_requests.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={
+                    "Location": "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=test"
+                },
+            )
+        return httpx.Response(200, json={"id": "youtube-video"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(integrations.httpx, "Client", lambda **_kwargs: client)
+
+    result = integrations._publish_youtube(
+        "access-token",
+        {
+            "title": "Un consejo",
+            "description": "Un consejo práctico para hoy.",
+            "hashtags": {"youtube": ["Consejos", "#YouTubeShorts"]},
+            "viral_reason": "No publicar esta explicación interna.",
+            "keywords": ["consejo"],
+        },
+        file_path,
+        "public",
+    )
+
+    payload = upload_requests[0]
+    assert result["external_id"] == "youtube-video"
+    assert payload["snippet"]["description"] == (
+        "Un consejo práctico para hoy.\n\n#Consejos #YouTubeShorts #Shorts"
+    )
+    assert "No publicar" not in payload["snippet"]["description"]
+    assert payload["status"]["selfDeclaredMadeForKids"] is False
+
+
+def test_clip_keeps_generated_publication_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    project_id = "metadata-project"
+    project_dir = settings.data_dir / "projects" / project_id
+    input_path = project_dir / "source"
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Metadata",
+        input_path,
+        {"ratio": "9:16"},
+        "test-user",
+    )
+    monkeypatch.setattr(
+        pipeline.database, "resolve_subtitle_template", lambda *_args: "Default"
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "render_clip",
+        lambda *_args, **_kwargs: (10.0, []),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "probe_media",
+        lambda *_args, **_kwargs: {"width": 720, "height": 1280},
+    )
+    monkeypatch.setattr(pipeline.shutil, "which", lambda _name: "ffprobe")
+    proposal = ClipProposal.model_validate(
+        {
+            "inicio": 1,
+            "fin": 11,
+            "titulo": "Un consejo",
+            "puntuacion": 8,
+            "razon_viral": "Explica una idea útil.",
+            "descripcion": "Un consejo práctico.",
+            "hashtags": {"youtube": ["Consejos"]},
+        }
+    )
+
+    clips = pipeline._render_projects(
+        settings,
+        project_id,
+        input_path,
+        ProjectConfig(),
+        [proposal],
+        [],
+        "ffmpeg",
+        "test-user",
+    )
+
+    assert clips[0]["description"] == "Un consejo práctico."
+    assert clips[0]["hashtags"] == {"youtube": ["Consejos"]}
+
+
+def test_social_captions_select_hashtags_for_the_target_platform() -> None:
+    clip = {
+        "title": "Consejo",
+        "description": "Un consejo útil.",
+        "hashtags": {
+            "youtube": ["Youtube"],
+            "tiktok": ["TikTok"],
+            "instagram": ["Instagram"],
+        },
+    }
+
+    assert integrations._publication_caption(
+        clip, "tiktok", max_length=2200
+    ) == "Un consejo útil.\n\n#TikTok"
+    assert integrations._publication_caption(
+        clip, "instagram", max_length=2200
+    ) == "Un consejo útil.\n\n#Instagram"

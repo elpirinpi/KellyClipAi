@@ -97,8 +97,11 @@ def _prompt(
         "Cada clip debe conservar una idea completa: no cortes una oración, una respuesta ni una explicación a la mitad. "
         "Incluye el final de la última frase hablada y un breve margen de audio. Evita clips artificialmente cortos; "
         "prefiere un momento desarrollado y coherente en vez de un fragmento de pocas palabras. "
+        "Para cada clip escribe descripcion, un texto público independiente de la razón interna, y hashtags "
+        "pertinentes en listas separadas para youtube, tiktok e instagram. "
         "Responde únicamente con un JSON válido que sea un array de objetos con las claves "
-        "inicio, fin, titulo, puntuacion (0-10), razon_viral, palabras_clave (array) y emojis (array). "
+        "inicio, fin, titulo, puntuacion (0-10), razon_viral, descripcion, hashtags, palabras_clave (array) "
+        "y emojis (array). "
         "Usa el idioma de la transcripción para títulos y razones. Si no hay momentos que cumplan los criterios, "
         "devuelve []."
     )

@@ -36,6 +36,37 @@ class IntegrationError(RuntimeError):
     pass
 
 
+def _publication_caption(
+    clip: dict[str, Any],
+    platform: str,
+    *,
+    add_shorts: bool = False,
+    max_length: int,
+) -> str:
+    description = str(clip.get("description") or clip.get("title") or "").strip()
+    platform_hashtags = clip.get("hashtags")
+    values = (
+        platform_hashtags.get(platform, [])
+        if isinstance(platform_hashtags, dict)
+        else []
+    )
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    if isinstance(values, list):
+        for value in values:
+            tag = str(value).strip().lstrip("#")
+            if not tag or not all(character.isalnum() or character == "_" for character in tag):
+                continue
+            normalized = tag.casefold()
+            if normalized not in seen:
+                hashtags.append(f"#{tag}")
+                seen.add(normalized)
+    if add_shorts and "shorts" not in seen:
+        hashtags.append("#Shorts")
+    parts = [part for part in (description, " ".join(hashtags)) if part]
+    return "\n\n".join(parts)[:max_length]
+
+
 def _missing_credentials(provider: str, settings: AppSettings) -> list[str]:
     attributes = _PROVIDER_SETTINGS.get(provider)
     if attributes is None:
@@ -592,11 +623,16 @@ def _publish_youtube(
                 json={
                     "snippet": {
                         "title": str(clip["title"])[:100],
-                        "description": str(clip.get("viral_reason") or "")[:4000],
+                        "description": _publication_caption(
+                            clip, "youtube", add_shorts=True, max_length=4000
+                        ),
                         "tags": [str(item)[:40] for item in clip.get("keywords") or []][:15],
                         "categoryId": "22",
                     },
-                    "status": {"privacyStatus": visibility},
+                    "status": {
+                        "privacyStatus": visibility,
+                        "selfDeclaredMadeForKids": False,
+                    },
                 },
             )
         except httpx.RequestError as error:
@@ -660,7 +696,9 @@ def _publish_tiktok(
             },
             json={
                 "post_info": {
-                    "title": str(clip["title"])[:2200],
+                    "title": _publication_caption(
+                        clip, "tiktok", max_length=2200
+                    ),
                     "privacy_level": privacy_level,
                     "disable_duet": False,
                     "disable_comment": False,
@@ -745,7 +783,9 @@ def _publish_instagram(
             data={
                 "media_type": "REELS",
                 "upload_type": "resumable",
-                "caption": str(clip["title"])[:2200],
+                "caption": _publication_caption(
+                    clip, "instagram", max_length=2200
+                ),
             },
         )
         container_id = _required_token(container, "id", "Instagram")
