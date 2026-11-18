@@ -1879,7 +1879,9 @@ def create_app(
             ) from error
         return {"saved": saved}
 
-    @application.post("/api/projects/{project_id}/clips/{clip_id}/share", status_code=201)
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/share", status_code=201
+    )
     def create_clip_share(project_id: str, clip_id: str) -> dict[str, str]:
         clip_file(project_id, clip_id)
         token = database.create_or_get_clip_share(
@@ -1888,7 +1890,41 @@ def create_app(
             clip_id,
             secrets.token_urlsafe(24),
         )
-        return {"share_url": f"/share/{token}"}
+        share = database.get_clip_share(app_settings.database_path, token)
+        if share is None:
+            raise HTTPException(
+                status_code=500, detail="No se pudo crear el enlace compartido."
+            )
+        return {
+            "share_url": f"/share/{token}",
+            "expires_at": share["expires_at"],
+        }
+
+    @application.delete("/api/projects/{project_id}/clips/{clip_id}/share")
+    def revoke_clip_share_route(
+        project_id: str,
+        clip_id: str,
+        request: Request,
+    ) -> dict[str, bool]:
+        project = database.get_project(
+            app_settings.database_path,
+            project_id,
+            request_user_id(request),
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if not any(
+            str(clip.get("id")) == clip_id for clip in project.get("clips") or []
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        if not database.revoke_clip_share(
+            app_settings.database_path, project_id, clip_id
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="No hay un enlace compartido activo para este clip.",
+            )
+        return {"revoked": True}
 
     def shared_clip(token: str) -> tuple[dict, dict]:
         share = database.get_clip_share(app_settings.database_path, token)

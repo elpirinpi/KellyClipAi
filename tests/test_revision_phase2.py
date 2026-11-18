@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -663,6 +664,138 @@ def test_delete_project_rejects_active_processing(
 
     assert response.status_code == 409
     assert database.get_project(settings.database_path, project_id) is not None
+
+
+def test_share_links_expire_and_can_be_revoked_and_recreated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    database.initialize(settings.database_path)
+    project_id = "revocable-share-project"
+    clip_id = "shareable-clip"
+    config = ProjectConfig()
+    database.create_project(
+        settings.database_path,
+        project_id,
+        "Shareable project",
+        tmp_path / "source.mp4",
+        config.model_dump(mode="json"),
+        "test-user",
+    )
+    clip_path = settings.data_dir / "projects" / project_id / "clips" / f"{clip_id}.mp4"
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_bytes(b"shareable clip")
+    database.update_project(
+        settings.database_path,
+        project_id,
+        status="completed",
+        clips=[
+            {
+                "id": clip_id,
+                "title": "Shareable clip",
+                "duration": 12,
+                "width": 720,
+                "height": 1280,
+                "filename": f"{clip_id}.mp4",
+                "status": "ready",
+            }
+        ],
+    )
+
+    async def idle_schedule_worker(_settings: AppSettings) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_module, "schedule_worker", idle_schedule_worker)
+    with TestClient(main_module.create_app(settings, auth_required=False)) as client:
+        created = client.post(
+            f"/api/projects/{project_id}/clips/{clip_id}/share"
+        )
+        token = created.json()["share_url"].rsplit("/", 1)[-1]
+        shared = client.get(f"/api/shares/{token}")
+        revoked = client.delete(
+            f"/api/projects/{project_id}/clips/{clip_id}/share"
+        )
+        revoked_details = client.get(f"/api/shares/{token}")
+        revoked_file = client.get(f"/api/shares/{token}/file")
+        recreated = client.post(
+            f"/api/projects/{project_id}/clips/{clip_id}/share"
+        )
+        new_token = recreated.json()["share_url"].rsplit("/", 1)[-1]
+        new_details = client.get(f"/api/shares/{new_token}")
+
+        assert created.status_code == 201
+        assert "expires_at" in created.json()
+        assert shared.status_code == 200
+        assert revoked.status_code == 200
+        assert revoked.json() == {"revoked": True}
+        assert revoked_details.status_code == 404
+        assert revoked_file.status_code == 404
+        assert recreated.status_code == 201
+        assert new_token != token
+        assert new_details.status_code == 200
+
+        with database.connection(settings.database_path) as connection:
+            connection.execute(
+                "UPDATE clip_shares SET expires_at = ? WHERE token = ?",
+                ("2000-01-01T00:00:00+00:00", new_token),
+            )
+        expired_details = client.get(f"/api/shares/{new_token}")
+
+    assert expired_details.status_code == 404
+
+
+def test_existing_share_rows_receive_backward_compatible_expiration(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "data" / "app.sqlite3"
+    database_path.parent.mkdir(parents=True)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE clip_shares (
+                token TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                clip_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(project_id, clip_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO clip_shares (token, project_id, clip_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                "legacy-share-token",
+                "legacy-project",
+                "legacy-clip",
+                database.utc_now(),
+            ),
+        )
+
+    database.initialize(database_path)
+    share = database.get_clip_share(database_path, "legacy-share-token")
+
+    assert share is not None
+    with database.connection(database_path) as connection:
+        duration_days = connection.execute(
+            """
+            SELECT julianday(expires_at) - julianday(created_at)
+            FROM clip_shares WHERE token = ?
+            """,
+            ("legacy-share-token",),
+        ).fetchone()[0]
+    assert duration_days == pytest.approx(30, abs=0.01)
 
 
 def test_startup_holds_overdue_publications_for_user_decision(

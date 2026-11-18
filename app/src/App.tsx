@@ -1724,7 +1724,11 @@ function ResultsPage({
   const [sort, setSort] = useState<'score' | 'time'>('score');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState('');
-  const [shareLink, setShareLink] = useState('');
+  const [shareLink, setShareLink] = useState<{
+    url: string;
+    clipId: string;
+    expiresAt: string;
+  } | null>(null);
   const [busyAction, setBusyAction] = useState('');
   const [sharingClip, setSharingClip] = useState('');
   const [publishPlatform, setPublishPlatform] = useState('youtube');
@@ -1984,16 +1988,16 @@ function ResultsPage({
   const shareClip = async (clipId: string) => {
     if (!project) return;
     setSharingClip(clipId);
-    setShareLink('');
+    setShareLink(null);
     setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clipId}/share`, {
         method: 'POST',
       });
       if (!response.ok) throw new Error(await responseError(response));
-      const result = await response.json() as { share_url: string };
+      const result = await response.json() as { share_url: string; expires_at: string };
       const url = new URL(result.share_url, window.location.origin).toString();
-      setShareLink(url);
+      setShareLink({ url, clipId, expiresAt: result.expires_at });
       try {
         await navigator.clipboard.writeText(url);
         setNotice('Enlace local copiado al portapapeles.');
@@ -2004,6 +2008,24 @@ function ResultsPage({
       setNotice(shareError instanceof Error ? shareError.message : 'No se pudo crear el enlace compartido.');
     } finally {
       setSharingClip('');
+    }
+  };
+
+  const revokeShareLink = async () => {
+    if (!project || !shareLink) return;
+    setBusyAction('revoke-share');
+    try {
+      const response = await apiFetch(
+        `${API_BASE}/api/projects/${project.id}/clips/${shareLink.clipId}/share`,
+        { method: 'DELETE' },
+      );
+      if (!response.ok) throw new Error(await responseError(response));
+      setShareLink(null);
+      setNotice('El enlace compartido quedó revocado.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo revocar el enlace.');
+    } finally {
+      setBusyAction('');
     }
   };
   const editSelected = () => {
@@ -2128,7 +2150,15 @@ function ResultsPage({
         </div>
       )}
       {notice && <p className="notice-message" role="status"><AlertCircle size={17} />{notice}<button type="button" onClick={() => setNotice('')} aria-label="Cerrar aviso"><X size={14} /></button></p>}
-      {shareLink && <p className="share-link-message"><a href={shareLink} target="_blank" rel="noreferrer">{shareLink}</a></p>}
+      {shareLink && (
+        <p className="share-link-message">
+          <a href={shareLink.url} target="_blank" rel="noreferrer">{shareLink.url}</a>
+          <span>Expira: {new Date(shareLink.expiresAt).toLocaleString()}</span>
+          <button type="button" className="job-link" onClick={() => void revokeShareLink()} disabled={busyAction === 'revoke-share'}>
+            Revocar enlace
+          </button>
+        </p>
+      )}
       {!project && error && <button type="button" className="retry-button" onClick={() => window.location.reload()}>Volver a cargar el proyecto</button>}
       {project?.status === 'completed' && clips.length === 0 && (
         <section className="empty-clips"><WandSparkles size={23} /><h2>No se encontraron clips</h2><p>El análisis real no identificó momentos que cumplieran la duración y el criterio solicitados.</p></section>

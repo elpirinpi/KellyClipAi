@@ -6,7 +6,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +117,8 @@ def initialize(database_path: Path) -> None:
                 token TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 clip_id TEXT NOT NULL,
+                expires_at TEXT,
+                revoked_at TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(project_id, clip_id)
             );
@@ -180,6 +182,20 @@ def initialize(database_path: Path) -> None:
             )
         if "external_url" not in schedule_columns:
             conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
+        share_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(clip_shares)")
+        }
+        if "expires_at" not in share_columns:
+            conn.execute("ALTER TABLE clip_shares ADD COLUMN expires_at TEXT")
+        if "revoked_at" not in share_columns:
+            conn.execute("ALTER TABLE clip_shares ADD COLUMN revoked_at TEXT")
+        conn.execute(
+            """
+            UPDATE clip_shares
+            SET expires_at = datetime(created_at, '+30 days')
+            WHERE expires_at IS NULL
+            """
+        )
         for table in ("staged_media", "projects", "oauth_states"):
             columns = {
                 row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
@@ -797,8 +813,13 @@ def resolve_subtitle_template(
 def get_clip_share(database_path: Path, token: str) -> dict[str, str] | None:
     with connection(database_path) as conn:
         row = conn.execute(
-            "SELECT token, project_id, clip_id FROM clip_shares WHERE token = ?",
-            (token,),
+            """
+            SELECT token, project_id, clip_id, expires_at
+            FROM clip_shares
+            WHERE token = ? AND revoked_at IS NULL
+              AND expires_at IS NOT NULL AND julianday(expires_at) > julianday(?)
+            """,
+            (token, utc_now()),
         ).fetchone()
     return dict(row) if row else None
 
@@ -809,23 +830,65 @@ def create_or_get_clip_share(
     clip_id: str,
     token: str,
 ) -> str:
+    now = datetime.now(UTC)
+    expires_at = (now + timedelta(days=30)).isoformat()
     with _lock, connection(database_path) as conn:
         row = conn.execute(
-            "SELECT token FROM clip_shares WHERE project_id = ? AND clip_id = ?",
+            """
+            SELECT token, expires_at, revoked_at
+            FROM clip_shares WHERE project_id = ? AND clip_id = ?
+            """,
             (project_id, clip_id),
         ).fetchone()
-        if row:
+        if (
+            row
+            and row["revoked_at"] is None
+            and row["expires_at"] is not None
+            and conn.execute(
+                "SELECT julianday(?) > julianday(?)",
+                (row["expires_at"], utc_now()),
+            ).fetchone()[0]
+        ):
             return str(row["token"])
-        conn.execute(
-            """
-            INSERT INTO clip_shares (token, project_id, clip_id, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (token, project_id, clip_id, utc_now()),
-        )
+        if row:
+            conn.execute(
+                """
+                UPDATE clip_shares
+                SET token = ?, expires_at = ?, revoked_at = NULL, created_at = ?
+                WHERE project_id = ? AND clip_id = ?
+                """,
+                (token, expires_at, now.isoformat(), project_id, clip_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO clip_shares (
+                    token, project_id, clip_id, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (token, project_id, clip_id, expires_at, now.isoformat()),
+            )
     return token
 
 
+def revoke_clip_share(
+    database_path: Path,
+    project_id: str,
+    clip_id: str,
+) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE clip_shares
+            SET revoked_at = ?
+            WHERE project_id = ? AND clip_id = ?
+              AND revoked_at IS NULL
+              AND expires_at IS NOT NULL
+              AND julianday(expires_at) > julianday(?)
+            """,
+            (utc_now(), project_id, clip_id, utc_now()),
+        )
+    return cursor.rowcount == 1
 def save_oauth_state(
     database_path: Path,
     state: str,
