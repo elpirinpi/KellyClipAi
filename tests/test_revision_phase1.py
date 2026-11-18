@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import httpx
@@ -10,9 +11,11 @@ from fastapi.testclient import TestClient
 from backend import database
 from backend import integrations
 from backend import llm as llm_module
+from backend import media as media_module
 from backend import pipeline
 from backend.main import create_app
 from backend.llm import _prompt
+from backend.media import MediaProcessingError, render_clip
 from backend.schemas import ClipProposal, ProjectConfig
 from backend.llm import ResolvedLLM
 from backend.settings import AppSettings
@@ -361,3 +364,66 @@ def test_social_captions_select_hashtags_for_the_target_platform() -> None:
     assert integrations._publication_caption(
         clip, "instagram", max_length=2200
     ) == "Un consejo útil.\n\n#Instagram"
+
+
+def test_ffmpeg_timeout_kills_and_reaps_the_process(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    stopped = threading.Event()
+
+    class BlockingStdout:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            stopped.wait(timeout=2)
+            if stopped.is_set():
+                raise StopIteration
+            raise AssertionError("The render timeout did not stop reading FFmpeg output.")
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.stdout = BlockingStdout()
+            self.killed = False
+            self.wait_calls = 0
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def kill(self) -> None:
+            self.killed = True
+            stopped.set()
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            return -9 if self.killed else 0
+
+    process = FakeProcess()
+    monkeypatch.setattr(media_module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(media_module, "_FFMPEG_RENDER_TIMEOUT_SECONDS", 0.01, raising=False)
+    proposal = ClipProposal(
+        inicio=0,
+        fin=1,
+        titulo="Clip de prueba",
+        puntuacion=7,
+        razon_viral="Una frase.",
+    )
+
+    with pytest.raises(MediaProcessingError, match="tiempo máximo"):
+        render_clip(
+            tmp_path / "source.mp4",
+            tmp_path / "output" / "clip.mp4",
+            tmp_path / "output" / "clip.ass",
+            proposal,
+            ProjectConfig(options={"face_tracking": False}),
+            [],
+            "ffmpeg",
+            lambda _percent: None,
+        )
+
+    assert process.killed
+    assert process.wait_calls >= 1

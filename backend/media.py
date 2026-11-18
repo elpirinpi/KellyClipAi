@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import textwrap
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +37,7 @@ _CENSORED_WORDS = {
     "shit",
     "verga",
 }
+_FFMPEG_RENDER_TIMEOUT_SECONDS = 600
 
 
 class MediaProcessingError(RuntimeError):
@@ -723,6 +725,9 @@ def _render_clip(
         "-y",
         str(output_path.resolve()),
     ])
+    process: subprocess.Popen[str] | None = None
+    timer: threading.Timer | None = None
+    timed_out = threading.Event()
     try:
         process = subprocess.Popen(
             arguments,
@@ -733,9 +738,20 @@ def _render_clip(
             errors="replace",
             cwd=subtitle_path.resolve().parent,
         )
-        last_lines: list[str] = []
         if process.stdout is None:
             raise MediaProcessingError("No se pudo leer el progreso de FFmpeg.")
+
+        def terminate_on_timeout() -> None:
+            if process is not None and process.poll() is None:
+                timed_out.set()
+                process.kill()
+
+        timer = threading.Timer(
+            _FFMPEG_RENDER_TIMEOUT_SECONDS, terminate_on_timeout
+        )
+        timer.daemon = True
+        timer.start()
+        last_lines: list[str] = []
         for line in process.stdout:
             stripped = line.strip()
             if stripped:
@@ -747,9 +763,22 @@ def _render_clip(
                     on_progress(min(100.0, max(0.0, processed_seconds / render_duration * 100)))
                 except ValueError:
                     continue
-        return_code = process.wait(timeout=600)
+        return_code = process.wait()
+        if timed_out.is_set():
+            raise MediaProcessingError(
+                "FFmpeg superó el tiempo máximo de renderizado de 600 segundos."
+            )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise MediaProcessingError(f"FFmpeg no pudo exportar el clip: {error}") from error
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
     if return_code:
         raise MediaProcessingError(f"FFmpeg no pudo exportar el clip: {' '.join(last_lines[-6:])}")
     clip_transcript = words
