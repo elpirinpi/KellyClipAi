@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +29,9 @@ _BASE_URLS = {
 
 class LLMConfigurationError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,49 @@ def _extract_json(content: str) -> Any:
     return json.loads(text[start : end + 1])
 
 
+def _post_with_retry(
+    client: httpx.Client,
+    provider: str,
+    url: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    for attempt in range(3):
+        try:
+            response = client.post(url, **kwargs)
+        except httpx.RequestError as error:
+            logger.exception("No se pudo contactar al proveedor LLM %s", provider)
+            raise LLMConfigurationError(
+                "No se pudo conectar con el proveedor de IA. Revisa la conexión y la URL configurada."
+            ) from error
+        if (
+            response.status_code == 429 or response.status_code >= 500
+        ) and attempt < 2:
+            time.sleep(0.5 * (2**attempt))
+            continue
+        if response.status_code == 401:
+            raise LLMConfigurationError(
+                f"La clave API de {provider} no es válida. Revisa las credenciales guardadas."
+            )
+        if response.status_code == 402:
+            raise LLMConfigurationError(
+                f"{provider} necesita que revises el crédito o la facturación de la cuenta."
+            )
+        if response.status_code == 429:
+            raise LLMConfigurationError(
+                f"{provider} alcanzó el límite de solicitudes. Espera un momento o revisa tu plan."
+            )
+        if response.status_code >= 500:
+            raise LLMConfigurationError(
+                f"{provider} no está disponible temporalmente (HTTP {response.status_code}). Inténtalo más tarde."
+            )
+        if response.is_error:
+            raise LLMConfigurationError(
+                f"{provider} rechazó la solicitud (HTTP {response.status_code})."
+            )
+        return response
+    raise AssertionError("El ciclo de reintento del proveedor LLM terminó inesperadamente.")
+
+
 def propose_clips(
     transcript: list[TranscriptSegment],
     project: ProjectConfig,
@@ -146,7 +194,9 @@ def propose_clips(
     timeout = httpx.Timeout(150, connect=15)
     with httpx.Client(timeout=timeout) as client:
         if llm.provider == "Anthropic":
-            response = client.post(
+            response = _post_with_retry(
+                client,
+                llm.provider,
                 f"{llm.base_url}/v1/messages",
                 headers={
                     "x-api-key": llm.api_key,
@@ -160,14 +210,15 @@ def propose_clips(
                     "messages": [{"role": "user", "content": user}],
                 },
             )
-            response.raise_for_status()
             blocks = response.json().get("content", [])
             content = "\n".join(
                 block.get("text", "") for block in blocks if block.get("type") == "text"
             )
         else:
             headers = {"Authorization": f"Bearer {llm.api_key}"}
-            response = client.post(
+            response = _post_with_retry(
+                client,
+                llm.provider,
                 f"{llm.base_url}/chat/completions",
                 headers=headers,
                 json={
@@ -184,7 +235,6 @@ def propose_clips(
                     ],
                 },
             )
-            response.raise_for_status()
             choices = response.json().get("choices", [])
             if not choices:
                 raise ValueError("El proveedor LLM devolvió una respuesta vacía.")

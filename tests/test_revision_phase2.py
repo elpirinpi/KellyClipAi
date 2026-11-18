@@ -5,10 +5,14 @@ import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 
 from backend import database
+from backend import llm as llm_module
+from backend.llm import LLMConfigurationError, ResolvedLLM
 from backend.process_queue import ProjectProcessingQueue
+from backend.schemas import ProjectConfig
 
 
 @pytest.mark.skipif(os.name != "nt", reason="DPAPI solo está disponible en Windows")
@@ -125,3 +129,78 @@ def test_project_queue_enforces_configured_concurrency(
         await queue.stop()
 
     asyncio.run(verify())
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message", "expected_attempts"),
+    [
+        (401, "La clave API", 1),
+        (402, "crédito o la facturación", 1),
+        (429, "límite de solicitudes", 3),
+    ],
+)
+def test_llm_provider_errors_are_translated_without_raw_body(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    message: str,
+    expected_attempts: int,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(status_code, text="private provider error body")
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(llm_module.httpx, "Client", lambda **_kwargs: client)
+    monkeypatch.setattr("time.sleep", delays.append)
+
+    with pytest.raises(LLMConfigurationError, match=message) as error:
+        llm_module.propose_clips(
+            [],
+            ProjectConfig(),
+            60,
+            ResolvedLLM("OpenAI", "test-token", "test-model", "https://llm.example"),
+        )
+
+    assert "private provider error body" not in str(error.value)
+    assert attempts == expected_attempts
+    assert delays == ([0.5, 1.0] if status_code == 429 else [])
+
+
+def test_llm_retries_server_errors_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(503, text="private provider error body")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"clips": []}'}}
+                ]
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(llm_module.httpx, "Client", lambda **_kwargs: client)
+    monkeypatch.setattr("time.sleep", delays.append)
+
+    proposals = llm_module.propose_clips(
+        [],
+        ProjectConfig(),
+        60,
+        ResolvedLLM("OpenAI", "test-token", "test-model", "https://llm.example"),
+    )
+
+    assert proposals == []
+    assert attempts == 3
+    assert delays == [0.5, 1.0]
