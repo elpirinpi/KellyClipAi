@@ -70,6 +70,7 @@ from .integrations import (
 from .llm import LLMConfigurationError, resolve_llm
 from .media import MediaProcessingError
 from .pipeline import process_project
+from .process_queue import ProjectProcessingQueue
 from .scheduler import schedule_worker
 from .schemas import (
     ClipArchiveRequest,
@@ -334,16 +335,25 @@ def create_app(
         )
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
+    async def lifespan(application: FastAPI):
         app_settings.data_dir.mkdir(parents=True, exist_ok=True)
         database.initialize(app_settings.database_path)
         database.fail_interrupted_projects(app_settings.database_path)
         database.fail_interrupted_staged_media(app_settings.database_path)
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
+        processing_queue = ProjectProcessingQueue(
+            app_settings.processing_concurrency,
+            lambda project_id, llm_config: asyncio.to_thread(
+                process_project, project_id, llm_config, app_settings
+            ),
+        )
+        await processing_queue.start()
+        application.state.processing_queue = processing_queue
         scheduler_task = asyncio.create_task(schedule_worker(app_settings))
         try:
             yield
         finally:
+            await processing_queue.stop()
             scheduler_task.cancel()
             try:
                 await scheduler_task
@@ -1174,10 +1184,9 @@ def create_app(
         return FileResponse(thumbnail, media_type="image/jpeg")
 
     @application.post("/api/projects/{project_id}/process", status_code=202)
-    def process(
+    async def process(
         project_id: str,
         request: ProcessRequest,
-        background_tasks: BackgroundTasks,
     ) -> dict[str, str]:
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
@@ -1258,7 +1267,28 @@ def create_app(
             project["config"],
         ):
             raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
-        background_tasks.add_task(process_project, project_id, llm_config, app_settings)
+        processing_queue: ProjectProcessingQueue | None = getattr(
+            application.state, "processing_queue", None
+        )
+        if processing_queue is None:
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Reinicia la aplicación.",
+            )
+        try:
+            await processing_queue.submit(project_id, llm_config)
+        except RuntimeError as error:
+            database.update_project(
+                app_settings.database_path,
+                project_id,
+                status="failed",
+                step="failed",
+                error="La cola de procesamiento se cerró antes de aceptar el trabajo.",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Inténtalo de nuevo.",
+            ) from error
         return {"project_id": project_id, "status": "queued"}
 
     @application.get("/api/projects/{project_id}/events")

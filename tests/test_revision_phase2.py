@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from backend import database
+from backend.process_queue import ProjectProcessingQueue
 
 
 @pytest.mark.skipif(os.name != "nt", reason="DPAPI solo está disponible en Windows")
@@ -86,3 +88,40 @@ def test_oauth_tokens_are_encrypted_and_legacy_tokens_migrate(tmp_path: Path) ->
 
     database.initialize(database_path)
     assert database.get_connected_account(database_path, "instagram", "test-owner") == account
+
+
+@pytest.mark.parametrize(("max_concurrency", "expected_parallel"), [(1, 1), (2, 2)])
+def test_project_queue_enforces_configured_concurrency(
+    max_concurrency: int,
+    expected_parallel: int,
+) -> None:
+    async def verify() -> None:
+        active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+        parallel_started = asyncio.Event()
+        release_workers = asyncio.Event()
+
+        async def process_project(_project_id: str, _llm_config: object) -> None:
+            nonlocal active, max_active
+            async with lock:
+                active += 1
+                max_active = max(max_active, active)
+                if active == expected_parallel:
+                    parallel_started.set()
+            await release_workers.wait()
+            async with lock:
+                active -= 1
+
+        queue = ProjectProcessingQueue(max_concurrency, process_project)
+        await queue.start()
+        for project_id in ("project-1", "project-2"):
+            await queue.submit(project_id, None)
+
+        await asyncio.wait_for(parallel_started.wait(), timeout=1)
+        assert max_active == expected_parallel
+        release_workers.set()
+        await queue.join()
+        await queue.stop()
+
+    asyncio.run(verify())
