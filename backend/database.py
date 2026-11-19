@@ -17,7 +17,7 @@ from .credential_store import (
 )
 
 _lock = threading.RLock()
-_LATEST_SCHEMA_VERSION = 1
+_LATEST_SCHEMA_VERSION = 2
 _JSON_COLUMNS = {"config", "metadata", "transcript", "clips"}
 _PROJECT_COLUMNS = {
     "title",
@@ -185,7 +185,7 @@ def initialize(database_path: Path) -> None:
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    migrations = {1: _migrate_schema_v1}
+    migrations = {1: _migrate_schema_v1, 2: _migrate_schema_v2}
     for next_version in range(version + 1, _LATEST_SCHEMA_VERSION + 1):
         conn.execute("BEGIN IMMEDIATE")
         migrations[next_version](conn)
@@ -268,6 +268,22 @@ def _migrate_schema_v1(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
         "ON staged_media(owner_id, source_type, created_at DESC)"
+    )
+
+
+def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE llm_credentials
+        SET model = ?, updated_at = ?
+        WHERE provider = ? AND model = ?
+        """,
+        (
+            "openai/gpt-oss-120b",
+            utc_now(),
+            "Groq",
+            "llama-3.3-70b-versatile",
+        ),
     )
 
 

@@ -13,7 +13,7 @@ from .schemas import LLMConfig, ProjectConfig, TranscriptSegment
 from .settings import AppSettings
 
 _DEFAULT_MODELS = {
-    "Groq": "llama-3.3-70b-versatile",
+    "Groq": "openai/gpt-oss-120b",
     "OpenAI": "gpt-4o-mini",
     "Anthropic": "claude-3-7-sonnet-latest",
     "OpenRouter": "openai/gpt-4o-mini",
@@ -32,6 +32,8 @@ class LLMConfigurationError(RuntimeError):
 
 
 logger = logging.getLogger(__name__)
+_GROQ_KEY_PATTERN = re.compile(r"\bgsk_[A-Za-z0-9_-]+\b", re.IGNORECASE)
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+\S+")
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,33 @@ class ResolvedLLM:
     api_key: str
     model: str
     base_url: str
+
+
+def _groq_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return ""
+
+    error = payload["error"]
+    details: list[str] = []
+    code = error.get("code")
+    if isinstance(code, (str, int)) and not isinstance(code, bool):
+        safe_code = re.sub(r"[\x00-\x1f\x7f]+", " ", str(code)).strip()
+        safe_code = _GROQ_KEY_PATTERN.sub("gsk_[redacted]", safe_code)
+        safe_code = _BEARER_PATTERN.sub("Bearer [redacted]", safe_code)
+        if safe_code:
+            details.append(safe_code[:80])
+    message = error.get("message")
+    if isinstance(message, str):
+        safe_message = re.sub(r"[\x00-\x1f\x7f]+", " ", message).strip()
+        safe_message = _GROQ_KEY_PATTERN.sub("gsk_[redacted]", safe_message)
+        safe_message = _BEARER_PATTERN.sub("Bearer [redacted]", safe_message)
+        if safe_message:
+            details.append(safe_message[:240])
+    return " — ".join(details)[:320]
 
 
 def resolve_llm(request: LLMConfig | None, settings: AppSettings) -> ResolvedLLM:
@@ -170,8 +199,11 @@ def _post_with_retry(
                 f"{provider} no está disponible temporalmente (HTTP {response.status_code}). Inténtalo más tarde."
             )
         if response.is_error:
+            detail = _groq_error_detail(response) if provider == "Groq" else ""
+            detail_suffix = f" Detalle: {detail}" if detail else ""
             raise LLMConfigurationError(
                 f"{provider} rechazó la solicitud (HTTP {response.status_code})."
+                f"{detail_suffix}"
             )
         return response
     raise AssertionError("El ciclo de reintento del proveedor LLM terminó inesperadamente.")
@@ -216,24 +248,29 @@ def propose_clips(
             )
         else:
             headers = {"Authorization": f"Bearer {llm.api_key}"}
+            request_payload: dict[str, Any] = {
+                "model": llm.model,
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": user
+                        + '\nResponde con {"clips":[...]} o con un array JSON si tu API solo permite arrays.',
+                    },
+                ],
+            }
+            if llm.provider == "Groq" and llm.model.casefold().startswith(
+                "openai/gpt-oss-"
+            ):
+                request_payload["reasoning_format"] = "hidden"
             response = _post_with_retry(
                 client,
                 llm.provider,
                 f"{llm.base_url}/chat/completions",
                 headers=headers,
-                json={
-                    "model": llm.model,
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {
-                            "role": "user",
-                            "content": user
-                            + '\nResponde con {"clips":[...]} o con un array JSON si tu API solo permite arrays.',
-                        },
-                    ],
-                },
+                json=request_payload,
             )
             choices = response.json().get("choices", [])
             if not choices:

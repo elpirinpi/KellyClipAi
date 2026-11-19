@@ -90,7 +90,7 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.6.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.0.7.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador requiere internet para instalar
 WebView2 si hace falta; el modelo Whisper seleccionado se descarga la primera

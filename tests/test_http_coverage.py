@@ -523,6 +523,37 @@ def test_anthropic_clip_proposal_uses_messages_api_with_mock_transport(
     assert json.loads(requests[0].content)["model"] == "claude-test"
 
 
+def test_groq_gpt_oss_json_request_hides_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"clips": []}'}}]},
+        )
+
+    _install_transport(monkeypatch, llm, handle)
+    proposals = llm.propose_clips(
+        [],
+        ProjectConfig(),
+        60,
+        ResolvedLLM(
+            "Groq",
+            "test-key",
+            "openai/gpt-oss-120b",
+            "https://api.groq.com/openai/v1",
+        ),
+    )
+
+    assert proposals == []
+    request_payload = json.loads(requests[0].content)
+    assert request_payload["response_format"] == {"type": "json_object"}
+    assert request_payload["reasoning_format"] == "hidden"
+
+
 @pytest.mark.parametrize(
     ("clips", "expected_clip_count"),
     [

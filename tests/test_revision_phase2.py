@@ -182,6 +182,46 @@ def test_llm_provider_errors_are_translated_without_raw_body(
     assert delays == ([0.5, 1.0] if status_code == 429 else [])
 
 
+def test_groq_http_errors_include_safe_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "code": "model_decommissioned",
+                        "message": (
+                            "Model was retired. gsk_test_secret "
+                            "Bearer another-test-secret"
+                        ),
+                    }
+                },
+            )
+        )
+    )
+    monkeypatch.setattr(llm_module.httpx, "Client", lambda **_kwargs: client)
+
+    with pytest.raises(LLMConfigurationError) as error:
+        llm_module.propose_clips(
+            [],
+            ProjectConfig(),
+            60,
+            ResolvedLLM(
+                "Groq",
+                "test-key",
+                "llama-3.3-70b-versatile",
+                "https://api.groq.com/openai/v1",
+            ),
+        )
+
+    assert "model_decommissioned" in str(error.value)
+    assert "Model was retired" in str(error.value)
+    assert "gsk_test_secret" not in str(error.value)
+    assert "another-test-secret" not in str(error.value)
+
+
 def test_llm_retries_server_errors_with_exponential_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

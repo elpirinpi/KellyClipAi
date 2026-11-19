@@ -852,6 +852,20 @@ def test_environment_key_is_not_reused_with_another_provider() -> None:
         resolve_llm(LLMConfig(provider="Anthropic"), settings)
 
 
+def test_groq_defaults_to_a_supported_model() -> None:
+    settings = AppSettings(
+        data_dir=Path("data"),
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="test-key",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+
+    assert resolve_llm(None, settings).model == "openai/gpt-oss-120b"
+
+
 def test_health_endpoint_uses_real_app(tmp_path: Path) -> None:
     settings = AppSettings(
         data_dir=tmp_path / "data",

@@ -15,7 +15,44 @@ def test_initialize_tracks_schema_with_user_version(tmp_path: Path) -> None:
     with database.connection(database_path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == 1
+    assert version == 2
+
+
+def test_v2_migrates_only_the_retired_groq_model(tmp_path: Path) -> None:
+    database_path = tmp_path / "data" / "app.sqlite3"
+    database.initialize(database_path)
+    database.save_llm_credentials(
+        database_path,
+        "groq-owner",
+        "Groq",
+        b"encrypted-groq-key",
+        "llama-3.3-70b-versatile",
+        "https://custom.groq.example/v1",
+    )
+    database.save_llm_credentials(
+        database_path,
+        "other-owner",
+        "OpenAI",
+        b"encrypted-other-key",
+        "llama-3.3-70b-versatile",
+        "",
+    )
+
+    with database.connection(database_path) as connection:
+        connection.execute("PRAGMA user_version = 1")
+
+    database.initialize(database_path)
+
+    migrated = database.get_llm_credentials(database_path, "groq-owner")
+    unchanged = database.get_llm_credentials(database_path, "other-owner")
+    assert migrated is not None
+    assert migrated["model"] == "openai/gpt-oss-120b"
+    assert migrated["encrypted_api_key"] == b"encrypted-groq-key"
+    assert migrated["base_url"] == "https://custom.groq.example/v1"
+    assert unchanged is not None
+    assert unchanged["provider"] == "OpenAI"
+    assert unchanged["model"] == "llama-3.3-70b-versatile"
+    assert unchanged["encrypted_api_key"] == b"encrypted-other-key"
 
 
 def test_initialize_rejects_a_database_from_a_newer_schema(
