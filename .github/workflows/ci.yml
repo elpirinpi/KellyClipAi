@@ -79,6 +79,13 @@ jobs:
             $generated = (($lines[$start..($lines.Count - 1)] | Where-Object { $_ -ne 'Dry-run, so nothing updated.' }) -join "`n").TrimEnd()
             $committed = ((Get-Content $pair.Lock -Raw) -replace "`r`n", "`n").TrimEnd()
             if ($generated -ne $committed) {
+              # Print the exact diff so the mismatch can be fixed precisely
+              # (a bare "out of date" gives no clue which lines differ).
+              $genFile = Join-Path $env:RUNNER_TEMP "generated-$($pair.Lock)"
+              $comFile = Join-Path $env:RUNNER_TEMP "committed-$($pair.Lock)"
+              [System.IO.File]::WriteAllText($genFile, $generated)
+              [System.IO.File]::WriteAllText($comFile, $committed)
+              git diff --no-index -- $comFile $genFile
               throw "Lock file $($pair.Lock) is out of date with $($pair.Input). Regenerate it with: pip-compile --generate-hashes --allow-unsafe --output-file=$($pair.Lock) $($pair.Input)"
             }
           }
