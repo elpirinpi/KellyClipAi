@@ -1233,6 +1233,7 @@ numpy==2.5.5 \
     --hash=sha256:fd47c92e0d1e53f9498b1a30305072434fbae6b5a305cbcab514f959e9ce0fab \
     --hash=sha256:ff5c1ab54a637c0adcdbb69ad10e5c4f1c4dedba69c0d1de383249b70c36908f
     # via
+    #   -r requirements.txt
     #   contourpy
     #   ctranslate2
     #   matplotlib
@@ -1264,7 +1265,9 @@ onnxruntime==1.32.0 \
     --hash=sha256:d7e0c45cc5f456ad7805e6dd256a7662736cda9c2fd17becae194eb3c2f6df72 \
     --hash=sha256:e36c187006e7a7c8b8d6d57f1a209dd63f52430dca6c282b177718ad6b841054 \
     --hash=sha256:efe7456952c243a05a53d5b8732953625144642c2f3989094277f6217f0c0c40
-    # via faster-whisper
+    # via
+    #   -r requirements.txt
+    #   faster-whisper
 opencv-contrib-python==4.11.0.86 \
     --hash=sha256:194841c664ceaa0692410b4ed0af557425608e33db3a181ded28b87acb66748d \
     --hash=sha256:4ff773dab44911da366b906621c9592d4eb96f6ad3777098933a23f064aab38e \

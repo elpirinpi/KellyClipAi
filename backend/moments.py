@@ -1,0 +1,1161 @@
+"""Motor de detección de momentos por señales (Tier 0, Fase A, v1.1.0).
+
+Selecciona los mejores momentos de un video midiendo señales — energía de
+audio, densidad y ritmo de habla, ganchos de texto — en vez de pedirle a
+un LLM que lea la transcripción. Es el motor POR DEFECTO de la app: no
+necesita internet, clave API ni descargas (0 MB adicionales, solo numpy +
+ffmpeg, que la app ya tiene). Sin PyTorch jamás.
+
+Diseño (patrón del proyecto Chopify, MIT):
+- Unidad base: la frase (de faster-whisper con word-timestamps). Cada
+  frase es un posible inicio; el final es el final natural de una frase
+  posterior dentro del rango de duración pedido. Los clips nunca cortan
+  una idea a la mitad.
+- Puntuación ABSOLUTA 0–10 + umbral (por defecto 8.0, ajustable en
+  Ajustes): un video aburrido da pocos clips o ninguno — "cero clips"
+  es un resultado válido, mejor que inventar clips malos.
+- Diversidad temporal (MMR) + deduplicación semántica por TF-IDF
+  implementado a mano (sin sklearn): los clips se reparten por el video
+  y no repiten la misma idea.
+- Explicabilidad: cada clip guarda qué canales lo eligieron
+  (``signal_breakdown``) para el "por qué este clip" de la UI.
+
+Canales y pesos iniciales (informe INVESTIGACION_MOTOR_LOCAL_KELLYCLIPAI.md;
+la calibración con videos reales es la Fase E):
+- energía de audio 1.0, densidad/ritmo de habla 1.0, ganchos de texto 1.5,
+  gancho inicial 1.0, completitud como multiplicador.
+- El canal de eventos de audio (risa, aplauso, ovación, grito; peso
+  1.5) lo aporta la Fase B (Tier 1, YAMNet ONNX): ``backend.audio_events``
+  produce el ``event_timeline`` y este scorer lo incluye en la media
+  ponderada solo cuando está presente. Escenas/movimiento/rostros son
+  Fase C.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import re
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import httpx
+import numpy as np
+
+from .llm import (
+    ResolvedLLM,
+    _extract_json,
+    _request_clip_content,
+)
+from .schemas import ClipProposal, ProjectConfig, TranscriptSegment, Word
+
+logger = logging.getLogger(__name__)
+
+# --- Pesos de los canales (ver docstring del módulo) ------------------------
+_WEIGHT_AUDIO = 1.0
+_WEIGHT_SPEECH = 1.0
+_WEIGHT_TEXT = 1.5
+_WEIGHT_OPENING = 1.0
+_WEIGHT_EVENTS = 1.5  # Solo cuando la Fase B aporta event_timeline.
+
+# Separación MMR por defecto: los clips elegidos tienden a estar al menos
+# a esta distancia entre sí (proporcional a la duración, con topes).
+_MMR_MIN_SECONDS = 45.0
+_MMR_MAX_SECONDS = 90.0
+_MMR_DURATION_DIVISOR = 15.0
+# Similitud coseno TF-IDF por encima de la cual dos clips "dicen lo mismo".
+_TFIDF_DUPLICATE_SIMILARITY = 0.55
+# Rango de duración preferido cuando el proyecto pide "Cualquiera" (igual
+# que la instrucción del prompt LLM: prefiere 15–45 s, evita < 12 s).
+_DEFAULT_MIN_CLIP_SECONDS = 15.0
+_DEFAULT_MAX_CLIP_SECONDS = 45.0
+# Rangos de duración por elección del proyecto (espejo de
+# pipeline._duration_bounds; "Cualquiera" usa el rango preferido 15–45 s
+# en vez de (3, ∞) para no generar clips de 3 s ni de 10 minutos).
+_DURATION_BOUNDS: dict[str, tuple[float, float]] = {
+    "Cualquiera": (_DEFAULT_MIN_CLIP_SECONDS, _DEFAULT_MAX_CLIP_SECONDS),
+    "<30s": (3.0, 29.9),
+    "30–60s": (30.0, 60.0),
+    "60–90s": (60.0, 90.0),
+    "90s–3min": (90.0, 180.0),
+}
+_MAX_CANDIDATES = 60_000  # Guarda: videos larguísimos con frases densas.
+_MAX_TITLE_CHARS = 60
+_MAX_DESCRIPTION_CHARS = 300
+
+# Palabras-gancho en español (lista curada): absolutos, exclusividad,
+# urgencia, curiosidad y llamadas de atención. Solo afectan a la
+# puntuación del canal de texto; nunca se inventan en títulos.
+_HOOK_WORDS = frozenset(
+    {
+        "increíble",
+        "impresionante",
+        "brutal",
+        "épico",
+        "locura",
+        "alucinante",
+        "secreto",
+        "gratis",
+        "nunca",
+        "siempre",
+        "nadie",
+        "todos",
+        "primero",
+        "último",
+        "único",
+        "única",
+        "mejor",
+        "peor",
+        "verdad",
+        "mentira",
+        "truco",
+        "fácil",
+        "rápido",
+        "urgente",
+        "ahora",
+        "mira",
+        "imagina",
+        "escucha",
+        "atención",
+        "cuidado",
+        "ojo",
+        "wow",
+        "importante",
+        "clave",
+        "error",
+        "peligro",
+        "regalo",
+        "sorpresa",
+        "exclusivo",
+        "prohibido",
+        "oculto",
+        "finalmente",
+    }
+)
+# Ordinales de lista ("primero..., segundo..., tercero...").
+_LIST_WORDS = frozenset({"primero", "segundo", "tercero", "cuarto", "quinto", "sexto"})
+_QUESTION_STARTERS = frozenset(
+    {"qué", "cómo", "por", "cuándo", "dónde", "quién", "cuál", "cuánto", "cuánta"}
+)
+# Stopwords en español para TF-IDF y palabras clave (lista corta y
+# conservadora: solo palabras funcionales, nunca contenido).
+_STOPWORDS = frozenset(
+    {
+        "de",
+        "la",
+        "el",
+        "en",
+        "y",
+        "a",
+        "los",
+        "las",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "que",
+        "es",
+        "se",
+        "su",
+        "sus",
+        "con",
+        "por",
+        "para",
+        "del",
+        "al",
+        "lo",
+        "como",
+        "más",
+        "pero",
+        "este",
+        "esta",
+        "esto",
+        "eso",
+        "ese",
+        "esa",
+        "son",
+        "fue",
+        "han",
+        "o",
+        "si",
+        "no",
+        "sí",
+        "ya",
+        "muy",
+        "mi",
+        "mis",
+        "tu",
+        "tus",
+        "te",
+        "me",
+        "le",
+        "les",
+        "nos",
+        "os",
+        "yo",
+        "tú",
+        "él",
+        "ella",
+        "nosotros",
+        "ustedes",
+        "ellos",
+        "ellas",
+        "aquí",
+        "ahí",
+        "allí",
+        "cuando",
+        "donde",
+        "porque",
+        "pues",
+        "entonces",
+        "también",
+        "tampoco",
+        "bien",
+        "mal",
+        "hay",
+        "está",
+        "están",
+        "estoy",
+        "ser",
+        "estar",
+        "tener",
+        "haber",
+        "hacer",
+        "decir",
+        "ir",
+        "ver",
+        "dar",
+        "saber",
+        "querer",
+        "poder",
+        "deber",
+    }
+)
+_WORD_PATTERN = re.compile(r"[^\W\d_]+|\d+(?:[.,]\d+)?", re.UNICODE)
+_NUMBER_PATTERN = re.compile(r"\d")
+_SENTENCE_END = (".", "!", "?", "…", "。", "！", "？")
+# ffmpeg: PCM 16 kHz mono para el timeline de audio 1 Hz. Se lee por
+# bloques (streaming) para no cargar en RAM el audio de un video de horas.
+_AUDIO_SAMPLE_RATE = 16000
+_AUDIO_CHUNK_SECONDS = 5
+
+
+@dataclass(frozen=True)
+class Phrase:
+    """Una frase de la transcripción, con tiempos por palabra."""
+
+    start: float
+    end: float
+    text: str
+    words: tuple[Word, ...] = ()
+
+    @property
+    def word_count(self) -> int:
+        return len(self.words) if self.words else len(self.text.split())
+
+    @property
+    def is_question(self) -> bool:
+        return "?" in self.text
+
+    @property
+    def has_exclamation(self) -> bool:
+        return "!" in self.text
+
+
+def _ends_sentence(text: str) -> bool:
+    return text.rstrip("\"'”’)]}").endswith(_SENTENCE_END)
+
+
+def build_phrases(transcript: list[TranscriptSegment]) -> list[Phrase]:
+    """Agrupa las palabras de la transcripción en frases.
+
+    Una frase se cierra cuando una palabra termina en signo de puntuación
+    de fin de oración, o al terminar el segmento. Los segmentos sin
+    palabras se usan tal cual como frase (defensivo: el pipeline ya exige
+    tiempos por palabra, pero la caché de transcripción podría no traerlos).
+    """
+    phrases: list[Phrase] = []
+    current: list[Word] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        text = " ".join(word.text.strip() for word in current).strip()
+        if text:
+            phrases.append(
+                Phrase(
+                    start=current[0].start,
+                    end=current[-1].end,
+                    text=text,
+                    words=tuple(current),
+                )
+            )
+        current.clear()
+
+    for segment in sorted(transcript, key=lambda item: item.start):
+        if not segment.words:
+            flush()
+            text = segment.text.strip()
+            if text:
+                phrases.append(Phrase(start=segment.start, end=segment.end, text=text))
+            continue
+        for word in sorted(segment.words, key=lambda item: item.start):
+            if not word.text.strip():
+                continue
+            current.append(word)
+            if _ends_sentence(word.text.strip()):
+                flush()
+        flush()
+    flush()
+    return [phrase for phrase in phrases if phrase.end > phrase.start]
+
+
+def extract_audio_timeline(
+    input_path: Path | str,
+    ffmpeg_path: str,
+    duration: float,
+    *,
+    sample_rate: int = _AUDIO_SAMPLE_RATE,
+) -> np.ndarray:
+    """RMS de audio por segundo (timeline 1 Hz) con ffmpeg + numpy.
+
+    Decodifica a PCM s16le mono por stdout y lo lee por bloques de 5 s:
+    la memoria es O(1) aunque el video dure horas. Si ffmpeg falla o el
+    video no tiene audio, devuelve ceros (el motor sigue con el canal de
+    texto) y registra un aviso; nunca lanza.
+    """
+    seconds = max(1, math.ceil(duration))
+    rms = np.zeros(seconds, dtype=np.float64)
+    command = [
+        ffmpeg_path,
+        "-v",
+        "error",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "s16le",
+        "-",
+    ]
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as error:
+        logger.warning("No se pudo extraer el audio para el motor de señales: %s", error)
+        return rms
+    assert process.stdout is not None
+    chunk_bytes = sample_rate * 2 * _AUDIO_CHUNK_SECONDS
+    leftover = np.empty(0, dtype=np.float32)
+    second = 0
+    saw_samples = False
+    try:
+        while second < seconds:
+            data = process.stdout.read(chunk_bytes)
+            if not data:
+                break
+            saw_samples = True
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+            samples /= 32768.0
+            if leftover.size:
+                samples = np.concatenate([leftover, samples])
+            complete = samples.size // sample_rate
+            if complete:
+                usable = min(complete, seconds - second)
+                block = samples[: usable * sample_rate].reshape(usable, sample_rate)
+                rms[second : second + usable] = np.sqrt(np.mean(block * block, axis=1))
+                second += usable
+                samples = samples[usable * sample_rate :]
+                # Si el audio supera la duración probada, se ignora el resto.
+                if second >= seconds:
+                    break
+                # Segundos completos restantes en el bloque (más allá de
+                # `usable` no puede haber: usable == complete aquí).
+                leftover = samples
+            else:
+                leftover = samples
+        if second < seconds and leftover.size:
+            rms[second] = float(np.sqrt(np.mean(leftover * leftover)))
+    except (OSError, ValueError) as error:
+        logger.warning("La extracción de audio para señales falló a medias: %s", error)
+    finally:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            _, stderr = process.communicate(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            stderr = b""
+    if not saw_samples:
+        detail = stderr.decode("utf-8", "replace").strip()[:200]
+        logger.warning(
+            "ffmpeg no devolvió audio para el motor de señales (%s); "
+            "se usa solo el canal de texto.",
+            detail or "sin pista de audio",
+        )
+    return rms
+
+
+def _tokenize(text: str) -> list[str]:
+    return [token.lower() for token in _WORD_PATTERN.findall(text)]
+
+
+def _content_tokens(text: str) -> list[str]:
+    return [token for token in _tokenize(text) if token not in _STOPWORDS and len(token) >= 2]
+
+
+def _phrase_hook_points(phrase: Phrase) -> tuple[float, list[str]]:
+    """Puntos de gancho de una frase + etiquetas legibles (para razon_viral).
+
+    Pregunta 2.0, exclamación 1.0, cada palabra-gancho distinta 1.0 (tope
+    3), números 1.0, ordinales de lista 0.5 (tope 1), inicio interrogativo
+    0.5, palabra en MAYÚSCULAS (énfasis) 0.5.
+    """
+    text = phrase.text
+    points = 0.0
+    labels: list[str] = []
+    if phrase.is_question:
+        points += 2.0
+        labels.append("pregunta")
+    if phrase.has_exclamation:
+        points += 1.0
+        labels.append("exclamación")
+    tokens = set(_tokenize(text))
+    hooks = sorted(token for token in tokens if token in _HOOK_WORDS)
+    if hooks:
+        points += min(3.0, float(len(hooks)))
+        labels.extend(f"gancho:{hook}" for hook in hooks[:2])
+    if _NUMBER_PATTERN.search(text):
+        points += 1.0
+        labels.append("números")
+    list_hits = tokens & _LIST_WORDS
+    if list_hits:
+        points += min(1.0, 0.5 * len(list_hits))
+        labels.append("lista")
+    first = _tokenize(text)[:1]
+    if first and first[0] in _QUESTION_STARTERS and not phrase.is_question:
+        points += 0.5
+        labels.append("pregunta")
+    if any(len(token) >= 4 and token.isupper() for token in _WORD_PATTERN.findall(text)):
+        points += 0.5
+        labels.append("énfasis")
+    return points, labels
+
+
+def _clip01(value: float) -> float:
+    return min(1.0, max(0.0, value))
+
+
+class MomentScorer:
+    """Canales de señal precalculados + puntuación de ventanas.
+
+    Las sumas prefijas hacen que puntuar una ventana sea O(1) (salvo el
+    pico de energía, un máximo numpy sobre ~30–180 valores). ``event_timeline``
+    es el hook de la Fase B: por segundo, 0–1 de eventos de audio (risa,
+    aplauso, grito); ausente en Tier 0, en cuyo caso el canal no participa
+    en la media ponderada.
+    """
+
+    def __init__(
+        self,
+        phrases: list[Phrase],
+        audio_rms: np.ndarray,
+        duration: float,
+        event_timeline: np.ndarray | None = None,
+    ) -> None:
+        self.phrases = phrases
+        self.duration = duration
+        self.audio_rms = audio_rms
+        self.event_timeline = event_timeline
+        # Z-score robusto del RMS por segundo (mediana + MAD): cuánto
+        # destaca cada segundo respecto a la línea base DEL VIDEO.
+        median = float(np.median(audio_rms)) if audio_rms.size else 0.0
+        mad = float(np.median(np.abs(audio_rms - median))) if audio_rms.size else 0.0
+        sigma = 1.4826 * mad
+        if sigma < 1e-6:
+            sigma = float(np.std(audio_rms)) if audio_rms.size else 0.0
+        if sigma < 1e-6:
+            sigma = 1e-6
+        self.audio_z = (audio_rms - median) / sigma
+        self._hot_prefix = np.concatenate(
+            [[0.0], np.cumsum((self.audio_z > 1.0).astype(np.float64))]
+        )
+        # Silencio para recortar bordes: segundos con RMS por debajo del
+        # 25 % de la mediana (con suelo absoluto 0.005).
+        self._silence_threshold = max(0.005, 0.25 * median)
+        # Puntos de gancho y palabras por frase, con sumas prefijas.
+        hook_points = []
+        hook_labels: list[list[str]] = []
+        for phrase in phrases:
+            points, labels = _phrase_hook_points(phrase)
+            hook_points.append(points)
+            hook_labels.append(labels)
+        self._hook_points = hook_points
+        self._hook_labels = hook_labels
+        self._hook_prefix = np.concatenate(
+            [[0.0], np.cumsum(np.asarray(hook_points, dtype=np.float64))]
+        )
+        word_counts = np.asarray([phrase.word_count for phrase in phrases], dtype=np.float64)
+        self._words_prefix = np.concatenate([[0.0], np.cumsum(word_counts)])
+        # Línea base de ritmo: palabras por minuto del video completo.
+        speech_seconds = sum(max(0.1, phrase.end - phrase.start) for phrase in phrases)
+        total_words = float(word_counts.sum()) if word_counts.size else 0.0
+        self._baseline_wpm = total_words / speech_seconds * 60.0 if speech_seconds > 0 else 0.0
+
+    # -- canales -----------------------------------------------------------
+    def _audio_channel(self, start: float, end: float) -> tuple[float, float]:
+        """(puntuación 0–1, pico z). Pico + fracción de segundos calientes."""
+        first = max(0, math.floor(start))
+        last = min(self.audio_z.size, math.ceil(end))
+        if last <= first:
+            return 0.0, 0.0
+        peak_z = float(np.max(self.audio_z[first:last]))
+        peak_component = _clip01((peak_z - 0.5) / 3.0)
+        hot_fraction = float((self._hot_prefix[last] - self._hot_prefix[first]) / (last - first))
+        return 0.6 * peak_component + 0.4 * hot_fraction, peak_z
+
+    def _speech_channel(
+        self, first_idx: int, last_idx: int, start: float, end: float
+    ) -> tuple[float, dict[str, float]]:
+        """Densidad y ritmo de habla 0–1 + detalles para las etiquetas."""
+        if self._baseline_wpm <= 0:
+            return 0.0, {}
+        words = float(self._words_prefix[last_idx + 1] - self._words_prefix[first_idx])
+        span = max(0.1, end - start)
+        wpm = words / span * 60.0
+        ratio = wpm / self._baseline_wpm
+        fast = _clip01((ratio - 1.0) / 0.5)
+        # Habla lenta y pausada también es señal (énfasis), pero más débil.
+        slow = _clip01((0.8 - ratio) / 0.4) * 0.7
+        rhythm = 0.0
+        count = last_idx - first_idx + 1
+        if count >= 4:
+            half = first_idx + count // 2
+            words_first = float(self._words_prefix[half] - self._words_prefix[first_idx])
+            words_second = float(self._words_prefix[last_idx + 1] - self._words_prefix[half])
+            span_first = max(0.1, self.phrases[half - 1].end - self.phrases[first_idx].start)
+            span_second = max(0.1, self.phrases[last_idx].end - self.phrases[half].start)
+            wpm_first = words_first / span_first * 60.0
+            wpm_second = words_second / span_second * 60.0
+            rhythm = _clip01(abs(wpm_first - wpm_second) / self._baseline_wpm / 0.8)
+        score = 0.6 * max(fast, slow) + 0.4 * rhythm
+        return score, {"ratio": ratio, "fast": fast, "slow": slow, "rhythm": rhythm}
+
+    def _text_channel(self, first_idx: int, last_idx: int) -> tuple[float, list[str]]:
+        """Ganchos de texto 0–1 + etiquetas (pregunta→respuesta incluida)."""
+        points = float(self._hook_prefix[last_idx + 1] - self._hook_prefix[first_idx])
+        score = 1.0 - math.exp(-points / 3.0)
+        labels: list[str] = []
+        for idx in range(first_idx, last_idx + 1):
+            labels.extend(self._hook_labels[idx])
+        # Estructura pregunta→respuesta: la ventana empieza con una
+        # pregunta y hay frases después que la responden.
+        if self.phrases[first_idx].is_question and last_idx - first_idx >= 2:
+            score = min(1.0, score + 0.1)
+            labels.append("pregunta-respuesta")
+        return score, labels
+
+    def _opening_channel(self, first_idx: int, last_idx: int, start: float) -> float:
+        """Fuerza de los primeros 3 s (la retención depende del gancho)."""
+        opening_end = start + 3.0
+        points = 0.0
+        for idx in range(first_idx, last_idx + 1):
+            if self.phrases[idx].start >= opening_end:
+                break
+            points += self._hook_points[idx]
+        text_open = 1.0 - math.exp(-points / 2.0)
+        if self.phrases[first_idx].is_question:
+            text_open = max(text_open, 0.85)
+        first = max(0, math.floor(start))
+        last = min(self.audio_z.size, math.ceil(opening_end))
+        if last > first:
+            mean_z = float(np.mean(self.audio_z[first:last]))
+        else:
+            mean_z = 0.0
+        audio_open = _clip01((mean_z - 0.5) / 2.0)
+        # El gancho es fuerte si las palabras enganchan O la energía
+        # sube: basta una de las dos (max, no media).
+        return max(text_open, audio_open)
+
+    def _events_channel(self, start: float, end: float) -> float:
+        """Canal de eventos de audio (Fase B). En Tier 0 no se llama."""
+        timeline = self.event_timeline
+        if timeline is None:
+            return 0.0
+        first = max(0, math.floor(start))
+        last = min(timeline.size, math.ceil(end))
+        if last <= first:
+            return 0.0
+        window = timeline[first:last]
+        peak = float(np.max(window))
+        frac = float(np.mean(window > 0.5))
+        return 0.5 * _clip01((peak - 0.3) / 0.5) + 0.5 * frac
+
+    # -- bordes ------------------------------------------------------------
+    def trim_edges(self, start: float, end: float) -> tuple[float, float, float]:
+        """Recorta silencios en los bordes (máx. 2 s por lado).
+
+        Devuelve (inicio, fin, multiplicador de completitud): 1.0 si el
+        recorte es pequeño, 0.85 si movió un borde más de 1 s (la frontera
+        de frase caía en una pausa).
+        """
+        trimmed = 0.0
+        new_start = start
+        for _ in range(2):
+            second = math.floor(new_start)
+            if (
+                second < 0
+                or second >= self.audio_rms.size
+                or self.audio_rms[second] >= self._silence_threshold
+                or new_start + 1.0 >= end - 3.0
+            ):
+                break
+            new_start = min(end - 3.0, second + 1.0)
+            trimmed += 1.0
+        new_end = end
+        for _ in range(2):
+            second = math.ceil(new_end) - 1
+            if (
+                second < 0
+                or second >= self.audio_rms.size
+                or self.audio_rms[second] >= self._silence_threshold
+                or new_end - 1.0 <= new_start + 3.0
+            ):
+                break
+            new_end = max(new_start + 3.0, float(second))
+            trimmed += 1.0
+        multiplier = 0.85 if trimmed > 1.0 else 1.0
+        return new_start, new_end, multiplier
+
+    # -- puntuación --------------------------------------------------------
+    def score_window(
+        self, first_idx: int, last_idx: int
+    ) -> tuple[float, dict[str, float], list[str]]:
+        """Puntuación absoluta 0–10 de la ventana + desglose + etiquetas."""
+        start = self.phrases[first_idx].start
+        end = self.phrases[last_idx].end
+        audio, peak_z = self._audio_channel(start, end)
+        speech, speech_detail = self._speech_channel(first_idx, last_idx, start, end)
+        text, text_labels = self._text_channel(first_idx, last_idx)
+        opening = self._opening_channel(first_idx, last_idx, start)
+        channels: list[tuple[str, float, float]] = [
+            ("audio", audio, _WEIGHT_AUDIO),
+            ("texto", text, _WEIGHT_TEXT),
+            ("ritmo", speech, _WEIGHT_SPEECH),
+            ("gancho_inicial", opening, _WEIGHT_OPENING),
+        ]
+        if self.event_timeline is not None:
+            events_score = self._events_channel(start, end)
+            channels.append(("eventos", events_score, _WEIGHT_EVENTS))
+        else:
+            events_score = 0.0
+        total_weight = sum(weight for _, _, weight in channels)
+        weighted = sum(value * weight for _, value, weight in channels) / total_weight
+        _, _, completeness = self.trim_edges(start, end)
+        score = min(10.0, max(0.0, weighted * 10.0 * completeness))
+        breakdown = {name: round(value * 10.0, 1) for name, value, _ in channels}
+        breakdown["completitud"] = round(completeness, 2)
+        labels = self._build_labels(
+            text_labels, peak_z, speech_detail, opening, first_idx, events_score
+        )
+        return score, breakdown, labels
+
+    def _build_labels(
+        self,
+        text_labels: list[str],
+        peak_z: float,
+        speech_detail: dict[str, float],
+        opening: float,
+        first_idx: int,
+        events_score: float = 0.0,
+    ) -> list[str]:
+        """Etiquetas legibles para razon_viral, en orden de prioridad."""
+        labels: list[str] = []
+        if self.phrases[first_idx].is_question:
+            labels.append("Empieza con una pregunta")
+        elif "pregunta" in text_labels:
+            labels.append("Pregunta directa")
+        hooks = sorted(
+            {label.split(":", 1)[1] for label in text_labels if label.startswith("gancho:")}
+        )
+        if hooks:
+            quoted = ", ".join(f"«{hook}»" for hook in hooks[:2])
+            labels.append(f"Palabras gancho: {quoted}")
+        if events_score >= 0.5:
+            # Antes que "Pico de energía": una reacción detectada (risa,
+            # aplauso) es más específica que un pico de volumen, y
+            # razon_viral solo muestra las 3 primeras etiquetas.
+            labels.append("Reacción del público (risa o aplauso)")
+        if peak_z >= 2.0:
+            labels.append("Pico de energía")
+        if speech_detail.get("fast", 0.0) >= 0.6:
+            labels.append("Ritmo de habla acelerado")
+        elif speech_detail.get("slow", 0.0) >= 0.5:
+            labels.append("Ritmo pausado con énfasis")
+        if "números" in text_labels:
+            labels.append("Datos y cifras")
+        if opening >= 0.7 and "Empieza con una pregunta" not in labels:
+            labels.append("Gancho inicial fuerte")
+        if "exclamación" in text_labels:
+            labels.append("Exclamación")
+        if speech_detail.get("rhythm", 0.0) >= 0.6:
+            labels.append("Cambio brusco de ritmo")
+        if "lista" in text_labels:
+            labels.append("Estructura de lista")
+        return labels[:4]
+
+
+# --- selección --------------------------------------------------------------
+
+
+@dataclass
+class _ScoredCandidate:
+    score: float
+    first_idx: int
+    last_idx: int
+    start: float
+    end: float
+    breakdown: dict[str, float]
+    labels: list[str]
+    text: str
+
+
+def _candidate_bounds(choice: str, duration: float) -> tuple[float, float] | None:
+    """Rango de duración de los candidatos para la elección del proyecto.
+
+    En videos más cortos que el mínimo preferido, el rango se encoge al
+    video (un video de 10 s con "Cualquiera" da candidatos de 10 s).
+    None si el video es demasiado corto para cualquier clip.
+    """
+    minimum, maximum = _DURATION_BOUNDS.get(
+        choice, (_DEFAULT_MIN_CLIP_SECONDS, _DEFAULT_MAX_CLIP_SECONDS)
+    )
+    maximum = min(maximum, duration)
+    minimum = min(minimum, maximum)
+    if maximum < 3.0:
+        return None
+    return minimum, maximum
+
+
+def _default_separation(duration: float) -> float:
+    """Separación MMR por defecto: proporcional a la duración, con topes."""
+    return min(
+        _MMR_MAX_SECONDS,
+        max(_MMR_MIN_SECONDS, duration / _MMR_DURATION_DIVISOR),
+    )
+
+
+def _tfidf_vectors(texts: list[str], idf_corpus: list[str]) -> list[dict[str, float]]:
+    """Vectores TF-IDF (implementación a mano, sin sklearn).
+
+    TF sobre el texto del candidato; IDF sobre TODAS las frases del video
+    (no solo sobre los candidatos): así las palabras del momento — raras
+    en el video — pesan mucho y la similitud refleja solape de contenido
+    distintivo, no de tema general. Si el IDF se calculase solo sobre los
+    candidatos que superaron el umbral (ventanas solapadas sobre los
+    mismos momentos), las palabras compartidas parecerían comunes y la
+    deduplicación no detectaría repeticiones.
+    """
+    tokenized = [_content_tokens(text) for text in texts]
+    corpus_tokenized = [_content_tokens(text) for text in idf_corpus]
+    doc_count = len(corpus_tokenized)
+    doc_freq: dict[str, int] = {}
+    for tokens in corpus_tokenized:
+        for token in set(tokens):
+            doc_freq[token] = doc_freq.get(token, 0) + 1
+    idf = {token: math.log((doc_count + 1) / (freq + 1)) + 1.0 for token, freq in doc_freq.items()}
+    default_idf = math.log(doc_count + 1) + 1.0
+    vectors: list[dict[str, float]] = []
+    for tokens in tokenized:
+        counts: dict[str, int] = {}
+        for token in tokens:
+            counts[token] = counts.get(token, 0) + 1
+        total = max(1, len(tokens))
+        vector = {
+            token: (count / total) * idf.get(token, default_idf) for token, count in counts.items()
+        }
+        norm = math.sqrt(sum(value * value for value in vector.values()))
+        if norm > 0:
+            vector = {token: value / norm for token, value in vector.items()}
+        vectors.append(vector)
+    return vectors
+
+
+def _cosine_similarity(left: dict[str, float], right: dict[str, float]) -> float:
+    if len(left) > len(right):
+        left, right = right, left
+    return float(sum(value * right.get(token, 0.0) for token, value in left.items()))
+
+
+def _select_diverse(
+    candidates: list[_ScoredCandidate],
+    *,
+    threshold: float,
+    separation_seconds: float,
+    max_clips: int,
+    idf_corpus: list[str],
+) -> list[_ScoredCandidate]:
+    """Elige hasta max_clips por puntuación, con diversidad MMR + TF-IDF.
+
+    - Solapes: un candidato que se solapa con uno elegido se descarta
+      (la validación del pipeline también los rechaza).
+    - MMR: la puntuación efectiva se penaliza según la cercanía al clip
+      elegido más próximo (factor 0.5 si es adyacente, 1.0 a >= X s); si
+      la penalizada cae bajo el umbral, el candidato se descarta. Solo un
+      momento excepcional puede quedar junto a otro elegido.
+    - TF-IDF: si el texto es casi idéntico al de un clip elegido
+      (similitud > 0.55), se queda el de mayor puntuación.
+    """
+    ordered = sorted(
+        (cand for cand in candidates if cand.score >= threshold),
+        key=lambda cand: (-cand.score, cand.start),
+    )
+    if not ordered:
+        return []
+    vectors = _tfidf_vectors([cand.text for cand in ordered], idf_corpus)
+    selected: list[_ScoredCandidate] = []
+    selected_vectors: list[dict[str, float]] = []
+    for index, candidate in enumerate(ordered):
+        if len(selected) >= max_clips:
+            break
+        overlaps = any(
+            candidate.start < chosen.end and chosen.start < candidate.end for chosen in selected
+        )
+        if overlaps:
+            continue
+        if selected:
+            gap = min(
+                max(
+                    candidate.start - chosen.end,
+                    chosen.start - candidate.end,
+                    0.0,
+                )
+                for chosen in selected
+            )
+            factor = 0.5 + 0.5 * min(1.0, gap / separation_seconds)
+            if candidate.score * factor < threshold:
+                continue
+        vector = vectors[index]
+        if any(
+            _cosine_similarity(vector, chosen) > _TFIDF_DUPLICATE_SIMILARITY
+            for chosen in selected_vectors
+        ):
+            continue
+        selected.append(candidate)
+        selected_vectors.append(vector)
+    return sorted(selected, key=lambda cand: cand.start)
+
+
+# --- construcción de ClipProposal --------------------------------------------
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    """Recorta a max_chars en frontera de palabra, con '…' si recorta."""
+    text = " ".join(text.split())
+    if len(text) <= max_chars:
+        return text
+    cut = text[: max_chars - 1].rsplit(" ", 1)[0]
+    return (cut or text[: max_chars - 1]).rstrip(".,;:") + "…"
+
+
+def _build_title(scorer: MomentScorer, first_idx: int, last_idx: int) -> str:
+    """Título por plantilla: la frase más contundente del clip.
+
+    Si el clip empieza con una pregunta, la pregunta es el título.
+    Recortado a ~60 caracteres.
+    """
+    phrases = scorer.phrases
+    if phrases[first_idx].is_question:
+        best = phrases[first_idx]
+    else:
+        best_idx = max(
+            range(first_idx, last_idx + 1),
+            key=lambda idx: scorer._hook_points[idx],
+        )
+        best = phrases[best_idx]
+    title = _trim_text(best.text, _MAX_TITLE_CHARS)
+    # Quitar el punto final (las preguntas/exclamaciones se conservan).
+    if title.endswith("."):
+        title = title[:-1]
+    return title or "Momento destacado"
+
+
+def _build_keywords(text: str) -> list[str]:
+    """Palabras clave: contenido más frecuente del clip (incluye números)."""
+    counts: dict[str, int] = {}
+    order: dict[str, int] = {}
+    for position, token in enumerate(_content_tokens(text)):
+        counts[token] = counts.get(token, 0) + 1
+        order.setdefault(token, position)
+    ranked = sorted(counts, key=lambda token: (-counts[token], order.get(token, 0)))
+    return ranked[:12]
+
+
+def _build_proposal(
+    scorer: MomentScorer,
+    candidate: _ScoredCandidate,
+    theme_tokens: list[str],
+) -> ClipProposal:
+    phrases = scorer.phrases
+    start, end, _ = scorer.trim_edges(candidate.start, candidate.end)
+    if end - start < 3.0:
+        # El recorte de silencios no debe dejar un clip inválido.
+        start, end = candidate.start, candidate.end
+    title = _build_title(scorer, candidate.first_idx, candidate.last_idx)
+    description = _trim_text(
+        " ".join(phrase.text for phrase in phrases[candidate.first_idx : candidate.last_idx + 1])[
+            : _MAX_DESCRIPTION_CHARS * 2
+        ],
+        _MAX_DESCRIPTION_CHARS,
+    )
+    keywords = _build_keywords(candidate.text)
+    # Hashtags: lo más frecuente del clip + genéricos del tema del video.
+    hashtag_words = keywords[:6]
+    hashtag_words.extend(token for token in theme_tokens if token not in hashtag_words)
+    hashtags = ["#" + keyword for keyword in hashtag_words[:8]]
+    hashtag_map = (
+        {"youtube": hashtags, "tiktok": hashtags, "instagram": hashtags} if hashtags else {}
+    )
+    reason_parts = [f"Puntuación {candidate.score:.1f}/10"] + candidate.labels[:3]
+    return ClipProposal(
+        inicio=round(start, 3),
+        fin=round(end, 3),
+        titulo=title[:160],
+        puntuacion=round(candidate.score, 2),
+        razon_viral=" · ".join(reason_parts)[:1400],
+        descripcion=description,
+        hashtags=hashtag_map,
+        palabras_clave=keywords,
+        emojis=[],
+        signal_breakdown={key: float(value) for key, value in candidate.breakdown.items()},
+    )
+
+
+def detect_moments(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    *,
+    input_path: Path | str | None = None,
+    ffmpeg_path: str | None = None,
+    audio_timeline: np.ndarray | None = None,
+    event_timeline: np.ndarray | None = None,
+    threshold: float | None = None,
+    min_separation_seconds: float | None = None,
+    max_clips: int = 10,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[ClipProposal]:
+    """Detecta momentos por señales sobre el video COMPLETO (sin ventanas).
+
+    El ventaneado de 5 min era una limitación del LLM por TPM; las
+    señales no la tienen. ``audio_timeline`` es inyectable para los tests;
+    si no se pasa y hay ``input_path`` + ``ffmpeg_path``, se extrae con
+    ffmpeg; sin ninguno, el motor trabaja solo con texto (canal de audio
+    en cero). ``event_timeline`` es el hook del Tier 1 (Fase B): lo
+    produce ``backend.audio_events.get_event_timeline`` y es None cuando
+    Tier 1 no está disponible. Devuelve [] si ningún candidato supera el
+    umbral: "cero clips" es un resultado válido, no un error.
+    """
+    threshold = project.signal_score_threshold if threshold is None else threshold
+    phrases = build_phrases(transcript)
+    if not phrases:
+        logger.info("El motor de señales no encontró frases en la transcripción.")
+        return []
+    if audio_timeline is None:
+        if input_path is not None and ffmpeg_path:
+            audio_timeline = extract_audio_timeline(input_path, ffmpeg_path, duration)
+        else:
+            logger.info(
+                "El motor de señales trabaja sin timeline de audio "
+                "(sin ruta de video o sin ffmpeg); el canal de audio puntúa 0."
+            )
+            audio_timeline = np.zeros(max(1, math.ceil(duration)))
+    bounds = _candidate_bounds(project.duration, duration)
+    if bounds is None:
+        logger.info(
+            "El video (%.1f s) es demasiado corto para el motor de señales.",
+            duration,
+        )
+        return []
+    minimum, maximum = bounds
+    scorer = MomentScorer(phrases, audio_timeline, duration, event_timeline)
+    # Candidatos: cada frase es un inicio; el final es el final natural de
+    # una frase posterior dentro del rango de duración pedido.
+    candidates: list[_ScoredCandidate] = []
+    stride = 1
+    estimated = len(phrases) * max(1, int((maximum - minimum) / 5))
+    if estimated > _MAX_CANDIDATES:
+        stride = math.ceil(estimated / _MAX_CANDIDATES)
+    for step, first_idx in enumerate(range(0, len(phrases), stride)):
+        if should_cancel is not None and step % 200 == 0 and should_cancel():
+            logger.info("La detección de momentos se canceló.")
+            return []
+        start = phrases[first_idx].start
+        for last_idx in range(first_idx, len(phrases)):
+            clip_end = phrases[last_idx].end
+            clip_duration = clip_end - start
+            if clip_duration > maximum:
+                break
+            if clip_duration < minimum:
+                continue
+            score, breakdown, labels = scorer.score_window(first_idx, last_idx)
+            if score < threshold:
+                continue
+            text = " ".join(phrase.text for phrase in phrases[first_idx : last_idx + 1])
+            candidates.append(
+                _ScoredCandidate(
+                    score=score,
+                    first_idx=first_idx,
+                    last_idx=last_idx,
+                    start=start,
+                    end=clip_end,
+                    breakdown=breakdown,
+                    labels=labels,
+                    text=text,
+                )
+            )
+    if not candidates:
+        logger.info(
+            "El motor de señales no encontró momentos por encima del umbral "
+            "%.1f (cero clips, resultado válido).",
+            threshold,
+        )
+        return []
+    separation = (
+        min_separation_seconds
+        if min_separation_seconds is not None
+        else _default_separation(duration)
+    )
+    selected = _select_diverse(
+        candidates,
+        threshold=threshold,
+        separation_seconds=separation,
+        max_clips=max_clips,
+        idf_corpus=[phrase.text for phrase in phrases],
+    )
+    # Tema del video: contenido más frecuente de toda la transcripción,
+    # para hashtags genéricos del tema en cada clip.
+    all_text = " ".join(phrase.text for phrase in phrases)
+    theme_counts: dict[str, int] = {}
+    for token in _content_tokens(all_text):
+        theme_counts[token] = theme_counts.get(token, 0) + 1
+    theme_tokens = [
+        token for token, _ in sorted(theme_counts.items(), key=lambda item: -item[1])[:3]
+    ]
+    proposals = [_build_proposal(scorer, candidate, theme_tokens) for candidate in selected]
+    logger.info(
+        "El motor de señales eligió %d clip(s) de %d candidato(s) por encima del umbral %.1f.",
+        len(proposals),
+        len(candidates),
+        threshold,
+    )
+    return proposals
+
+
+# --- pulido con IA (modo "signals+ai") ----------------------------------------
+
+
+def polish_titles(
+    proposals: list[ClipProposal],
+    transcript: list[TranscriptSegment],
+    llm: ResolvedLLM,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
+) -> list[ClipProposal] | None:
+    """Pule títulos/descripciones de clips YA ELEGIDOS con UNA llamada corta.
+
+    Reutiliza el cliente LLM existente (reintentos, 429, fallback sin modo
+    JSON). Devuelve None si el pulido falla por cualquier motivo o no
+    cambia ningún título: el llamador conserva los títulos por plantilla.
+    Nunca lanza.
+    """
+    if not proposals:
+        return None
+    try:
+        items: list[dict[str, Any]] = []
+        for index, proposal in enumerate(proposals):
+            text = " ".join(
+                segment.text
+                for segment in transcript
+                if segment.start < proposal.fin and segment.end > proposal.inicio
+            )[:600]
+            items.append(
+                {
+                    "indice": index,
+                    "inicio": round(proposal.inicio, 1),
+                    "fin": round(proposal.fin, 1),
+                    "titulo_actual": proposal.titulo,
+                    "texto": text,
+                }
+            )
+        system = (
+            "Eres un editor de clips cortos para redes sociales. Te doy clips "
+            "ya elegidos con su transcripción y su título actual. Reescribe "
+            "cada título para que sea más atractivo y claro, sin inventar "
+            "datos ni cambiar el sentido, y escribe una descripción breve "
+            "de 1–2 frases. Usa el idioma de la transcripción. Responde "
+            'únicamente con un objeto JSON con una única clave "clips", '
+            "cuyo valor sea un array de objetos con las claves indice, "
+            "titulo, descripcion y palabras_clave (array, máximo 12)."
+        )
+        user = "Clips a pulir (conserva cada indice tal cual):\n" + json.dumps(
+            items, ensure_ascii=False
+        )
+        timeout = httpx.Timeout(90, connect=15)
+        with httpx.Client(timeout=timeout) as client:
+            content, _finish_reason = _request_clip_content(
+                client, llm, system, user, on_rate_limit=on_rate_limit
+            )
+        parsed = _extract_json(content)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("clips")
+        if not isinstance(parsed, list):
+            logger.warning("El pulido con IA devolvió un JSON sin lista de clips.")
+            return None
+        by_index = {
+            item["indice"]: item
+            for item in parsed
+            if isinstance(item, dict) and isinstance(item.get("indice"), int)
+        }
+        polished: list[ClipProposal] = []
+        changed = False
+        for index, proposal in enumerate(proposals):
+            item = by_index.get(index)
+            if not item:
+                polished.append(proposal)
+                continue
+            title = str(item.get("titulo") or "").strip()
+            if not title:
+                polished.append(proposal)
+                continue
+            update: dict[str, Any] = {"titulo": title[:160]}
+            description = str(item.get("descripcion") or "").strip()
+            if description:
+                update["descripcion"] = description[:4000]
+            keywords = [
+                str(keyword).strip()
+                for keyword in (item.get("palabras_clave") or [])
+                if str(keyword).strip()
+            ][:12]
+            if keywords:
+                update["palabras_clave"] = keywords
+            updated = proposal.model_copy(update=update)
+            if updated.titulo != proposal.titulo:
+                changed = True
+            polished.append(updated)
+        if not changed:
+            return None
+        return polished
+    except Exception as error:  # noqa: BLE001 - el pulido nunca tumba el proyecto
+        logger.warning(
+            "El pulido de títulos con IA falló; se conservan los títulos por plantilla: %s",
+            error,
+        )
+        return None

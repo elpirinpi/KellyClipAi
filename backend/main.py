@@ -1706,52 +1706,57 @@ def create_app(
         if project["status"] in {"processing", "queued"}:
             raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
         stored_config = request.config or ProjectConfig.model_validate(project["config"])
-        credentials = database.get_llm_credentials(
-            app_settings.database_path,
-            project["owner_id"],
-        )
-        if credentials is None and not app_settings.llm_api_key:
-            raise HTTPException(
-                status_code=422,
-                detail="Falta la clave API. Guárdala en Ajustes antes de procesar el video.",
+        # El motor de señales (por defecto) no necesita clave de IA: el
+        # gate de credenciales solo aplica al modo "llm". En "signals+ai"
+        # el pulido es best-effort (sin clave, títulos por plantilla).
+        llm_config: LLMConfig | None = None
+        if stored_config.moment_engine == "llm":
+            credentials = database.get_llm_credentials(
+                app_settings.database_path,
+                project["owner_id"],
             )
-        try:
-            llm_config = (
-                LLMConfig(
-                    provider=credentials["provider"],
-                    api_key=decrypt_api_key(bytes(credentials["encrypted_api_key"])),
-                    model=credentials["model"],
-                    base_url=credentials["base_url"],
+            if credentials is None and not app_settings.llm_api_key:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Falta la clave API. Guárdala en Ajustes antes de procesar el video.",
                 )
-                if credentials is not None
-                else LLMConfig(
-                    provider=app_settings.llm_provider,
-                    api_key=app_settings.llm_api_key,
-                    model=app_settings.llm_model,
-                    base_url=app_settings.llm_base_url,
+            try:
+                llm_config = (
+                    LLMConfig(
+                        provider=credentials["provider"],
+                        api_key=decrypt_api_key(bytes(credentials["encrypted_api_key"])),
+                        model=credentials["model"],
+                        base_url=credentials["base_url"],
+                    )
+                    if credentials is not None
+                    else LLMConfig(
+                        provider=app_settings.llm_provider,
+                        api_key=app_settings.llm_api_key,
+                        model=app_settings.llm_model,
+                        base_url=app_settings.llm_base_url,
+                    )
                 )
-            )
-            resolve_llm(llm_config, app_settings)
-        except CredentialStoreError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        except LLMConfigurationError as error:
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        except ValidationError as error:
-            # Las credenciales guardadas o el entorno pueden traer una
-            # base_url que el validador actual rechaza (p. ej. un
-            # servidor local en LAN http://192.168.x.x): es un error de
-            # configuración, no un 500. Se devuelve 422 con el motivo.
-            details = "; ".join(
-                f"{'.'.join(str(part) for part in item.get('loc', ()))}: {item.get('msg', '')}"
-                for item in error.errors()[:3]
-            )
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "La configuración del proveedor de IA no es válida"
-                    f"{f': {details}' if details else ''}. Revísala en Ajustes."
-                ),
-            ) from error
+                resolve_llm(llm_config, app_settings)
+            except CredentialStoreError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            except LLMConfigurationError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            except ValidationError as error:
+                # Las credenciales guardadas o el entorno pueden traer una
+                # base_url que el validador actual rechaza (p. ej. un
+                # servidor local en LAN http://192.168.x.x): es un error de
+                # configuración, no un 500. Se devuelve 422 con el motivo.
+                details = "; ".join(
+                    f"{'.'.join(str(part) for part in item.get('loc', ()))}: {item.get('msg', '')}"
+                    for item in error.errors()[:3]
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "La configuración del proveedor de IA no es válida"
+                        f"{f': {details}' if details else ''}. Revísala en Ajustes."
+                    ),
+                ) from error
         if any(
             job["status"] in {"scheduled", "processing"}
             for job in database.list_schedule_jobs(

@@ -1090,7 +1090,7 @@ def test_propose_valid_clips_paces_between_windows(
     # tokens; con presupuesto 3000 la segunda debe esperar.
     proposals = pipeline._propose_valid_clips(
         transcript,
-        ProjectConfig(),
+        ProjectConfig(moment_engine="llm"),
         400,
         ResolvedLLM("Groq", "k", "m", "https://llm.example"),
         token_pacer=pacer,

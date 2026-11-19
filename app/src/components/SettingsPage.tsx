@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ArrowLeft, ChevronDown, Circle, LoaderCircle, Sparkles } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { apiFetch } from '../auth';
-import { API_BASE } from '../context/constants';
+import { API_BASE, type MomentEngine } from '../context/constants';
 import type { ThemePreference } from '../hooks/useTheme';
 import type { ToastKind } from './Toasts';
 import type { IntegrationStatus } from '../types';
@@ -18,11 +18,15 @@ function defaultModelFor(provider: string): string {
   }[provider] ?? '';
 }
 
-export function SettingsPage({ provider, setProvider, whisper, setWhisper, theme, setTheme, onBack, onNotice }: {
+export function SettingsPage({ provider, setProvider, whisper, setWhisper, momentEngine, setMomentEngine, signalThreshold, setSignalThreshold, theme, setTheme, onBack, onNotice }: {
   provider: string;
   setProvider: (value: string) => void;
   whisper: string;
   setWhisper: (value: string) => void;
+  momentEngine: MomentEngine;
+  setMomentEngine: (value: MomentEngine) => void;
+  signalThreshold: number;
+  setSignalThreshold: (value: number) => void;
   theme: ThemePreference;
   setTheme: (value: ThemePreference) => void;
   onBack: () => void;
@@ -198,6 +202,31 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, theme
           {hasSavedKey && <button type="button" className="outline-action" onClick={() => void removeSavedKey()}>Eliminar clave guardada</button>}
         </div>
         {saved && <p className="form-message" role="status">Preferencias y clave guardadas para esta cuenta.</p>}
+      </section>
+      {/* Fase A (v1.1.0): motor de momentos por defecto para los proyectos
+      nuevos. Se guarda en este dispositivo; cada proyecto puede cambiarlo
+      en su configuración. */}
+      <section className="config-card">
+        <div className="card-heading"><div><h2>Motor de momentos</h2><p>Cómo se eligen los mejores momentos en los proyectos nuevos</p></div></div>
+        <div className="settings-form-grid">
+          <label className="config-field"><span>Motor por defecto</span><span className="select-wrap"><select value={momentEngine} onChange={(event) => {
+            const value = event.target.value;
+            if (value === 'signals' || value === 'signals+ai' || value === 'llm') setMomentEngine(value);
+          }}><option value="signals">Señales locales · sin internet ni clave</option><option value="signals+ai">Señales locales + pulido con IA</option><option value="llm">Solo IA (proveedor de arriba)</option></select><ChevronDown size={16} /></span></label>
+          {momentEngine !== 'llm' && (
+            <label className="config-field"><span>Umbral de puntuación: {signalThreshold.toFixed(1)} / 10</span><input
+              className="threshold-slider"
+              type="range"
+              min={5}
+              max={9.5}
+              step={0.5}
+              value={signalThreshold}
+              onChange={(event) => setSignalThreshold(Number.parseFloat(event.target.value))}
+              aria-label="Umbral de puntuación del motor de señales"
+            /></label>
+          )}
+        </div>
+        <p className="settings-explainer">El motor de señales mide la energía del audio, el ritmo del habla y los ganchos del texto, y solo convierte en clips los momentos por encima del umbral. Si un video no da clips, baja el umbral y reprocesa. El modo “Solo IA” necesita la clave del proveedor.</p>
       </section>
       {/* Fase 2 (ítem 17): apariencia — modo oscuro con seguimiento del sistema. */}
       <section className="config-card">

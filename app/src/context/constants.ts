@@ -30,6 +30,45 @@ export const platforms = [
   { label: 'Vimeo', domain: 'vimeo.com', glyph: 'v', color: '#1ab7ea' },
 ];
 
+// Motor de detección de momentos (Fase A, v1.1.0): la preferencia por
+// defecto vive en localStorage (como el tema), se aplica a los proyectos
+// nuevos y cada proyecto puede cambiarla en su configuración. El backend
+// registra el motor efectivo en los metadatos del proyecto.
+export type MomentEngine = 'signals' | 'signals+ai' | 'llm';
+
+export const MOMENT_ENGINE_STORAGE_KEY = 'kellyclipai-moment-engine';
+export const SIGNAL_THRESHOLD_STORAGE_KEY = 'kellyclipai-signal-threshold';
+export const DEFAULT_SIGNAL_THRESHOLD = 8.0;
+
+export const MOMENT_ENGINE_LABELS: Record<MomentEngine, string> = {
+  signals: 'Señales locales',
+  'signals+ai': 'Señales locales + IA',
+  llm: 'IA',
+};
+
+export function readStoredMomentEngine(): MomentEngine {
+  try {
+    const stored = window.localStorage.getItem(MOMENT_ENGINE_STORAGE_KEY);
+    if (stored === 'signals' || stored === 'signals+ai' || stored === 'llm') return stored;
+  } catch {
+    // Sin almacenamiento disponible: el motor por defecto.
+  }
+  return 'signals';
+}
+
+export function readStoredSignalThreshold(): number {
+  try {
+    const stored = window.localStorage.getItem(SIGNAL_THRESHOLD_STORAGE_KEY);
+    if (stored !== null) {
+      const value = Number.parseFloat(stored);
+      if (Number.isFinite(value) && value >= 0 && value <= 10) return value;
+    }
+  } catch {
+    // Sin almacenamiento disponible: el umbral por defecto.
+  }
+  return DEFAULT_SIGNAL_THRESHOLD;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];

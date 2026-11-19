@@ -23,6 +23,17 @@ Ratio = Literal["9:16", "16:9", "1:1", "4:5"]
 WhisperModel = Literal["tiny", "small", "medium", "large-v3"]
 DurationChoice = Literal["Cualquiera", "<30s", "30–60s", "60–90s", "90s–3min"]
 PublishingPlatform = Literal["youtube", "tiktok", "instagram"]
+# Motor de detección de momentos (Fase A, v1.1.0): "signals" es el motor
+# por defecto (señales locales, sin API ni clave); "signals+ai" elige por
+# señales y pule títulos/descripciones con una llamada corta al LLM (si
+# hay clave configurada; si no, funciona igual con títulos por plantilla);
+# "llm" es el camino anterior (selección 100 % por LLM, por ventanas).
+MomentEngine = Literal["signals", "signals+ai", "llm"]
+# Umbral por defecto de la puntuación absoluta 0–10 del motor de señales:
+# por debajo no hay clip ("cero clips" es un resultado válido). Valor
+# inicial del informe (patrón Chopify); la calibración con videos reales
+# es la Fase E.
+DEFAULT_SIGNAL_SCORE_THRESHOLD = 8.0
 
 
 class ScheduledPublishing(BaseModel):
@@ -97,6 +108,12 @@ class ProjectConfig(BaseModel):
     options: EditOptions = Field(default_factory=EditOptions)
     moment: str = Field(default="", max_length=500)
     whisper_model: WhisperModel = "small"
+    moment_engine: MomentEngine = "signals"
+    # Umbral de puntuación del motor de señales (0–10). Solo aplica a los
+    # modos "signals" y "signals+ai"; el modo "llm" lo ignora.
+    signal_score_threshold: float = Field(
+        default=DEFAULT_SIGNAL_SCORE_THRESHOLD, ge=0, le=10
+    )
     schedule: ScheduledPublishing | None = None
 
 
@@ -410,6 +427,11 @@ class ClipProposal(BaseModel):
     hashtags: dict[PublishingPlatform, list[str]] = Field(default_factory=dict)
     palabras_clave: list[str] = Field(default_factory=list, max_length=12)
     emojis: list[str] = Field(default_factory=list, max_length=8)
+    # Desglose de señales del motor local (Fase A): puntuación 0–10 de
+    # cada canal ("audio", "texto", "ritmo", "gancho_inicial" y, desde la
+    # Fase B, "eventos") más "completitud" (multiplicador 0–1). None en
+    # las propuestas del LLM. La UI lo usa para el "por qué este clip".
+    signal_breakdown: dict[str, float] | None = None
 
     @model_validator(mode="after")
     def validate_order(self) -> ClipProposal:

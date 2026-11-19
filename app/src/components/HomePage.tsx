@@ -29,6 +29,7 @@ export function HomePage() {
       schedule, setSchedule, scheduleDate, setScheduleDate,
       schedulePlatform, setSchedulePlatform, scheduleVisibility, setScheduleVisibility,
       whisperLanguage, setWhisperLanguage, subtitleStyle, setSubtitleStyle,
+      momentEngine, setMomentEngine, signalThreshold, setSignalThreshold,
       visibleTemplates, saveCurrentTemplate, onTemplateTabKeyDown,
     },
     importer: {
@@ -153,6 +154,48 @@ export function HomePage() {
               <span className="select-wrap"><select value={duration} onChange={(event) => setDuration(event.target.value)}><option>Cualquiera</option><option>&lt;30s</option><option>30–60s</option><option>60–90s</option><option>90s–3min</option></select><ChevronDown size={16} /></span>
             </label>
           </div>
+
+          {/* Fase A (v1.1.0): motor de detección de momentos. Por defecto,
+          señales locales: sin internet ni clave de IA. */}
+          <section className="config-card moment-engine-card" aria-label="Motor de momentos">
+            <div className="card-heading"><div><h2>Motor de momentos</h2><p>Cómo se eligen los mejores momentos del video</p></div></div>
+            <div className="settings-row">
+              <label className="config-field">
+                <span>Motor</span>
+                <span className="select-wrap"><select value={momentEngine} onChange={(event) => {
+                  const value = event.target.value;
+                  if (value === 'signals' || value === 'signals+ai' || value === 'llm') setMomentEngine(value);
+                }}>
+                  <option value="signals">Señales locales · sin internet ni clave</option>
+                  <option value="signals+ai">Señales locales + pulido con IA</option>
+                  <option value="llm">Solo IA (proveedor configurado en Ajustes)</option>
+                </select><ChevronDown size={16} /></span>
+              </label>
+              {momentEngine !== 'llm' && (
+                <label className="config-field">
+                  <span>Umbral de puntuación: {signalThreshold.toFixed(1)} / 10</span>
+                  <input
+                    className="threshold-slider"
+                    type="range"
+                    min={5}
+                    max={9.5}
+                    step={0.5}
+                    value={signalThreshold}
+                    onChange={(event) => setSignalThreshold(Number.parseFloat(event.target.value))}
+                    aria-label="Umbral de puntuación del motor de señales"
+                  />
+                  <small>Solo los momentos por encima del umbral se convierten en clips. Si no sale ningún clip, baja el umbral y reprocesa.</small>
+                </label>
+              )}
+            </div>
+            <p className="settings-explainer">
+              {momentEngine === 'signals'
+                ? 'El motor local mide la energía del audio, el ritmo del habla y los ganchos del texto. Funciona sin conexión y sin clave de IA.'
+                : momentEngine === 'signals+ai'
+                  ? 'La selección es local; la IA solo pule los títulos y descripciones con una llamada corta. Sin clave configurada, funciona igual con títulos por plantilla.'
+                  : 'La selección la hace el modelo de IA por ventanas de 5 minutos. Necesita la clave del proveedor configurada en Ajustes.'}
+            </p>
+          </section>
 
           <section className="config-card templates-card">
             <div className="card-heading">

@@ -441,7 +441,7 @@ def test_llm_parse_error_in_one_window_does_not_abort_the_project(
 
     proposals = pipeline._propose_valid_clips(
         transcript,
-        ProjectConfig(),
+        ProjectConfig(moment_engine="llm"),
         700,
         ResolvedLLM("Groq", "k", "m", "https://llm.example"),
     )
@@ -474,7 +474,7 @@ def test_all_windows_failing_still_fails_the_project(
     ):
         pipeline._propose_valid_clips(
             transcript,
-            ProjectConfig(),
+            ProjectConfig(moment_engine="llm"),
             700,
             ResolvedLLM("Groq", "k", "m", "https://llm.example"),
         )
@@ -1009,7 +1009,9 @@ def test_process_with_invalid_env_base_url_returns_422(tmp_path: Path) -> None:
     settings = _settings(
         tmp_path / "data", llm_base_url="http://192.168.1.10"
     )
-    config = ProjectConfig().model_dump(mode="json")
+    # La validación de la base_url del LLM solo se aplica en modo "llm";
+    # el motor de señales (por defecto) no usa el proveedor.
+    config = ProjectConfig(moment_engine="llm").model_dump(mode="json")
 
     with TestClient(create_app(settings)) as client:
         created = client.post(

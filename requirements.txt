@@ -10,6 +10,8 @@ sse-starlette==3.7.0
 pydantic==2.14.3
 opencv-contrib-python==4.11.0.86
 mediapipe==0.10.35
+numpy==2.5.5
+onnxruntime==1.32.0
 python-dotenv==1.2.4
 httpx==0.28.1
 PyJWT[crypto]==2.15.0

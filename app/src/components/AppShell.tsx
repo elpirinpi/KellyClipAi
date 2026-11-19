@@ -73,6 +73,10 @@ export function AppShell() {
           setProvider={config.setSettingsProvider}
           whisper={config.whisperModel}
           setWhisper={config.setWhisperModel}
+          momentEngine={config.momentEngine}
+          setMomentEngine={config.setMomentEngine}
+          signalThreshold={config.signalThreshold}
+          setSignalThreshold={config.setSignalThreshold}
           theme={theme.preference}
           setTheme={theme.setPreference}
           onBack={() => navigate(settingsReturnPath)}

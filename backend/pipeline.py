@@ -424,6 +424,8 @@ def _validate_proposals(
     proposals: list[object],
     duration: float,
     choice: str,
+    *,
+    source: str = "del LLM",
 ) -> tuple[list[ClipProposal], list[str]]:
     minimum, maximum = _duration_bounds(choice)
     if choice != "Cualquiera" and duration + 0.05 < minimum:
@@ -442,13 +444,13 @@ def _validate_proposals(
             proposal = ClipProposal.model_validate(candidate)
         except (ValidationError, TypeError) as error:
             reason = f"clip {label}: estructura inválida ({str(error).splitlines()[0][:240]})"
-            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            logger.warning("Se descarta la propuesta %s: %s", source, reason)
             errors.append(reason)
             continue
 
         if proposal.fin > duration + 0.05:
             reason = f"clip {label}: el fin supera la duración del video"
-            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            logger.warning("Se descarta la propuesta %s: %s", source, reason)
             errors.append(reason)
             continue
         if proposal.fin > duration:
@@ -460,7 +462,7 @@ def _validate_proposals(
             or clip_duration > min(maximum, duration) + 0.05
         ):
             reason = f"clip {label}: duración fuera del rango solicitado ({choice})"
-            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            logger.warning("Se descarta la propuesta %s: %s", source, reason)
             errors.append(reason)
             continue
         valid.append(proposal)
@@ -470,7 +472,7 @@ def _validate_proposals(
     for proposal in sorted(valid, key=lambda clip: clip.inicio):
         if proposal.inicio < previous_end:
             reason = f"clip {proposal.titulo}: se solapa con otro clip"
-            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            logger.warning("Se descarta la propuesta %s: %s", source, reason)
             errors.append(reason)
             continue
         previous_end = proposal.fin
@@ -483,16 +485,135 @@ def _validate_and_complete_proposals(
     transcript: list[TranscriptSegment],
     duration: float,
     choice: str,
+    *,
+    source: str = "del LLM",
 ) -> tuple[list[ClipProposal], list[str]]:
-    proposals, errors = _validate_proposals(candidates, duration, choice)
+    proposals, errors = _validate_proposals(
+        candidates, duration, choice, source=source
+    )
     if not proposals:
         return [], errors
     completed = _complete_clip_ends(proposals, transcript, duration, choice)
-    completed, completion_errors = _validate_proposals(completed, duration, choice)
+    completed, completion_errors = _validate_proposals(
+        completed, duration, choice, source=source
+    )
     return completed, errors + completion_errors
 
 
 def _propose_valid_clips(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    llm: ResolvedLLM | None,
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
+    token_pacer: _TokenPacer | None = None,
+    input_path: Path | None = None,
+    ffmpeg_path: str | None = None,
+    on_event_download_progress: Callable[[float], None] | None = None,
+) -> list[ClipProposal]:
+    """Punto de entrada de propuestas: despacha según project.moment_engine.
+
+    - "signals" / "signals+ai": motor local de señales (video completo,
+      sin ventanas ni LLM para elegir; el pulido con IA de "signals+ai"
+      lo hace process_project después de la selección).
+    - "llm": camino anterior por ventanas de 5 min (llm obligatorio).
+    """
+    if project.moment_engine in {"signals", "signals+ai"}:
+        return _propose_valid_signals(
+            transcript,
+            project,
+            duration,
+            input_path,
+            ffmpeg_path,
+            should_cancel,
+            on_event_download_progress=on_event_download_progress,
+        )
+    if llm is None:
+        raise LLMConfigurationError(
+            "El modo de motor 'llm' necesita un proveedor de IA configurado."
+        )
+    return _propose_valid_clips_llm(
+        transcript,
+        project,
+        duration,
+        llm,
+        should_cancel,
+        on_rate_limit=on_rate_limit,
+        token_pacer=token_pacer,
+    )
+
+
+def _propose_valid_signals(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    input_path: Path | None,
+    ffmpeg_path: str | None,
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    on_event_download_progress: Callable[[float], None] | None = None,
+) -> list[ClipProposal]:
+    """Propuestas del motor de señales (Fase A + Tier 1, v1.1.0).
+
+    Importación perezosa de backend.moments: numpy solo se necesita aquí
+    (en producción siempre está, vía mediapipe/opencv/faster-whisper); si
+    falta, el proyecto falla con un mensaje claro en vez de romper la
+    importación de todo el pipeline. Cero clips es un resultado válido
+    del motor de señales: se devuelve [] sin error.
+
+    Tier 1 (Fase B) es opcional y jamás rompe un proyecto: si el módulo
+    de eventos no se puede importar, o si get_event_timeline devuelve
+    None (sin runtime, sin modelo, sin red, sin audio), el motor sigue
+    con Tier 0. Solo la cancelación del usuario se propaga.
+    """
+    if should_cancel is not None and should_cancel():
+        raise ProjectCancelled()
+    try:
+        from . import moments
+    except ImportError as error:
+        raise MediaProcessingError(
+            "El motor de señales locales necesita numpy, que no está "
+            "instalado. Reinstala la aplicación."
+        ) from error
+    event_timeline = None
+    if transcript:
+        # Sin frases no hay candidatos: no merece descargar el modelo
+        # (~15 MB) ni correr la inferencia para un resultado vacío.
+        try:
+            from . import audio_events
+        except ImportError:
+            audio_events = None
+        if audio_events is not None:
+            try:
+                event_timeline = audio_events.get_event_timeline(
+                    input_path,
+                    duration,
+                    ffmpeg_path,
+                    on_progress=on_event_download_progress,
+                    should_cancel=should_cancel,
+                )
+            except audio_events.AudioEventsCancelled as error:
+                raise ProjectCancelled() from error
+    proposals = moments.detect_moments(
+        transcript,
+        project,
+        duration,
+        input_path=input_path,
+        ffmpeg_path=ffmpeg_path,
+        event_timeline=event_timeline,
+        should_cancel=should_cancel,
+    )
+    if not proposals:
+        return []
+    valid, _errors = _validate_and_complete_proposals(
+        proposals, transcript, duration, project.duration, source="de señales"
+    )
+    return valid
+
+
+def _propose_valid_clips_llm(
     transcript: list[TranscriptSegment],
     project: ProjectConfig,
     duration: float,
@@ -502,7 +623,7 @@ def _propose_valid_clips(
     on_rate_limit: Callable[[float, int], None] | None = None,
     token_pacer: _TokenPacer | None = None,
 ) -> list[ClipProposal]:
-    """Propuestas válidas para todo el video, por ventanas de 5 min.
+    """Propuestas válidas para todo el video, por ventanas de 5 min (LLM).
 
     token_pacer regula el ritmo de las llamadas LLM (presupuesto TPM);
     si es None no hay pacing (process_project siempre pasa uno).
@@ -766,6 +887,20 @@ def _progress_for_llm(
     )
 
 
+def _progress_for_signals(
+    settings: AppSettings,
+    project_id: str,
+) -> None:
+    _publish(
+        settings,
+        project_id,
+        "processing",
+        "finding",
+        None,
+        "Analizando momentos con señales locales (sin IA)…",
+    )
+
+
 def _render_projects(
     settings: AppSettings,
     project_id: str,
@@ -852,6 +987,10 @@ def _render_projects(
             "width": 0,
             "height": 0,
         }
+        if proposal.signal_breakdown is not None:
+            # Desglose "por qué este clip" del motor de señales (la UI lo
+            # muestra; las propuestas del LLM no lo traen).
+            clip["signal_breakdown"] = proposal.signal_breakdown
         clip_start_progress = 72 + round(index / count * 26)
         _publish(
             settings,
@@ -983,9 +1122,12 @@ def process_project(
         _check_not_cancelled(settings, project_id)
         _check_free_disk_space(project_dir)
         project_config = ProjectConfig.model_validate(stored["config"])
+        # El motor de señales (por defecto) no necesita LLM: el proveedor
+        # solo se resuelve en modo "llm". En "signals+ai" se resuelve más
+        # abajo, best-effort, solo para pulir títulos.
         llm = (
             None
-            if retry_failed_only
+            if retry_failed_only or project_config.moment_engine != "llm"
             else _resolve_llm_for_project(stored, request_llm, settings)
         )
         ffmpeg_path = shutil.which("ffmpeg")
@@ -1196,46 +1338,121 @@ def process_project(
                 f"Reintentando {len(proposal_records)} clip(s) fallido(s) sin volver a llamar a la IA…",
             )
         else:
-            if llm is None:
-                raise LLMConfigurationError("No se pudo configurar el proveedor de IA.")
-            _progress_for_llm(settings, project_id, llm.provider)
+            if project_config.moment_engine == "llm":
+                if llm is None:
+                    raise LLMConfigurationError("No se pudo configurar el proveedor de IA.")
+                _progress_for_llm(settings, project_id, llm.provider)
 
-            def on_rate_limit(wait_seconds: float, _attempt: int) -> None:
-                # Aviso visible mientras se espera por un 429: el usuario
-                # ve que la app está esperando y no colgada (Fase 2).
-                _publish(
-                    settings,
-                    project_id,
-                    "processing",
-                    "finding",
-                    None,
-                    f"Límite de {llm.provider} alcanzado, esperando "
-                    f"{wait_seconds:.0f}s antes de reintentar…",
+                def on_rate_limit(wait_seconds: float, _attempt: int) -> None:
+                    # Aviso visible mientras se espera por un 429: el usuario
+                    # ve que la app está esperando y no colgada (Fase 2).
+                    _publish(
+                        settings,
+                        project_id,
+                        "processing",
+                        "finding",
+                        None,
+                        f"Límite de {llm.provider} alcanzado, esperando "
+                        f"{wait_seconds:.0f}s antes de reintentar…",
+                    )
+
+                def on_pacing_wait(wait_seconds: float) -> None:
+                    # Aviso visible mientras el pacer TPM espera entre
+                    # ventanas: sin él, la pausa de hasta un minuto parecería
+                    # un cuelgue (Fase 2).
+                    _publish(
+                        settings,
+                        project_id,
+                        "processing",
+                        "finding",
+                        None,
+                        f"Esperando {wait_seconds:.0f}s para respetar el límite de {llm.provider}…",
+                    )
+
+                token_pacer = _TokenPacer(on_wait=on_pacing_wait)
+                proposals = _propose_valid_clips(
+                    transcript,
+                    project_config,
+                    float(metadata["duration"]),
+                    llm,
+                    should_cancel,
+                    on_rate_limit=on_rate_limit,
+                    token_pacer=token_pacer,
                 )
+                engine_used = "llm"
+            else:
+                _progress_for_signals(settings, project_id)
 
-            def on_pacing_wait(wait_seconds: float) -> None:
-                # Aviso visible mientras el pacer TPM espera entre
-                # ventanas: sin él, la pausa de hasta un minuto parecería
-                # un cuelgue (Fase 2).
-                _publish(
-                    settings,
-                    project_id,
-                    "processing",
-                    "finding",
+                def on_event_download_progress(percent: float) -> None:
+                    # Aviso visible mientras se descarga el modelo YAMNet
+                    # (~15 MB, solo la primera vez): sin él, la descarga
+                    # parecería un cuelgue (Fase B, Tier 1).
+                    _publish(
+                        settings,
+                        project_id,
+                        "processing",
+                        "finding",
+                        None,
+                        f"Descargando el modelo de eventos de audio ({percent:.0f}%)…",
+                    )
+
+                proposals = _propose_valid_clips(
+                    transcript,
+                    project_config,
+                    float(metadata["duration"]),
                     None,
-                    f"Esperando {wait_seconds:.0f}s para respetar el límite de {llm.provider}…",
+                    should_cancel,
+                    input_path=input_path,
+                    ffmpeg_path=ffmpeg_path,
+                    on_event_download_progress=on_event_download_progress,
                 )
+                engine_used = "signals"
+                if project_config.moment_engine == "signals+ai" and proposals:
+                    # Pulido best-effort con UNA llamada corta al LLM: sin
+                    # clave configurada, o si la llamada falla, se conservan
+                    # los títulos por plantilla sin error.
+                    polish_llm: ResolvedLLM | None = None
+                    try:
+                        polish_llm = _resolve_llm_for_project(
+                            stored, request_llm, settings
+                        )
+                    except (
+                        LLMConfigurationError,
+                        CredentialStoreError,
+                        ValidationError,
+                    ) as error:
+                        logger.info(
+                            "Sin proveedor de IA para el pulido de títulos; "
+                            "se conservan los títulos por plantilla: %s",
+                            error,
+                        )
+                    if polish_llm is not None:
+                        def on_polish_rate_limit(
+                            wait_seconds: float, _attempt: int
+                        ) -> None:
+                            assert polish_llm is not None
+                            _publish(
+                                settings,
+                                project_id,
+                                "processing",
+                                "finding",
+                                None,
+                                f"Límite de {polish_llm.provider} alcanzado, "
+                                f"esperando {wait_seconds:.0f}s antes de "
+                                "reintentar…",
+                            )
 
-            token_pacer = _TokenPacer(on_wait=on_pacing_wait)
-            proposals = _propose_valid_clips(
-                transcript,
-                project_config,
-                float(metadata["duration"]),
-                llm,
-                should_cancel,
-                on_rate_limit=on_rate_limit,
-                token_pacer=token_pacer,
-            )
+                        from . import moments
+
+                        polished = moments.polish_titles(
+                            proposals,
+                            transcript,
+                            polish_llm,
+                            on_rate_limit=on_polish_rate_limit,
+                        )
+                        if polished is not None:
+                            proposals = polished
+                            engine_used = "signals+ai"
             proposal_records = [
                 {
                     "id": str(uuid.uuid4()),
@@ -1245,18 +1462,35 @@ def process_project(
             ]
             metadata = dict(metadata or {})
             metadata["clip_proposals"] = proposal_records
+            # Motor efectivo registrado por proyecto (la UI lo muestra en
+            # resultados). En "signals+ai" sin clave o con pulido fallido,
+            # el motor efectivo es "signals".
+            metadata["moment_engine"] = engine_used
+            if engine_used in {"signals", "signals+ai"}:
+                metadata["signal_score_threshold"] = (
+                    project_config.signal_score_threshold
+                )
             database.update_project(
                 settings.database_path, project_id, metadata=metadata
             )
             if not proposals:
                 # No se toca clips_json: los clips anteriores se conservan.
+                empty_message = (
+                    "El análisis terminó. No se encontraron momentos que "
+                    "cumplan los criterios solicitados."
+                )
+                if engine_used == "signals":
+                    empty_message += (
+                        " Puedes bajar el umbral de puntuación en la "
+                        "configuración del proyecto y reprocesar."
+                    )
                 _publish(
                     settings,
                     project_id,
                     "completed",
                     "finalize",
                     100,
-                    "El análisis terminó. No se encontraron momentos que cumplan los criterios solicitados.",
+                    empty_message,
                 )
                 return
 

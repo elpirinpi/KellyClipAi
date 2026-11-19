@@ -629,6 +629,8 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
         assert project["config"] == {
             **config,
             "whisper_language": "auto",
+            "moment_engine": "signals",
+            "signal_score_threshold": 8.0,
             "subtitle_style": {
                 "font_family": None,
                 "font_size": None,
@@ -639,9 +641,11 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
         }
         assert (settings.data_dir / "projects" / project_id / "source").is_file()
 
+        # El modo "llm" sigue bloqueado sin clave; el motor de señales
+        # (por defecto) no necesita clave y no se bloquea.
         blocked = client.post(
             f"/api/projects/{project_id}/process",
-            json={"llm": {"provider": "Groq", "api_key": ""}, "config": config},
+            json={"llm": {"provider": "Groq", "api_key": ""}, "config": {**config, "moment_engine": "llm"}},
         )
         assert blocked.status_code == 422
         assert "Falta la clave" in blocked.json()["detail"]

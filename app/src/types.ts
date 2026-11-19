@@ -73,6 +73,9 @@ export type ClipResult = {
   viral_reason: string;
   keywords: string[];
   emojis: string[];
+  // Desglose "por qué este clip" del motor de señales (canal → 0–10);
+  // ausente en los clips elegidos por el LLM.
+  signal_breakdown?: Record<string, number>;
   width: number;
   height: number;
   resolution?: 720 | 1080;
@@ -120,9 +123,15 @@ export type ProjectResult = {
     subtitle_style?: SubtitleStyleState;
     options: Record<string, boolean>;
     moment: string;
+    // Motor de detección de momentos (Fase A, v1.1.0): "signals" es el
+    // motor por defecto (señales locales, sin API); "signals+ai" pule los
+    // títulos con una llamada corta al LLM; "llm" es el camino anterior.
+    // Opcionales: los proyectos anteriores a v1.1.0 no los traen.
+    moment_engine?: 'signals' | 'signals+ai' | 'llm';
+    signal_score_threshold?: number;
     schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
   };
-  metadata: { duration: number; width: number; height: number; language?: string } | null;
+  metadata: { duration: number; width: number; height: number; language?: string; moment_engine?: string; signal_score_threshold?: number } | null;
   transcript: Array<{ start: number; end: number; text: string; words: Array<{ start: number; end: number; text: string }> }> | null;
   clips: ClipResult[];
   thumbnail_url: string | null;

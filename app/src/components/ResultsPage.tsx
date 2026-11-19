@@ -3,7 +3,7 @@ import {
   AlertCircle, ArrowRight, Download, FileText, FileVideo2, LoaderCircle, Scissors, Search, Share2, Sparkles, Trash2, WandSparkles,
 } from 'lucide-react';
 import { apiFetch } from '../auth';
-import { API_BASE, formatBytes } from '../context/constants';
+import { API_BASE, MOMENT_ENGINE_LABELS, formatBytes, type MomentEngine } from '../context/constants';
 import { ToastStack, useToasts, type ToastKind } from './Toasts';
 import type { ClipResult, ProjectResult, ScheduleJob } from '../types';
 import { formatDuration, responseError } from '../utils';
@@ -16,6 +16,22 @@ declare global {
       };
     };
   }
+}
+
+// Etiquetas del desglose "por qué este clip" (Fase A, v1.1.0).
+const SIGNAL_CHANNEL_LABELS: Record<string, string> = {
+  audio: 'Energía de audio',
+  texto: 'Ganchos de texto',
+  ritmo: 'Ritmo de habla',
+  gancho_inicial: 'Gancho inicial',
+  eventos: 'Eventos de audio',
+};
+
+function resolveEngine(project: ProjectResult | null): MomentEngine {
+  const engine = project?.metadata?.moment_engine ?? project?.config.moment_engine;
+  if (engine === 'signals' || engine === 'signals+ai' || engine === 'llm') return engine;
+  // Proyectos anteriores a v1.1.0: todos usaban el LLM.
+  return 'llm';
 }
 
 function triggerDownload(blob: Blob, filename: string): void {
@@ -100,6 +116,8 @@ export function ResultsPage({
   const readyClips = clips.filter((clip) => clip.status !== 'failed');
   const failedClips = clips.filter((clip) => clip.status === 'failed');
   const visibleReadyClips = visibleClips.filter((clip) => clip.status !== 'failed');
+  // Motor efectivo que eligió los clips (registrado en metadatos).
+  const engine = resolveEngine(project);
   const allSelected = visibleReadyClips.length > 0 && visibleReadyClips.every((clip) => selected.has(clip.id));
   const selectedClips = readyClips.filter((clip) => selected.has(clip.id));
 
@@ -442,6 +460,7 @@ export function ResultsPage({
       <div className="clips-heading">
         <div><span className="clips-version">V1</span><strong>CLIPS IA</strong></div>
         <span className="clips-count">{filtersActive ? `${visibleClips.length} de ${clips.length} clips` : `${clips.length} clips`}</span>
+        <span className="engine-badge">Motor: {MOMENT_ENGINE_LABELS[engine]}</span>
         <span className="storage-usage" role="status">
           Almacenamiento local: {storageUsedBytes === null ? (storageError || 'calculando…') : formatBytes(storageUsedBytes)}
         </span>
@@ -552,7 +571,7 @@ export function ResultsPage({
       )}
       {!project && error && <button type="button" className="retry-button" onClick={() => window.location.reload()}>Volver a cargar el proyecto</button>}
       {project?.status === 'completed' && clips.length === 0 && (
-        <section className="empty-clips"><WandSparkles size={23} /><h2>No se encontraron clips</h2><p>El análisis real no identificó momentos que cumplieran la duración y el criterio solicitados.</p></section>
+        <section className="empty-clips"><WandSparkles size={23} /><h2>No se encontraron clips</h2><p>El análisis real no identificó momentos que cumplieran la duración y el criterio solicitados.{engine === 'signals' ? ' Puedes bajar el umbral de puntuación en la configuración del proyecto y reprocesar.' : ''}</p></section>
       )}
       {project?.status === 'completed' && clips.length > 0 && visibleClips.length === 0 && (
         <section className="empty-clips"><Search size={23} /><h2>Sin resultados</h2><p>Ningún clip coincide con la búsqueda o los filtros. <button type="button" className="job-link" onClick={clearClipFilters}>Limpiar filtros</button></p></section>
@@ -632,6 +651,23 @@ export function ResultsPage({
               {clip.status !== 'failed' && (
               <>
               <section className="viral-reason"><strong>Razón viral</strong><p>{clip.viral_reason}</p></section>
+              {clip.signal_breakdown && (
+                <section className="signal-breakdown" aria-label={`Por qué se eligió el clip ${index + 1}`}>
+                  <strong>Por qué este clip</strong>
+                  <ul>
+                    {Object.entries(clip.signal_breakdown)
+                      .filter(([channel, value]) => channel !== 'completitud' && value > 0)
+                      .sort((a, b) => b[1] - a[1])
+                      .map(([channel, value]) => (
+                        <li key={channel}>
+                          <span className="signal-channel">{SIGNAL_CHANNEL_LABELS[channel] ?? channel}</span>
+                          <span className="signal-bar" aria-hidden="true"><span style={{ width: `${Math.min(100, value * 10)}%` }} /></span>
+                          <span className="signal-value">{value.toFixed(1)}</span>
+                        </li>
+                      ))}
+                  </ul>
+                </section>
+              )}
               {clip.broll_provider && <p className="broll-attribution">B-roll de {clip.broll_provider} · {clip.broll_creator}{clip.broll_attribution_url && <> · <a href={clip.broll_attribution_url} target="_blank" rel="noreferrer">Ver fuente</a></>}</p>}
               <section className="clip-transcript" aria-label={`Transcripción del clip ${index + 1}`}>
                 <strong>Transcripción</strong>

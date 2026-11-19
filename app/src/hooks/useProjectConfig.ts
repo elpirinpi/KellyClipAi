@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { apiFetch } from '../auth';
-import { customTemplates, templates, type Template } from '../context/constants';
+import {
+  MOMENT_ENGINE_STORAGE_KEY, SIGNAL_THRESHOLD_STORAGE_KEY,
+  customTemplates, readStoredMomentEngine, readStoredSignalThreshold, templates,
+  type MomentEngine, type Template,
+} from '../context/constants';
 import type { ToastKind } from '../components/Toasts';
 import { DEFAULT_SUBTITLE_STYLE, type ProjectResult, type SubtitleStyleState } from '../types';
 import { responseError } from '../utils';
@@ -8,9 +12,10 @@ import { responseError } from '../utils';
 // Configuración de clips (extraída de App.tsx, ítem 23 de la Fase 2):
 // ratio, duración, encuadre, plantillas de subtítulos, opciones de
 // edición, momento, programación, modelo de Whisper e idioma, estilo de
-// subtítulos y proveedor de IA. Agrupa también la construcción de la
-// configuración que se envía al backend (projectConfig) y la aplicación
-// de la configuración de un proyecto cargado (applyProjectConfiguration).
+// subtítulos, proveedor de IA y motor de momentos (Fase A, v1.1.0).
+// Agrupa también la construcción de la configuración que se envía al
+// backend (projectConfig) y la aplicación de la configuración de un
+// proyecto cargado (applyProjectConfiguration).
 
 type UseProjectConfigOptions = {
   apiBase: string;
@@ -46,6 +51,29 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
   const [whisperModel, setWhisperModel] = useState('small');
   const [whisperLanguage, setWhisperLanguage] = useState('auto');
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyleState>(DEFAULT_SUBTITLE_STYLE);
+  // Motor de momentos (Fase A, v1.1.0): el valor inicial es la preferencia
+  // guardada en Ajustes (localStorage); cada cambio se persiste para los
+  // próximos proyectos. Al cargar un proyecto se restaura su configuración.
+  const [momentEngine, setMomentEngineState] = useState<MomentEngine>(() => readStoredMomentEngine());
+  const [signalThreshold, setSignalThresholdState] = useState<number>(() => readStoredSignalThreshold());
+
+  const setMomentEngine = useCallback((value: MomentEngine) => {
+    setMomentEngineState(value);
+    try {
+      window.localStorage.setItem(MOMENT_ENGINE_STORAGE_KEY, value);
+    } catch {
+      // Sin almacenamiento disponible: la elección vale para esta sesión.
+    }
+  }, []);
+
+  const setSignalThreshold = useCallback((value: number) => {
+    setSignalThresholdState(value);
+    try {
+      window.localStorage.setItem(SIGNAL_THRESHOLD_STORAGE_KEY, String(value));
+    } catch {
+      // Sin almacenamiento disponible: la elección vale para esta sesión.
+    }
+  }, []);
 
   useEffect(() => {
     if (!authReady || !userId) return;
@@ -138,6 +166,8 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
       moment,
       whisper_model: whisperModel,
       whisper_language: whisperLanguage,
+      moment_engine: momentEngine,
+      signal_score_threshold: signalThreshold,
       schedule: schedule
         ? {
             scheduled_at: new Date(scheduleDate).toISOString(),
@@ -166,6 +196,8 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
       ...loaded.config.options,
     });
     setMoment(loaded.config.moment);
+    setMomentEngineState(loaded.config.moment_engine ?? readStoredMomentEngine());
+    setSignalThresholdState(loaded.config.signal_score_threshold ?? readStoredSignalThreshold());
     setSchedule(Boolean(loaded.config.schedule));
     if (loaded.config.schedule) {
       const localDate = new Date(loaded.config.schedule.scheduled_at);
@@ -209,6 +241,10 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setWhisperModel,
     whisperLanguage,
     setWhisperLanguage,
+    momentEngine,
+    setMomentEngine,
+    signalThreshold,
+    setSignalThreshold,
     subtitleStyle,
     setSubtitleStyle,
     visibleTemplates,

@@ -148,7 +148,7 @@ def test_invalid_clip_proposals_are_logged_and_retried_once(monkeypatch, caplog)
     monkeypatch.setattr(pipeline, "propose_clips", propose_clips)
     proposals = pipeline._propose_valid_clips(
         [],
-        ProjectConfig(),
+        ProjectConfig(moment_engine="llm"),
         60,
         ResolvedLLM("OpenAI", "test-token", "gpt-4o-mini", "https://llm.example"),
     )

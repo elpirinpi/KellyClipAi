@@ -597,7 +597,7 @@ def test_process_project_runs_llm_http_and_persists_real_pipeline_result(
     input_path = project_dir / "source"
     input_path.parent.mkdir(parents=True)
     input_path.write_bytes(b"video")
-    config = ProjectConfig()
+    config = ProjectConfig(moment_engine="llm")
     database.create_project(
         settings.database_path,
         project_id,

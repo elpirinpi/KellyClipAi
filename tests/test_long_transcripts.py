@@ -48,7 +48,7 @@ def test_long_transcripts_use_overlapping_windows_and_restore_absolute_times(
 
     proposals = pipeline._propose_valid_clips(
         transcript,
-        ProjectConfig(),
+        ProjectConfig(moment_engine="llm"),
         1300,
         ResolvedLLM("OpenAI", "test-token", "test-model", "https://llm.example"),
     )
