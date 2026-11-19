@@ -43,9 +43,9 @@ añade pruebas y herramientas. Los archivos `requirements.lock`,
 transitivas con hashes SHA-256. Para actualizarlos, activa `.venv` y ejecuta:
 
 ```powershell
-.\.venv\Scripts\pip-compile.exe --generate-hashes --output-file=requirements.lock requirements.txt
-.\.venv\Scripts\pip-compile.exe --generate-hashes --output-file=requirements-dev.lock requirements-dev.txt
-.\.venv\Scripts\pip-compile.exe --generate-hashes --output-file=requirements-desktop.lock requirements-desktop.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --allow-unsafe --output-file=requirements.lock requirements.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --allow-unsafe --output-file=requirements-dev.lock requirements-dev.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --allow-unsafe --output-file=requirements-desktop.lock requirements-desktop.txt
 ```
 
 El `.env.example` incluido ya configura el proyecto Supabase de kellyClipAi
