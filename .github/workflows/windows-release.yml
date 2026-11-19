@@ -62,6 +62,28 @@ jobs:
         shell: pwsh
         run: .\build_windows.ps1
 
+      - name: Smoke-test built bundle
+        # El bundle es un ejecutable --windowed: PowerShell no esperaría a que
+        # terminase con `&`, por eso se usa Start-Process -Wait -PassThru.
+        # Si el smoke test falla, este paso falla y el instalador NO se publica.
+        # El smoke test arranca el backend local en el puerto 8000 y comprueba
+        # /, /settings, /api/health y que ffmpeg/ffprobe se ejecuten
+        # (desktop.py, KELLYCLIP_SMOKE_TEST=1). El timeout acota el paso si un
+        # fallo de arranque deja abierto el cuadro de error de Windows.
+        shell: pwsh
+        env:
+          KELLYCLIP_SMOKE_TEST: "1"
+        timeout-minutes: 10
+        run: |
+          $bundleExe = ".\build\bundle\KellyClipAi\KellyClipAi.exe"
+          if (-not (Test-Path $bundleExe)) { throw "Built bundle not found: $bundleExe" }
+          $process = Start-Process -FilePath $bundleExe -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            $log = Join-Path $env:LOCALAPPDATA "kellyClipAi\desktop.log"
+            if (Test-Path $log) { Get-Content $log -Tail 50 }
+            throw "Smoke test failed with exit code $($process.ExitCode)."
+          }
+
       - name: Attach installer to release
         shell: pwsh
         env:
