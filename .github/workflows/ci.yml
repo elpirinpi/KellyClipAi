@@ -52,14 +52,53 @@ jobs:
       - name: Install Python dependencies and audit tools
         run: python -m pip install --require-hashes -r requirements-dev.lock
 
+      - name: Check Python lock files are up to date
+        # pip-tools 7.5.2 has no --check flag: regenerate each lock with
+        # --dry-run (which prints to stderr, followed by a "Dry-run, so
+        # nothing updated." trailer) and compare it with the committed
+        # file. The flags must match the header recorded in each lock
+        # (--allow-unsafe --generate-hashes); any extra flag would change
+        # the header and fail the comparison. --dry-run itself is not
+        # recorded in the header. If this step fails, regenerate the lock
+        # on Windows with the command from README.md.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($pair in @(
+            @{ Input = 'requirements.txt'; Lock = 'requirements.lock' },
+            @{ Input = 'requirements-dev.txt'; Lock = 'requirements-dev.lock' },
+            @{ Input = 'requirements-desktop.txt'; Lock = 'requirements-desktop.lock' }
+          )) {
+            $stderrFile = Join-Path $env:RUNNER_TEMP "pip-compile-$($pair.Lock).txt"
+            & pip-compile --allow-unsafe --generate-hashes --dry-run --output-file=$($pair.Lock) $($pair.Input) 2> $stderrFile
+            if ($LASTEXITCODE -ne 0) { throw "pip-compile failed for $($pair.Input)." }
+            $lines = @(Get-Content $stderrFile)
+            $start = 0
+            while ($start -lt $lines.Count -and -not $lines[$start].StartsWith('#')) { $start++ }
+            if ($start -ge $lines.Count) { throw "pip-compile produced no lock output for $($pair.Input)." }
+            $generated = (($lines[$start..($lines.Count - 1)] | Where-Object { $_ -ne 'Dry-run, so nothing updated.' }) -join "`n").TrimEnd()
+            $committed = ((Get-Content $pair.Lock -Raw) -replace "`r`n", "`n").TrimEnd()
+            if ($generated -ne $committed) {
+              throw "Lock file $($pair.Lock) is out of date with $($pair.Input). Regenerate it with: pip-compile --generate-hashes --allow-unsafe --output-file=$($pair.Lock) $($pair.Input)"
+            }
+          }
+
       - name: Install frontend dependencies
         run: npm ci --prefix app
 
       - name: Run backend tests
         run: python -m pytest
 
-      - name: Lint backend
-        run: ruff check backend
+      - name: Lint Python
+        run: ruff check .
+
+      - name: Check Python formatting
+        # Advisory until the tree is formatted once (28 of 38 files fail
+        # today, 19-11-2026): visible in CI, but does not block while the
+        # reformat is pending. Remove continue-on-error after running
+        # `ruff format` on the whole tree.
+        continue-on-error: true
+        run: ruff format --check .
 
       - name: Type-check frontend
         working-directory: app
@@ -69,7 +108,10 @@ jobs:
         run: npm run build --prefix app
 
       - name: Audit Python dependencies
-        run: pip-audit -r requirements.lock
+        run: |
+          pip-audit -r requirements.lock
+          pip-audit -r requirements-dev.lock
+          pip-audit -r requirements-desktop.lock
 
       - name: Audit frontend dependencies
         run: npm audit --prefix app --audit-level=high
