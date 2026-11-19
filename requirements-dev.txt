@@ -3,3 +3,7 @@ pytest==9.2.0
 ruff==0.17.5
 pip-audit==2.9.0
 pip-tools==7.5.2
+# pip<26: pip-tools 7.5.2 is incompatible with pip 26 (it uses
+# PackageFinder.allow_all_prereleases, removed in pip 26); CI runs
+# pip-compile from the environment installed from this lock.
+pip==25.3
