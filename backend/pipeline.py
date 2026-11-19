@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from . import database
 from .integrations import download_broll
 from .llm import (
     LLMConfigurationError,
+    LLMResponseError,
     ResolvedLLM,
     propose_clips,
     resolve_llm,
@@ -23,12 +26,33 @@ from .media import (
     render_clip,
     transcribe,
 )
-from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment, Word
+from .process_queue import is_project_cancelled
+from .schemas import (
+    MAX_VIDEO_DURATION_SECONDS,
+    ClipProposal,
+    LLMConfig,
+    ProjectConfig,
+    TranscriptSegment,
+    Word,
+)
 from .settings import AppSettings, get_settings
 
 
 class ProjectNotFoundError(RuntimeError):
     pass
+
+
+class ProjectCancelled(RuntimeError):
+    """El usuario canceló el procesamiento.
+
+    Lleva los clips renderizados hasta el momento para conservarlos: si al
+    menos uno quedó listo, el pipeline los publica; si no, se conservan
+    los clips anteriores del proyecto.
+    """
+
+    def __init__(self, clips: list[dict[str, Any]] | None = None) -> None:
+        super().__init__("Procesamiento cancelado por el usuario.")
+        self.clips = clips or []
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +63,128 @@ logger = logging.getLogger(__name__)
 # límites de tokens/minuto del plan gratuito de Groq con videos largos.
 _LLM_WINDOW_SECONDS = 5 * 60
 _LLM_WINDOW_OVERLAP_SECONDS = 1 * 60
+
+# Espacio libre mínimo para empezar a procesar: un proyecto puede producir
+# ~10 clips renderizados, B-roll y la descarga del modelo Whisper. Si hay
+# menos, se falla rápido con un mensaje claro en vez de dejar el disco
+# lleno a mitad del render. En sistemas de archivos más pequeños que el
+# propio umbral (tmpfs, RAM disks, contenedores con /tmp pequeño), exigir
+# 1 GiB haría imposible procesar nada aunque hubiera espacio de sobra para
+# el proyecto, así que el mínimo baja al 10 % del total (ver
+# _check_free_disk_space). En cualquier disco real (>= 10 GB) el mínimo es
+# exactamente 1 GiB.
+_MIN_FREE_DISK_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
+_MIN_FREE_DISK_FRACTION = 0.10  # 10 % del total en sistemas pequeños
+
+
+def _is_cancelled(settings: AppSettings, project_id: str) -> bool:
+    """Cancelación cooperativa: flag en memoria o estado persistido."""
+    if is_project_cancelled(project_id):
+        return True
+    return (
+        database.get_project_status(settings.database_path, project_id)
+        == "cancelled"
+    )
+
+
+def _check_not_cancelled(settings: AppSettings, project_id: str) -> None:
+    if _is_cancelled(settings, project_id):
+        raise ProjectCancelled()
+
+
+def _check_video_duration(duration_seconds: float) -> None:
+    if duration_seconds > MAX_VIDEO_DURATION_SECONDS:
+        limit_hours = MAX_VIDEO_DURATION_SECONDS // 3600
+        raise MediaProcessingError(
+            f"El video dura {duration_seconds / 3600:.1f} horas y supera el "
+            f"máximo de {limit_hours} horas por proyecto."
+        )
+
+
+def _format_bytes(size: int) -> str:
+    if size >= 1024**3:
+        return f"{size / 1024**3:.0f} GB"
+    return f"{max(1, size // (1024**2))} MB"
+
+
+def _check_free_disk_space(path: Path) -> None:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError as error:
+        # No se pudo comprobar (ruta inexistente, permiso): no bloquear el
+        # procesamiento por una comprobación de diagnóstico.
+        logger.warning("No se pudo comprobar el espacio libre en disco: %s", error)
+        return
+    required = min(
+        _MIN_FREE_DISK_BYTES, int(usage.total * _MIN_FREE_DISK_FRACTION)
+    )
+    if usage.free < required:
+        raise MediaProcessingError(
+            f"Queda menos de {_format_bytes(required)} de espacio libre en "
+            "disco. Libera espacio antes de procesar el video."
+        )
+
+
+def _transcript_cache_matches(
+    metadata: dict[str, Any],
+    project_config: ProjectConfig,
+    settings: AppSettings,
+) -> bool:
+    """La transcripción guardada solo se reutiliza si se hizo con el mismo
+    modelo e idioma de Whisper que la configuración actual (A6). Las
+    transcripciones guardadas antes de v1.0.11 no registran estos datos y
+    se reutilizan tal cual: no se puede saber con qué se hicieron y
+    forzar una retranscripción en cada reproceso sería un coste
+    inesperado para el usuario."""
+    cached_model = metadata.get("whisper_model")
+    if cached_model is not None and cached_model != (
+        project_config.whisper_model or settings.whisper_model
+    ):
+        return False
+    cached_language = metadata.get("whisper_language")
+    if (
+        cached_language is not None
+        and cached_language != project_config.whisper_language
+    ):
+        return False
+    return True
+
+
+def _swap_staged_clips(project_dir: Path, staging_dir: Path) -> None:
+    """Publica los clips renderizados en staging de forma atómica (A1).
+
+    Solo se llama cuando al menos un clip nuevo quedó listo. El directorio
+    viejo se aparta a clips.old/, el nuevo ocupa su lugar y luego se borra
+    el respaldo. Si el swap falla a medias, se restauran los clips viejos.
+    Un clips.old/ huérfano de un swap anterior que terminó bien se borra;
+    si clips/ no existe pero el respaldo sí (swap interrumpido), el
+    respaldo se restaura antes de continuar.
+    """
+    output_dir = project_dir / "clips"
+    backup_dir = project_dir / "clips.old"
+    if not staging_dir.exists():
+        return
+    if output_dir.exists() and backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    elif not output_dir.exists() and backup_dir.exists():
+        os.replace(backup_dir, output_dir)
+    try:
+        if output_dir.exists():
+            os.replace(output_dir, backup_dir)
+        os.replace(staging_dir, output_dir)
+    except OSError:
+        if backup_dir.exists() and not output_dir.exists():
+            os.replace(backup_dir, output_dir)
+        raise
+    if backup_dir.exists():
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as error:
+            # El swap ya terminó bien; el respaldo huérfano se limpia en
+            # el próximo reproceso. No merece fallar el proyecto.
+            logger.warning(
+                "No se pudo borrar el respaldo de clips %s: %s", backup_dir, error
+            )
 
 
 def _publish(
@@ -158,7 +304,10 @@ def _propose_valid_clips(
     project: ProjectConfig,
     duration: float,
     llm: ResolvedLLM,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[ClipProposal]:
+    if should_cancel is not None and should_cancel():
+        raise ProjectCancelled()
     if duration <= _LLM_WINDOW_SECONDS:
         return _propose_valid_window(transcript, project, duration, llm)
 
@@ -168,6 +317,8 @@ def _propose_valid_clips(
     window_start = 0.0
     window_index = 0
     while window_start < duration:
+        if should_cancel is not None and should_cancel():
+            raise ProjectCancelled()
         window_end = min(duration, window_start + _LLM_WINDOW_SECONDS)
         window_transcript = _slice_transcript(transcript, window_start, window_end)
         window_duration = window_end - window_start
@@ -175,7 +326,17 @@ def _propose_valid_clips(
             window_proposals = _propose_valid_window(
                 window_transcript, project, window_duration, llm
             )
-        except MediaProcessingError as error:
+        except (
+            MediaProcessingError,
+            LLMResponseError,
+            # Errores de parseo/JSON del LLM: LLMResponseError es el tipo
+            # canónico desde v1.0.11; ValueError/TypeError cubren las
+            # respuestas sin JSON válido que aún se propagan como errores
+            # de parseo crudos. Un fallo en una ventana se registra y se
+            # sigue con las restantes en vez de abortar el proyecto (A3).
+            ValueError,
+            TypeError,
+        ) as error:
             errors.append(f"ventana {window_index + 1}: {error}")
             logger.warning("Se omite una ventana de transcripción: %s", errors[-1])
             window_proposals = []
@@ -390,9 +551,16 @@ def _render_projects(
     ffmpeg_path: str,
     owner_id: str,
     existing_clips: list[dict[str, Any]] | None = None,
+    output_dir: Path | None = None,
+    persist_clips: bool = True,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
+    # Los parámetros nuevos van al final y se pasan por posición desde
+    # process_project: algunos tests sustituyen esta función por un mock
+    # que acepta *args pero no kwargs.
     project_dir = input_path.parent
-    output_dir = project_dir / "clips"
+    if output_dir is None:
+        output_dir = project_dir / "clips"
     output_dir.mkdir(parents=True, exist_ok=True)
     proposal_records = [
         {
@@ -414,6 +582,9 @@ def _render_projects(
         return rendered
 
     for index, record in enumerate(proposal_records):
+        if should_cancel is not None and should_cancel():
+            # Se conservan los clips ya renderizados en esta tanda.
+            raise ProjectCancelled(rendered)
         clip_id = str(record["id"])
         proposal = ClipProposal.model_validate(record["proposal"])
         output_path = output_dir / f"{clip_id}.mp4"
@@ -543,7 +714,12 @@ def _render_projects(
         rendered = [item for item in rendered if str(item.get("id")) != clip_id]
         rendered.append(clip)
         rendered.sort(key=lambda item: float(item.get("start") or 0))
-        database.update_project(settings.database_path, project_id, clips=rendered)
+        if persist_clips:
+            # Al renderizar en staging (reproceso completo) no se toca
+            # clips_json hasta el swap: si el reproceso falla, los clips
+            # viejos siguen publicados. En el reintento de fallidos se
+            # renderiza directo en clips/ y sí se persiste por clip.
+            database.update_project(settings.database_path, project_id, clips=rendered)
     return rendered
 
 
@@ -557,11 +733,16 @@ def process_project(
     settings = settings or get_settings()
     project_dir = settings.data_dir / "projects" / project_id
     input_path = project_dir / "source"
-    output_dir = project_dir / "clips"
+
+    def should_cancel() -> bool:
+        return _is_cancelled(settings, project_id)
+
     try:
         stored = database.get_project(settings.database_path, project_id)
         if stored is None or not input_path.is_file():
             raise ProjectNotFoundError("No se encontró el video guardado para este proyecto.")
+        _check_not_cancelled(settings, project_id)
+        _check_free_disk_space(project_dir)
         project_config = ProjectConfig.model_validate(stored["config"])
         llm = None if retry_failed_only else resolve_llm(request_llm, settings)
         ffmpeg_path = shutil.which("ffmpeg")
@@ -573,13 +754,16 @@ def process_project(
 
         stored_metadata = stored.get("metadata")
         stored_transcript = stored.get("transcript")
-        if (
+        transcript_cache_valid = (
             isinstance(stored_metadata, dict)
             and stored_metadata.get("duration")
             and isinstance(stored_transcript, list)
             and stored_transcript
-        ):
+            and _transcript_cache_matches(stored_metadata, project_config, settings)
+        )
+        if transcript_cache_valid:
             metadata = stored_metadata
+            _check_video_duration(float(metadata["duration"]))
             transcript = [
                 TranscriptSegment.model_validate(segment) for segment in stored_transcript
             ]
@@ -596,6 +780,16 @@ def process_project(
                 "Reutilizando la transcripción real guardada…",
             )
         else:
+            if (
+                isinstance(stored_metadata, dict)
+                and isinstance(stored_transcript, list)
+                and stored_transcript
+            ):
+                logger.info(
+                    "La transcripción guardada del proyecto %s se descarta porque "
+                    "cambió el modelo o el idioma de Whisper; se vuelve a transcribir.",
+                    project_id,
+                )
             _publish(
                 settings,
                 project_id,
@@ -605,6 +799,7 @@ def process_project(
                 "Leyendo metadatos y creando miniatura con ffprobe y FFmpeg…",
             )
             metadata = probe_media(input_path, ffprobe_path)
+            _check_video_duration(float(metadata["duration"]))
             project_dir.mkdir(parents=True, exist_ok=True)
             create_thumbnail(
                 input_path,
@@ -651,15 +846,23 @@ def process_project(
                 language=project_config.whisper_language,
                 on_model_download_progress=on_whisper_download_progress,
             )
+            _check_not_cancelled(settings, project_id)
             transcript_data = [segment.model_dump() for segment in transcript]
             metadata["language"] = language
+            # Se registra con qué modelo e idioma se transcribió para
+            # invalidar la caché si el usuario los cambia (A6).
+            metadata["whisper_model"] = (
+                project_config.whisper_model or settings.whisper_model
+            )
+            metadata["whisper_language"] = project_config.whisper_language
             database.update_project(
                 settings.database_path,
                 project_id,
                 metadata=metadata,
                 transcript=transcript_data,
             )
-        existing_clips = stored.get("clips") or []
+        previous_clips = stored.get("clips") or []
+        existing_clips = previous_clips
         if retry_failed_only:
             failed_ids = {
                 str(clip["id"])
@@ -699,6 +902,7 @@ def process_project(
                 project_config,
                 float(metadata["duration"]),
                 llm,
+                should_cancel,
             )
             proposal_records = [
                 {
@@ -713,7 +917,7 @@ def process_project(
                 settings.database_path, project_id, metadata=metadata
             )
             if not proposals:
-                database.update_project(settings.database_path, project_id, clips=[])
+                # No se toca clips_json: los clips anteriores se conservan.
                 _publish(
                     settings,
                     project_id,
@@ -723,46 +927,161 @@ def process_project(
                     "El análisis terminó. No se encontraron momentos que cumplan los criterios solicitados.",
                 )
                 return
-            existing_clips = []
-            if output_dir.exists():
-                shutil.rmtree(output_dir)
 
-        clips = _render_projects(
-            settings,
-            project_id,
-            input_path,
-            project_config,
-            proposal_records,
-            transcript,
-            ffmpeg_path,
-            str(stored["owner_id"]),
-            existing_clips,
-        )
-        database.update_project(settings.database_path, project_id, clips=clips)
+        if retry_failed_only:
+            # El reintento renderiza directo en clips/ y persiste por clip:
+            # solo repone los fallidos, sin tocar los que ya estaban listos.
+            clips = _render_projects(
+                settings,
+                project_id,
+                input_path,
+                project_config,
+                proposal_records,
+                transcript,
+                ffmpeg_path,
+                str(stored["owner_id"]),
+                existing_clips,
+                None,
+                True,
+                should_cancel,
+            )
+            database.update_project(settings.database_path, project_id, clips=clips)
+        else:
+            # Reproceso completo: se renderiza en clips.new/ y solo se
+            # publica con un swap atómico si al menos un clip nuevo quedó
+            # listo. Si el reproceso falla o se cancela sin clips listos,
+            # los clips viejos y su clips_json quedan intactos (A1).
+            staging_dir = project_dir / "clips.new"
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                clips = _render_projects(
+                    settings,
+                    project_id,
+                    input_path,
+                    project_config,
+                    proposal_records,
+                    transcript,
+                    ffmpeg_path,
+                    str(stored["owner_id"]),
+                    [],
+                    staging_dir,
+                    False,
+                    should_cancel,
+                )
+            except ProjectCancelled as cancelled:
+                clips = cancelled.clips
+                ready_cancelled = [
+                    clip
+                    for clip in clips
+                    if clip.get("status", "ready") != "failed"
+                ]
+                if ready_cancelled:
+                    try:
+                        _swap_staged_clips(project_dir, staging_dir)
+                        database.update_project(
+                            settings.database_path, project_id, clips=clips
+                        )
+                    except OSError:
+                        logger.exception(
+                            "No se pudieron publicar los clips renderizados antes "
+                            "de cancelar el proyecto %s; se conservan los anteriores.",
+                            project_id,
+                        )
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+                else:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                _publish(
+                    settings,
+                    project_id,
+                    "cancelled",
+                    "cancelled",
+                    None,
+                    "Procesamiento cancelado. Se conservaron los clips ya renderizados.",
+                )
+                return
+            except Exception:
+                # Un fallo inesperado del render no debe dejar un staging
+                # huérfano ni tocar los clips viejos.
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                raise
+            ready_clips = [
+                clip for clip in clips if clip.get("status", "ready") != "failed"
+            ]
+            if ready_clips:
+                try:
+                    _swap_staged_clips(project_dir, staging_dir)
+                except OSError as error:
+                    # Los clips se renderizaron pero no se pudieron
+                    # publicar; los viejos quedaron restaurados por el swap.
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                    raise MediaProcessingError(
+                        "Los clips se renderizaron, pero no se pudieron publicar "
+                        "en la carpeta del proyecto. Los clips anteriores se "
+                        "conservaron. Inténtalo de nuevo."
+                    ) from error
+                database.update_project(settings.database_path, project_id, clips=clips)
+            else:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                if not previous_clips:
+                    # Primer procesamiento sin clips previos: se guardan
+                    # los fallidos para que el reintento pueda recuperarlos
+                    # sin volver a llamar a la IA.
+                    database.update_project(
+                        settings.database_path, project_id, clips=clips
+                    )
+                # Con clips previos, clips_json queda intacto: los viejos
+                # siguen publicados.
         scheduled_count = 0
+        schedule_warning: str | None = None
         scheduled_clips = [
             clip for clip in clips if clip.get("status", "ready") != "failed"
         ]
         if project_config.schedule is not None and scheduled_clips:
-            jobs = database.enqueue_schedule_jobs(
-                settings.database_path,
-                project_id,
-                [str(clip["id"]) for clip in scheduled_clips],
-                project_config.schedule.platform,
-                project_config.schedule.scheduled_at.isoformat(),
-                project_config.schedule.visibility,
-            )
-            scheduled_count = len(jobs)
+            # La programación está desacoplada del estado del proyecto
+            # (A7): si falla, el proyecto completa con una advertencia en
+            # vez de marcarse como fallido con los clips ya listos.
+            try:
+                jobs = database.enqueue_schedule_jobs(
+                    settings.database_path,
+                    project_id,
+                    [str(clip["id"]) for clip in scheduled_clips],
+                    project_config.schedule.platform,
+                    project_config.schedule.scheduled_at.isoformat(),
+                    project_config.schedule.visibility,
+                )
+                scheduled_count = len(jobs)
+            except Exception as error:
+                logger.exception(
+                    "No se pudieron programar las publicaciones del proyecto %s",
+                    project_id,
+                )
+                schedule_warning = (
+                    "No se pudieron programar las publicaciones "
+                    f"({str(error).strip() or 'error desconocido'}). Los clips "
+                    "están listos; programa las publicaciones de nuevo desde la app."
+                )
         ready_count = len(scheduled_clips)
         failed_count = len(clips) - ready_count
         if not ready_count and failed_count:
+            if previous_clips and not retry_failed_only:
+                failure_message = (
+                    f"No se pudo renderizar ninguno de los {failed_count} clips nuevos. "
+                    "Se conservaron los clips anteriores."
+                )
+            else:
+                failure_message = (
+                    f"No se pudo renderizar ninguno de los {failed_count} clips. "
+                    "Puedes reintentarlos."
+                )
             _publish(
                 settings,
                 project_id,
                 "failed",
                 "failed",
                 None,
-                f"No se pudo renderizar ninguno de los {failed_count} clips. Puedes reintentarlos.",
+                failure_message,
             )
             return
         completion_message = f"Procesamiento terminado: {ready_count} clips reales listos."
@@ -772,6 +1091,13 @@ def process_project(
             )
         if scheduled_count:
             completion_message += f" {scheduled_count} publicaciones quedaron programadas."
+        if schedule_warning is not None:
+            completion_message += f" Advertencia: {schedule_warning}"
+            metadata = dict(metadata or {})
+            metadata["schedule_warning"] = schedule_warning
+            database.update_project(
+                settings.database_path, project_id, metadata=metadata
+            )
         _publish(
             settings,
             project_id,
@@ -779,6 +1105,16 @@ def process_project(
             "finalize",
             100,
             completion_message,
+        )
+    except ProjectCancelled:
+        logger.info("Procesamiento cancelado del proyecto %s", project_id)
+        _publish(
+            settings,
+            project_id,
+            "cancelled",
+            "cancelled",
+            None,
+            "Procesamiento cancelado por el usuario.",
         )
     except Exception as error:
         logger.exception("Fallo inesperado al procesar el proyecto %s", project_id)

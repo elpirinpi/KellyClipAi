@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { AlertCircle, Check, Circle, FileVideo2, LoaderCircle, WandSparkles } from 'lucide-react';
-import { getSupabase } from '../auth';
+import { AlertCircle, Check, Circle, FileVideo2, LoaderCircle, WandSparkles, X } from 'lucide-react';
+import { apiFetch, getSupabase } from '../auth';
 import type { ProjectResult, SharedClip } from '../types';
 import { formatDuration, responseError } from '../utils';
 
@@ -112,12 +112,42 @@ export function ProcessingPage({
   project,
   error,
   onRetry,
+  onCancelled,
 }: {
   apiBase: string;
   project: ProjectResult | null;
   error: string;
   onRetry: () => void;
+  onCancelled: (project: ProjectResult) => void;
 }) {
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelMessage, setCancelMessage] = useState('');
+
+  const cancelProcessing = async () => {
+    if (!project || cancelling) return;
+    setCancelling(true);
+    setCancelMessage('');
+    try {
+      const response = await apiFetch(`${apiBase}/api/projects/${project.id}/cancel`, { method: 'POST' });
+      if (response.status === 409) {
+        setCancelMessage('El procesamiento ya no se puede cancelar: es posible que ya haya terminado. Actualiza la página para ver el estado actual.');
+        return;
+      }
+      if (!response.ok) throw new Error(await responseError(response));
+      const cancelled: unknown = await response.json();
+      if (typeof cancelled !== 'object' || cancelled === null
+        || typeof (cancelled as { id?: unknown }).id !== 'string'
+        || typeof (cancelled as { status?: unknown }).status !== 'string') {
+        throw new Error('El servidor devolvió una respuesta inesperada al cancelar.');
+      }
+      onCancelled(cancelled as ProjectResult);
+    } catch (cancelError) {
+      setCancelMessage(cancelError instanceof Error ? cancelError.message : 'No se pudo cancelar el procesamiento.');
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   const steps = [
     { key: 'upload', label: 'Subida' },
     { key: 'project', label: 'Crear proyecto' },
@@ -130,6 +160,8 @@ export function ProcessingPage({
     ? 2
     : Math.max(0, steps.findIndex((step) => step.key === project?.step));
   const details = project?.metadata;
+  const cancellable = project?.status === 'queued' || project?.status === 'processing';
+  const cancelled = project?.status === 'cancelled';
 
   return (
     <main className="processing-page">
@@ -150,15 +182,18 @@ export function ProcessingPage({
         <div className="processing-heading">
           <WandSparkles size={25} />
           <div>
-            <h1>Analizando contenido y encontrando clips</h1>
-            <p>Permanece en la página mientras el video se procesa.</p>
+            <h1>{cancelled ? 'Procesamiento cancelado' : 'Analizando contenido y encontrando clips'}</h1>
+            <p>{cancelled
+              ? 'Puedes reprocesar el proyecto cuando quieras, con la misma configuración.'
+              : 'Permanece en la página mientras el video se procesa.'}</p>
           </div>
         </div>
         {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}
+        {cancelMessage && <p className="error-message" role="alert"><AlertCircle size={16} />{cancelMessage}</p>}
         <ol className="processing-steps">
           {steps.map((step, index) => {
             const complete = index < activeIndex || project?.status === 'completed';
-            const current = index === activeIndex && project?.status !== 'completed' && project?.status !== 'failed';
+            const current = index === activeIndex && project?.status !== 'completed' && project?.status !== 'failed' && !cancelled;
             const failed = index === activeIndex && project?.status === 'failed';
             const editingProgress = project?.progress == null || project.message?.includes('%')
               ? ''
@@ -178,6 +213,15 @@ export function ProcessingPage({
         </ol>
         {(project?.status === 'failed' || error) && (
           <button type="button" className="retry-button" onClick={onRetry}><WandSparkles size={16} /> Reintentar</button>
+        )}
+        {cancellable && (
+          <button type="button" className="cancel-processing-button" onClick={() => void cancelProcessing()} disabled={cancelling}>
+            {cancelling ? <LoaderCircle size={15} className="spin" /> : <X size={15} />}
+            {cancelling ? 'Cancelando…' : 'Cancelar procesamiento'}
+          </button>
+        )}
+        {cancelled && (
+          <button type="button" className="retry-button" onClick={onRetry}><WandSparkles size={16} /> Reprocesar</button>
         )}
       </section>
     </main>

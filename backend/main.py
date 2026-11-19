@@ -69,9 +69,10 @@ from .integrations import (
 from .llm import LLMConfigurationError, resolve_llm
 from .media import MediaProcessingError, format_subtitles
 from .pipeline import process_project
-from .process_queue import ProjectProcessingQueue
+from .process_queue import ProjectProcessingQueue, request_project_cancellation
 from .scheduler import schedule_worker
 from .schemas import (
+    MAX_UPLOAD_BYTES,
     ClipArchiveRequest,
     ClipEditRequest,
     ClipResolutionRequest,
@@ -109,6 +110,17 @@ _STAGED_SUFFIXES = _VIDEO_SUFFIXES | _AUDIO_SUFFIXES
 _STAGED_WRITE_SIZE = 1024 * 1024
 _STAGING_MAX_AGE = timedelta(hours=24)
 logger = logging.getLogger(__name__)
+
+
+class _StagedDownloadCancelled(RuntimeError):
+    """El usuario canceló una descarga staged mientras estaba en curso.
+
+    Se lanza desde el hook de progreso de yt-dlp (que propaga las
+    excepciones sin atraparlas) para abortar la descarga; la tarea la
+    captura y limpia los archivos parciales sin marcar el staged como
+    fallido. No hereda de OSError/ValueError para que _download_video
+    no la convierta en HTTPException 422.
+    """
 
 
 class SPAStaticFiles(StaticFiles):
@@ -233,6 +245,23 @@ def _download_video(
         ) from error
 
 
+def _staged_download_cancelled(settings: AppSettings, staged_id: str) -> bool:
+    """El staged fue cancelado/borrado mientras se descargaba.
+
+    El borrado marca el staged como 'deleting' y luego elimina la fila;
+    en ambos casos la descarga debe abortar y limpiar en vez de
+    completar el staged.
+    """
+    staged = database.get_staged_media(settings.database_path, staged_id)
+    return staged is None or staged["status"] == "deleting"
+
+
+def _cleanup_staged_download(settings: AppSettings, staged_id: str) -> None:
+    staging_dir = settings.data_dir / "staging" / staged_id
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    (settings.data_dir / "staging" / f"{staged_id}.source").unlink(missing_ok=True)
+
+
 def _download_staged_media(settings: AppSettings, staged_id: str, url: str) -> None:
     staging_dir = settings.data_dir / "staging" / staged_id
     last_progress_at = 0.0
@@ -251,6 +280,14 @@ def _download_staged_media(settings: AppSettings, staged_id: str, url: str) -> N
             and downloaded - last_progress_bytes < 4 * _STAGED_WRITE_SIZE
         ):
             return
+        # Aborto temprano: si el usuario canceló la descarga, yt-dlp
+        # propaga esta excepción y la tarea limpia los parciales. Si
+        # algún día yt-dlp la tragara, el chequeo posterior a la descarga
+        # seguiría impidiendo que el staged se completara.
+        if _staged_download_cancelled(settings, staged_id):
+            raise _StagedDownloadCancelled(
+                f"Descarga staged {staged_id} cancelada por el usuario."
+            )
         speed_value = data.get("speed")
         eta_value = data.get("eta")
         database.update_staged_media(
@@ -266,6 +303,15 @@ def _download_staged_media(settings: AppSettings, staged_id: str, url: str) -> N
 
     try:
         downloaded, title = _download_video(url, staging_dir, report_progress)
+        if _staged_download_cancelled(settings, staged_id):
+            # El usuario canceló mientras descargaba (o el hook no llegó
+            # a abortar a tiempo): limpiar sin completar el staged.
+            logger.info(
+                "Descarga staged %s cancelada; se descartan los archivos.",
+                staged_id,
+            )
+            _cleanup_staged_download(settings, staged_id)
+            return
         staged_path = settings.data_dir / "staging" / f"{staged_id}.source"
         shutil.move(str(downloaded), staged_path)
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -283,7 +329,16 @@ def _download_staged_media(settings: AppSettings, staged_id: str, url: str) -> N
             eta=None,
             error=None,
         )
+    except _StagedDownloadCancelled:
+        logger.info("Descarga staged %s cancelada por el usuario.", staged_id)
+        _cleanup_staged_download(settings, staged_id)
     except Exception as error:
+        if _staged_download_cancelled(settings, staged_id):
+            # La descarga falló a la vez que el usuario la cancelaba:
+            # limpiar sin marcarla como fallida (la fila ya no existe o
+            # está en 'deleting' y el borrado la eliminará).
+            _cleanup_staged_download(settings, staged_id)
+            return
         logger.exception("No se pudo completar la descarga staged %s", staged_id)
         detail = error.detail if isinstance(error, HTTPException) else str(error)
         database.update_staged_media(
@@ -672,6 +727,7 @@ def create_app(
     def settings_status(request: Request) -> dict:
         user_id = request_user_id(request)
         credentials = database.get_llm_credentials(app_settings.database_path, user_id)
+        saved_whisper_model = credentials.get("whisper_model") if credentials else None
         return {
             "provider": credentials["provider"] if credentials else app_settings.llm_provider,
             "model": credentials["model"] if credentials else app_settings.llm_model,
@@ -679,7 +735,9 @@ def create_app(
             "has_llm_key": credentials is not None or bool(app_settings.llm_api_key),
             "has_saved_llm_key": credentials is not None,
             "has_env_llm_key": bool(app_settings.llm_api_key),
-            "whisper_model": app_settings.whisper_model,
+            # El modelo Whisper guardado en Ajustes manda; si nunca se
+            # guardó, se usa el de entorno (WHISPER_MODEL).
+            "whisper_model": saved_whisper_model or app_settings.whisper_model,
             "integrations": integration_status(
                 app_settings,
                 app_settings.database_path,
@@ -720,6 +778,11 @@ def create_app(
                 encrypted,
                 payload.model.strip(),
                 payload.base_url.strip(),
+                # Guardar en Ajustes es una elección explícita del usuario:
+                # las migraciones no reescribirán este modelo (B21).
+                model_customized=True,
+                # whisper_model None = sin cambio (el cliente no lo envió).
+                whisper_model=payload.whisper_model,
             )
         except CredentialStoreError as error:
             raise HTTPException(status_code=500, detail=str(error)) from error
@@ -1250,8 +1313,26 @@ def create_app(
         project_dir.mkdir(parents=True, exist_ok=False)
         input_path = project_dir / "source"
         try:
+            # Copia por bloques contando bytes: la subida no declara su
+            # tamaño por adelantado y un video mayor que MAX_UPLOAD_BYTES
+            # se rechaza con 413 en cuanto supera el límite, sin esperar
+            # a copiarlo entero ni llenar el disco (A2).
+            bytes_written = 0
             with input_path.open("wb") as target:
-                shutil.copyfileobj(file.file, target, length=1024 * 1024)
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    bytes_written += len(chunk)
+                    if bytes_written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                "El video supera el tamaño máximo de "
+                                f"{MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)} GB por proyecto."
+                            ),
+                        )
+                    target.write(chunk)
             database.create_project(
                 app_settings.database_path,
                 project_id,
@@ -1329,9 +1410,15 @@ def create_app(
         project_path = project_root / project_id
         if not project_path.resolve().is_relative_to(project_root):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
-        staged_ids = database.delete_project(
-            app_settings.database_path, project_id, owner_id
-        )
+        try:
+            staged_ids = database.delete_project(
+                app_settings.database_path, project_id, owner_id
+            )
+        except database.ProjectBusyError as error:
+            # El proyecto empezó a procesarse entre la comprobación de
+            # estado y el borrado: la guarda atómica de delete_project
+            # lo impidió. Para borrarlo hay que cancelarlo primero.
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if staged_ids is None:
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         try:
@@ -1412,6 +1499,22 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
         except LLMConfigurationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+        except ValidationError as error:
+            # Las credenciales guardadas o el entorno pueden traer una
+            # base_url que el validador actual rechaza (p. ej. un
+            # servidor local en LAN http://192.168.x.x): es un error de
+            # configuración, no un 500. Se devuelve 422 con el motivo.
+            details = "; ".join(
+                f"{'.'.join(str(part) for part in item.get('loc', ()))}: {item.get('msg', '')}"
+                for item in error.errors()[:3]
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "La configuración del proveedor de IA no es válida"
+                    f"{f': {details}' if details else ''}. Revísala en Ajustes."
+                ),
+            ) from error
         if any(
             job["status"] in {"scheduled", "processing"}
             for job in database.list_schedule_jobs(
@@ -1478,6 +1581,59 @@ def create_app(
                 detail="La cola de procesamiento no está disponible. Inténtalo de nuevo.",
             ) from error
         return {"project_id": project_id, "status": "queued"}
+
+    @application.post("/api/projects/{project_id}/cancel")
+    async def cancel_project(project_id: str, request: Request) -> dict:
+        """Cancela un procesamiento en curso (B14/B-P7).
+
+        Proyecto en cola: se saca de la cola y se marca cancelled. Proyecto
+        procesándose: cancelación cooperativa — el pipeline consulta el flag
+        y el estado persistido entre fases, se detiene pronto y conserva los
+        clips ya renderizados. Devuelve el proyecto actualizado.
+        """
+        owner_id = request_user_id(request)
+        project = database.get_project(
+            app_settings.database_path, project_id, owner_id
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] not in {"queued", "processing"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Este proyecto no se está procesando.",
+            )
+        # Primero el flag en memoria (el pipeline lo consulta entre fases)
+        # y luego el estado persistido, que es la fuente de verdad.
+        request_project_cancellation(project_id)
+        processing_queue: ProjectProcessingQueue | None = getattr(
+            application.state, "processing_queue", None
+        )
+        if processing_queue is not None:
+            processing_queue.discard_queued(project_id)
+        database.update_project(
+            app_settings.database_path,
+            project_id,
+            status="cancelled",
+            step="cancelled",
+            progress=project.get("progress"),
+            error=None,
+        )
+        database.publish_event(
+            app_settings.database_path,
+            project_id,
+            "progress",
+            {
+                "status": "cancelled",
+                "step": "cancelled",
+                "progress": project.get("progress"),
+                "message": "Procesamiento cancelado.",
+            },
+        )
+        updated = database.get_project(
+            app_settings.database_path, project_id, owner_id
+        )
+        assert updated is not None
+        return _serialize_project(updated)
 
     @application.post(
         "/api/projects/{project_id}/retry-failed-clips", status_code=202
@@ -1565,7 +1721,7 @@ def create_app(
                 status = database.get_project_status(
                     app_settings.database_path, project_id
                 )
-                if status is None or status in {"completed", "failed"}:
+                if status is None or status in {"completed", "failed", "cancelled"}:
                     break
                 if await request.is_disconnected():
                     break

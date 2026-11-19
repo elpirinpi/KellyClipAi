@@ -1,20 +1,6 @@
 @import "tailwindcss";
 
-@font-face {
-  font-family: "Inter";
-  src: url("https://cdn-docs.vizard.ai/fonts/page/Inter-Regular.ttf") format("truetype");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Inter";
-  src: url("https://cdn-docs.vizard.ai/fonts/page/Inter-Medium.ttf") format("truetype");
-  font-style: normal;
-  font-weight: 500 700;
-  font-display: swap;
-}
+/* Inter se empaqueta localmente con @fontsource/inter (ver src/main.tsx). */
 
 @theme {
   --font-sans: "Inter", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -540,4 +526,40 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
   .shared-page { width: calc(100% - 28px); margin-top: 14px; }
   .shared-card { padding: 14px; }
   .shared-card h1 { font-size: 17px; }
+}
+
+/* Toasts auto-descartables (éxito/error/info), apilados abajo a la derecha. */
+.toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 60; display: flex; flex-direction: column; gap: 8px; width: min(360px, calc(100vw - 36px)); }
+.toast { display: flex; align-items: flex-start; gap: 9px; padding: 12px 12px 12px 14px; border-radius: 10px; border: 1px solid #e9eaf0; background: #fff; box-shadow: 0 8px 26px #151b2a1f; font-size: 12px; line-height: 1.5; color: #3c4659; }
+.toast svg { flex: 0 0 auto; margin-top: 1px; }
+.toast span { flex: 1; min-width: 0; }
+.toast button { flex: 0 0 auto; border: 0; background: transparent; padding: 2px; border-radius: 6px; color: #788195; cursor: pointer; }
+.toast button:hover { background: #f3f2f8; color: #3c4659; }
+.toast-success { border-color: #bbe7c9; background: #effbf3; color: #146c33; }
+.toast-success svg { color: #15803d; }
+.toast-error { border-color: #f3c2bd; background: #fff3f1; color: #9c1f16; }
+.toast-error svg { color: #b42318; }
+.toast-info { border-color: #e7e0fa; background: #faf8ff; color: #5b4b8f; }
+.toast-info svg { color: #7c5cff; }
+
+/* Error Boundary: pantalla amigable en vez de una página en blanco. */
+.error-boundary-page { min-height: 100vh; display: grid; place-items: center; padding: 32px 18px; background: #f6f7fb; }
+.error-boundary-card { width: min(480px, 100%); padding: 32px 28px; border: 1px solid #e9eaf0; border-radius: 14px; background: #fff; box-shadow: 0 5px 22px #151b2a0d; text-align: center; }
+.error-boundary-card h1 { margin: 0 0 10px; color: #232836; font-size: 22px; font-weight: 600; }
+.error-boundary-card p { margin: 0 0 22px; color: #6e788e; font-size: 13px; line-height: 1.6; }
+.error-boundary-actions { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.error-boundary-actions .create-button { width: 100%; }
+.error-boundary-actions .subtle-button { height: 38px; padding: 0 16px; }
+
+/* Cancelar descarga por enlace. */
+.cancel-download-button { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; padding: 6px 10px; border: 1px solid #f3c2bd; border-radius: 7px; background: #fff; color: #b42318; font-size: 12px; cursor: pointer; }
+.cancel-download-button:hover { background: #fff3f1; }
+
+/* Cancelar procesamiento en curso. */
+.cancel-processing-button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; margin-top: 14px; padding: 0 14px; border: 1px solid #f3c2bd; border-radius: 8px; background: #fff; color: #b42318; font-size: 12px; cursor: pointer; }
+.cancel-processing-button:hover:not(:disabled) { background: #fff3f1; }
+.cancel-processing-button:disabled { opacity: .6; cursor: wait; }
+
+@media (max-width: 482px) {
+  .toast-stack { right: 12px; bottom: 12px; width: calc(100vw - 24px); }
 }

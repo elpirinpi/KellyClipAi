@@ -15,7 +15,16 @@ from typing import Any
 _RELEASE_URL = "https://api.github.com/repos/elpirinpi/KellyClipAi/releases/latest"
 _MAX_INSTALLER_SIZE = 1024 * 1024 * 1024
 _VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+_INSTALLER_NAME_PATTERN = re.compile(r"^KellyClipAi-Setup-.*\.exe(\.part)?$")
 logger = logging.getLogger(__name__)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class UpdateError(RuntimeError):
@@ -223,6 +232,7 @@ class UpdateManager:
             if digest.hexdigest() != release["sha256"]:
                 raise UpdateError("La verificación SHA-256 del instalador falló.")
             os.replace(temporary, target)
+            self._cleanup_old_installers(keep=target)
             with self._lock:
                 self._status.update(
                     state="downloaded",
@@ -251,12 +261,51 @@ class UpdateManager:
                     progress=0,
                 )
 
+    def _cleanup_old_installers(self, keep: Path) -> None:
+        """Borra instaladores de versiones anteriores del directorio de
+        updates, conservando solo el descargado actual (`keep`).
+
+        Solo se tocan archivos con el nombre de nuestros instaladores
+        (KellyClipAi-Setup-*.exe y sus .part); cualquier otro archivo del
+        directorio se deja intacto. La limpieza es best-effort: un archivo
+        bloqueado (p. ej. en uso) se registra y se sigue con los demás.
+        """
+        try:
+            entries = list(self.update_dir.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if entry.resolve() == keep.resolve():
+                continue
+            if not _INSTALLER_NAME_PATTERN.fullmatch(entry.name):
+                continue
+            try:
+                entry.unlink()
+            except OSError:
+                logger.warning(
+                    "No se pudo borrar el instalador antiguo %s", entry.name
+                )
+
     def open_installer(self) -> None:
         if not self.enabled or self._latest is None:
             raise UpdateError("No hay una actualización lista para instalar.")
         installer = self.update_dir / self._latest["asset_name"]
         if self.status()["state"] not in {"downloaded", "installer_opened"} or not installer.is_file():
             raise UpdateError("Descarga primero el instalador de la actualización.")
+        # Re-verificar el SHA-256 inmediatamente antes de ejecutar: el
+        # archivo pudo modificarse o corromperse después de la descarga.
+        expected_sha256 = str(self._latest.get("sha256", "")).lower()
+        try:
+            actual_sha256 = _sha256_file(installer)
+        except OSError as error:
+            raise UpdateError(
+                "No se pudo leer el instalador descargado para verificarlo."
+            ) from error
+        if not expected_sha256 or actual_sha256 != expected_sha256:
+            raise UpdateError(
+                "La verificación SHA-256 del instalador falló antes de "
+                "ejecutarlo. Descarga de nuevo la actualización."
+            )
         try:
             os.startfile(str(installer))  # type: ignore[attr-defined]
         except OSError as error:

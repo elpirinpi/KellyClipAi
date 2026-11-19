@@ -7,6 +7,7 @@ import {
 import { useLocation, useMatch, useNavigate } from 'react-router-dom';
 import { apiFetch } from './auth';
 import { AuthPage, ProcessingPage, SharedClipPage } from './components/Pages';
+import { ToastStack, useToasts, type ToastKind } from './components/Toasts';
 import { useAuth } from './hooks/useAuth';
 import { ACCEPT, pollStagedMedia, useImport } from './hooks/useImport';
 import { useProjects } from './hooks/useProjects';
@@ -48,7 +49,7 @@ declare global {
 
 function defaultModelFor(provider: string): string {
   return {
-    Groq: 'openai/gpt-oss-120b',
+    Groq: 'qwen/qwen3.8-27b',
     OpenAI: 'gpt-4o-mini',
     Anthropic: 'claude-3-7-sonnet-latest',
     OpenRouter: 'openai/gpt-4o-mini',
@@ -109,6 +110,28 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(unit > 0 && value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
+// Las descargas canceladas por el usuario no se reanudan automáticamente
+// durante la sesión (resumeDownload las omitiría en caso contrario).
+function cancelledStagedKey(stagedId: string): string {
+  return `kellyclipai-cancelled-staged:${stagedId}`;
+}
+
+function wasLinkDownloadCancelled(stagedId: string): boolean {
+  try {
+    return sessionStorage.getItem(cancelledStagedKey(stagedId)) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function markLinkDownloadCancelled(stagedId: string): void {
+  try {
+    sessionStorage.setItem(cancelledStagedKey(stagedId), '1');
+  } catch {
+    // Sin almacenamiento de sesión disponible: la cancelación local sigue vigente.
+  }
+}
+
 function App() {
   const location = useLocation();
   const routerNavigate = useNavigate();
@@ -116,6 +139,9 @@ function App() {
   const [link, setLink] = useState('');
   const [linkMessage, setLinkMessage] = useState('');
   const [downloadProgress, setDownloadProgress] = useState<StagedMedia | null>(null);
+  // Controla el polling de la descarga por enlace: se detiene al navegar
+  // a otra vista, al desmontar y al pulsar "Cancelar descarga".
+  const linkDownloadRef = useRef({ active: false, cancelled: false, stagedId: '' });
   const [ratio, setRatio] = useState('9:16');
   const [duration, setDuration] = useState('Cualquiera');
   const [framing, setFraming] = useState<'speaker' | 'split' | 'blur' | 'center'>('speaker');
@@ -137,13 +163,15 @@ function App() {
   const [scheduleDate, setScheduleDate] = useState('');
   const [schedulePlatform, setSchedulePlatform] = useState('youtube');
   const [scheduleVisibility, setScheduleVisibility] = useState('private');
-  const [notice, setNotice] = useState('');
+  const { toasts, pushToast, dismissToast } = useToasts();
+  const notify = useCallback((message: string, kind: ToastKind = 'info') => pushToast(message, kind), [pushToast]);
+  const onSessionError = useCallback((message: string) => notify(message, 'error'), [notify]);
   const {
     authReady,
     authSession,
     configurationError: authConfigurationError,
     signOut: signOutCurrentUser,
-  } = useAuth(API_BASE, setNotice);
+  } = useAuth(API_BASE, onSessionError);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [settingsProvider, setSettingsProvider] = useState('Groq');
   const [whisperModel, setWhisperModel] = useState('small');
@@ -187,7 +215,7 @@ function App() {
     authReady: authReady && Boolean(authSession),
     userId: currentUserId,
     onImportStart: clearLinkProject,
-    onNotice: setNotice,
+    onNotice: notify,
   });
 
   useEffect(() => {
@@ -259,7 +287,6 @@ function App() {
 
   const navigate = useCallback((next: string) => {
     routerNavigate(next);
-    setNotice('');
     if (next === '/') setLinkProject(null);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [routerNavigate]);
@@ -281,7 +308,7 @@ function App() {
         }));
       })
       .catch((error: unknown) => {
-        if (active) setNotice(error instanceof Error ? error.message : 'No se pudieron cargar tus plantillas.');
+        if (active) notify(error instanceof Error ? error.message : 'No se pudieron cargar tus plantillas.', 'error');
       });
     return () => {
       active = false;
@@ -293,6 +320,15 @@ function App() {
     const interval = window.setInterval(() => setRecordingTime((value) => value + 1), 1000);
     return () => window.clearInterval(interval);
   }, [recording]);
+
+  // Al salir de la vista principal (o al desmontar), el polling de la
+  // descarga por enlace se detiene: no debe navegar por su cuenta.
+  useEffect(() => {
+    if (route !== '/') linkDownloadRef.current.active = false;
+    return () => {
+      linkDownloadRef.current.active = false;
+    };
+  }, [route]);
 
   const detectedPlatform = useMemo(() => {
     try {
@@ -325,14 +361,17 @@ function App() {
       if (!startResponse.ok) throw new Error(await responseError(startResponse));
       const started = await startResponse.json() as StagedMedia;
       setDownloadProgress(started);
+      linkDownloadRef.current = { active: true, cancelled: false, stagedId: started.id };
       const ready = started.status === 'ready'
         ? started
         : await pollStagedMedia(
             API_BASE,
             started.id,
             setDownloadProgress,
-            () => true,
+            () => linkDownloadRef.current.active,
           );
+      // No crear el proyecto ni navegar si el usuario canceló o ya está en otra vista.
+      if (!linkDownloadRef.current.active || window.location.pathname !== '/') return;
       const projectResponse = await apiFetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -345,9 +384,33 @@ function App() {
       setLinkMessage('Video descargado y guardado. Revisa la configuración antes de procesar.');
       navigate(`/p/${imported.id}/configure`);
     } catch (error) {
-      setLinkMessage(error instanceof Error ? error.message : 'No se pudo importar el enlace.');
+      // Si el usuario canceló, cancelLinkDownload ya puso el mensaje.
+      if (!linkDownloadRef.current.cancelled) {
+        setLinkMessage(error instanceof Error ? error.message : 'No se pudo importar el enlace.');
+      }
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const cancelLinkDownload = async () => {
+    const stagedId = linkDownloadRef.current.stagedId || downloadProgress?.id;
+    linkDownloadRef.current.active = false;
+    linkDownloadRef.current.cancelled = true;
+    if (stagedId) markLinkDownloadCancelled(stagedId);
+    setDownloadProgress(null);
+    setIsSubmitting(false);
+    setLinkMessage('Descarga cancelada. Puedes pegar otro enlace.');
+    if (!stagedId) return;
+    try {
+      const response = await apiFetch(`${API_BASE}/api/staged-media/${stagedId}`, { method: 'DELETE' });
+      // 404: el staged ya no existe; nada más que limpiar.
+      if (!response.ok && response.status !== 404) throw new Error(await responseError(response));
+    } catch {
+      // El endpoint actual no admite borrar una descarga en curso (409):
+      // el servidor puede seguir descargando en segundo plano, pero el
+      // seguimiento local quedó detenido y no se reanudará automáticamente.
+      setLinkMessage('Descarga detenida en esta pantalla. El servidor puede seguir descargando en segundo plano; no se reanudará automáticamente.');
     }
   };
 
@@ -403,7 +466,6 @@ function App() {
     const source = presets.find((item) => item.name === activeTemplate) ?? templates[0];
     const name = templateName.trim() || `Mi estilo ${savedTemplates.length + 1}`;
     setSavingTemplate(true);
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/templates`, {
         method: 'POST',
@@ -419,9 +481,9 @@ function App() {
       setSavedTemplates((items) => [...items, { ...base, name: saved.name, base_template: saved.base_template }]);
       setActiveTemplate(saved.name);
       setTemplateName('');
-      setNotice(`Se guardó “${saved.name}” y estará disponible después de recargar.`);
+      notify(`Se guardó “${saved.name}” y estará disponible después de recargar.`, 'success');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo guardar la plantilla.');
+      notify(error instanceof Error ? error.message : 'No se pudo guardar la plantilla.', 'error');
     } finally {
       setSavingTemplate(false);
     }
@@ -466,11 +528,10 @@ function App() {
   const submitProject = async () => {
     if (!linkProject && (!fileInfo || progress !== 100)) return;
     if (!linkProject && fileInfo?.kind === 'audio') {
-      setNotice('El procesamiento de clips requiere un video con pista de audio. Los archivos de solo audio no se procesan como clips de video.');
+      notify('El procesamiento de clips requiere un video con pista de audio. Los archivos de solo audio no se procesan como clips de video.', 'error');
       return;
     }
     setIsSubmitting(true);
-    setNotice('');
     setUploadError('');
     try {
       let target = linkProject;
@@ -489,11 +550,15 @@ function App() {
       navigate(`/p/${target.id}/configure`);
       await beginProjectProcessing(target.id);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo iniciar el procesamiento.');
+      notify(error instanceof Error ? error.message : 'No se pudo iniciar el procesamiento.', 'error');
     } finally {
       setIsSubmitting(false);
     }
   };
+
+  // El atajo Ctrl/Cmd+Enter llama siempre a la versión actual de submitProject.
+  const submitProjectRef = useRef(submitProject);
+  submitProjectRef.current = submitProject;
 
   useEffect(() => {
     if (!authReady || !authSession || route !== '/') return;
@@ -504,6 +569,7 @@ function App() {
         if (!latestResponse.ok) throw new Error(await responseError(latestResponse));
         const latest = await latestResponse.json() as StagedMedia | null;
         if (!active || !latest) return;
+        if (wasLinkDownloadCancelled(latest.id)) return;
         if (latest.status === 'failed') {
           setLinkMessage(latest.error ?? 'La descarga no se completó. Vuelve a intentarlo.');
           return;
@@ -511,12 +577,13 @@ function App() {
         setIsSubmitting(true);
         setDownloadProgress(latest);
         setLinkMessage('Reanudando la descarga local del enlace…');
+        linkDownloadRef.current = { active: true, cancelled: false, stagedId: latest.id };
         const ready = latest.status === 'ready'
           ? latest
           : await pollStagedMedia(API_BASE, latest.id, (staged) => {
               if (active) setDownloadProgress(staged);
-            }, () => active);
-        if (!active) return;
+            }, () => active && linkDownloadRef.current.active);
+        if (!active || !linkDownloadRef.current.active) return;
         const response = await apiFetch(`${API_BASE}/api/staged-media/${ready.id}/project`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -530,7 +597,7 @@ function App() {
         setLinkMessage('Video descargado y guardado. Revisa la configuración antes de procesar.');
         navigate(`/p/${imported.id}/configure`);
       } catch (error) {
-        if (active) {
+        if (active && !linkDownloadRef.current.cancelled) {
           setLinkMessage(error instanceof Error ? error.message : 'No se pudo reanudar la descarga.');
           setDownloadProgress(null);
         }
@@ -616,6 +683,50 @@ function App() {
     }
   };
 
+  // Atajos de teclado globales:
+  // - Espacio: play/pausa del video (solo si el foco no está en un campo
+  //   editable ni en un control que ya usa Espacio, como un botón).
+  // - Esc: cerrar los modales abiertos (salvo grabación o carga en curso).
+  // - Ctrl/Cmd+Enter: generar clips desde la vista de configuración.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (recordOpen && !recording) {
+          setRecordOpen(false);
+          return;
+        }
+        if (zoomOpen && !zoomLoading) setZoomOpen(false);
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        const onHomeOrConfigure = route === '/' || projectRouteMode === 'configure';
+        if (onHomeOrConfigure && !isSubmitting && (linkProject || progress === 100)) {
+          event.preventDefault();
+          void submitProjectRef.current();
+        }
+        return;
+      }
+      if (event.key !== ' ') return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName.toLowerCase();
+      const editable = tag === 'input' || tag === 'textarea' || tag === 'select' || Boolean(target?.isContentEditable);
+      if (editable) return;
+      if (tag === 'button' || tag === 'a' || target?.getAttribute('role') === 'button') return;
+      if (recordOpen || zoomOpen) return;
+      const focused = document.activeElement;
+      const videos = Array.from(document.querySelectorAll('video'));
+      const video = focused instanceof HTMLVideoElement
+        ? focused
+        : videos.find((item) => !item.paused && !item.ended) ?? videos[0];
+      if (!video) return;
+      event.preventDefault();
+      if (video.paused) void video.play();
+      else video.pause();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [recordOpen, zoomOpen, recording, zoomLoading, route, projectRouteMode, isSubmitting, linkProject, progress]);
+
   const openZoomImport = async () => {
     setZoomOpen(true);
     setZoomError('');
@@ -663,7 +774,7 @@ function App() {
       setProgress(null);
       navigate('/');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo cerrar la sesión.');
+      notify(error instanceof Error ? error.message : 'No se pudo cerrar la sesión.', 'error');
     }
   };
 
@@ -673,7 +784,7 @@ function App() {
       if (!response.ok) throw new Error(await responseError(response));
       setUpdateStatus(await response.json() as UpdateStatus);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo iniciar la descarga de la actualización.');
+      notify(error instanceof Error ? error.message : 'No se pudo iniciar la descarga de la actualización.', 'error');
     }
   };
 
@@ -684,7 +795,7 @@ function App() {
       if (!response.ok) throw new Error(await responseError(response));
       setUpdateStatus((current) => current ? { ...current, state: 'installer_opened' } : current);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo abrir el instalador.');
+      notify(error instanceof Error ? error.message : 'No se pudo abrir el instalador.', 'error');
     }
   };
 
@@ -696,7 +807,7 @@ function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No se pudo comprobar si hay actualizaciones.';
       setUpdateStatus((current) => current ? { ...current, state: 'error', error: message } : current);
-      setNotice(message);
+      notify(message, 'error');
     }
   };
 
@@ -792,12 +903,11 @@ function App() {
           whisper={whisperModel}
           setWhisper={setWhisperModel}
           onBack={() => navigate(settingsReturnPath)}
-          onNotice={setNotice}
-          notice={notice}
+          onNotice={notify}
         />
       ) : projectRouteId && projectRouteMode !== 'configure' ? (
         projectRouteMode === 'processing'
-          ? <ProcessingPage apiBase={API_BASE} project={project} error={projectError} onRetry={() => void retryProject()} />
+          ? <ProcessingPage apiBase={API_BASE} project={project} error={projectError} onRetry={() => void retryProject()} onCancelled={(cancelled) => setProject(cancelled)} />
           : projectRouteMode === 'edit'
             ? <ClipEditorPage
               projectId={projectRouteId}
@@ -868,6 +978,9 @@ function App() {
                       : ''}
                   </span>
                 </div>
+                <button type="button" className="cancel-download-button" onClick={() => void cancelLinkDownload()}>
+                  <X size={14} /> Cancelar descarga
+                </button>
               </div>
             )}
 
@@ -963,7 +1076,7 @@ function App() {
                 <div className="option-grid">
                   <Option checked={options.emojis} onClick={() => toggleOption('emojis')} title="Añadir emojis" description="Haz que tus subtítulos destaquen" />
                   <Option checked={options.keywords} onClick={() => toggleOption('keywords')} title="Resaltar palabras clave" description="Destaca las ideas importantes" />
-                  <Option checked={options.broll} onClick={() => { toggleOption('broll'); if (!options.broll) setNotice('B-rolls es una función premium y necesita una clave de Pexels o Pixabay.'); }} title="Añadir B-rolls" description="Inserta imágenes de apoyo" premium />
+                  <Option checked={options.broll} onClick={() => { toggleOption('broll'); if (!options.broll) notify('B-rolls es una función premium y necesita una clave de Pexels o Pixabay.'); }} title="Añadir B-rolls" description="Inserta imágenes de apoyo" premium />
                   <Option checked={options.silence} onClick={() => toggleOption('silence')} title="Eliminar silencios" description="Recorta las pausas largas" />
                   <Option checked={options.censor} onClick={() => toggleOption('censor')} title="Auto-censurar" description="Silencia y oculta palabrotas" />
                   <Option checked={options.face_tracking} onClick={() => toggleOption('face_tracking')} title="Seguir rostro en el encuadre" description="Mantiene a la persona principal visible al recortar" />
@@ -1054,7 +1167,6 @@ function App() {
                 )}
               </section>
 
-              {notice && <p className="notice-message" role="status"><AlertCircle size={17} />{notice}</p>}
               {projectError && <p className="error-message" role="alert"><AlertCircle size={16} />{projectError}</p>}
               <button className="create-button" type="button" onClick={() => void submitProject()} disabled={isSubmitting || (!linkProject && progress !== 100)}>
                 {isSubmitting ? <LoaderCircle size={18} className="spin" /> : <WandSparkles size={18} />}
@@ -1107,6 +1219,7 @@ function App() {
           </section>
         </div>
       )}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
       <footer className="developer-credit">
         Desarrollado por <strong>KELLY BENJAMIN DE LA CRUZ</strong>
       </footer>
@@ -1131,7 +1244,8 @@ function ResultsPage({
 }) {
   const [sort, setSort] = useState<'score' | 'time'>('score');
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [notice, setNotice] = useState('');
+  const { toasts, pushToast, dismissToast } = useToasts();
+  const notify = useCallback((message: string, kind: ToastKind = 'info') => pushToast(message, kind), [pushToast]);
   const [shareLink, setShareLink] = useState<{
     url: string;
     clipId: string;
@@ -1157,11 +1271,10 @@ function ResultsPage({
 
   const publishClips = async (clipIds: string[]) => {
     if (!project || !clipIds.length) {
-      setNotice('Selecciona al menos un clip para publicar.');
+      notify('Selecciona al menos un clip para publicar.');
       return;
     }
     setBusyAction('publish');
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/publish`, {
         method: 'POST',
@@ -1185,7 +1298,7 @@ function ResultsPage({
           ...current.filter((job) => !queuedJobs.some((queued) => queued.id === job.id)),
           ...queuedJobs,
         ]);
-        setNotice(`${queuedJobs.length} clip(s) añadidos a la cola real de publicación.`);
+        notify(`${queuedJobs.length} clip(s) añadidos a la cola real de publicación.`, 'success');
         return;
       }
       const publishedMessage = result.published.length
@@ -1197,9 +1310,9 @@ function ResultsPage({
       const pendingMessage = result.not_attempted.length
         ? ` No se intentaron ${result.not_attempted.length} clips restantes.`
         : '';
-      setNotice(`${publishedMessage}${failureMessage}${pendingMessage}`.trim() || 'La plataforma no confirmó ninguna publicación.');
+      notify(`${publishedMessage}${failureMessage}${pendingMessage}`.trim() || 'La plataforma no confirmó ninguna publicación.', result.failed ? 'error' : result.published.length ? 'success' : 'info');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo completar la publicación.');
+      notify(error instanceof Error ? error.message : 'No se pudo completar la publicación.', 'error');
     } finally {
       setBusyAction('');
     }
@@ -1223,13 +1336,12 @@ function ResultsPage({
       `¿Eliminar “${project.title}” y todos sus archivos, clips, publicaciones programadas y enlaces compartidos? Esta acción no se puede deshacer.`,
     )) return;
     setBusyAction('delete-project');
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}`, { method: 'DELETE' });
       if (!response.ok) throw new Error(await responseError(response));
       onProjectDeleted();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo eliminar el proyecto.');
+      notify(error instanceof Error ? error.message : 'No se pudo eliminar el proyecto.', 'error');
       setBusyAction('');
     }
   };
@@ -1237,16 +1349,15 @@ function ResultsPage({
   const retryFailedClips = async () => {
     if (!project || !failedClips.length) return;
     setBusyAction('retry-clips');
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/retry-failed-clips`, {
         method: 'POST',
       });
       if (!response.ok) throw new Error(await responseError(response));
-      setNotice('Los clips fallidos se añadieron a la cola para reintentarlos.');
+      notify('Los clips fallidos se añadieron a la cola para reintentarlos.', 'success');
       await onProjectUpdated(project.id);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudieron reintentar los clips fallidos.');
+      notify(error instanceof Error ? error.message : 'No se pudieron reintentar los clips fallidos.', 'error');
     } finally {
       setBusyAction('');
     }
@@ -1301,7 +1412,7 @@ function ResultsPage({
 
   const downloadSelected = async () => {
     if (!selectedClips.length) {
-      setNotice('Selecciona al menos un clip para descargarlo.');
+      notify('Selecciona al menos un clip para descargarlo.');
       return;
     }
     await saveProjectFiles(false, selectedClips.map((clip) => clip.id));
@@ -1309,13 +1420,12 @@ function ResultsPage({
   const saveProjectFiles = async (includeOriginal: boolean, clipIds: string[]) => {
     if (!project) return;
     setBusyAction(includeOriginal ? 'original' : 'archive');
-    setNotice('');
     try {
       const desktopApi = window.pywebview?.api;
       if (desktopApi) {
         const destination = await desktopApi.select_download_folder();
         if (!destination) {
-          setNotice('Guardado cancelado. No se eligió una carpeta.');
+          notify('Guardado cancelado. No se eligió una carpeta.');
           return;
         }
         const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/downloads/save`, {
@@ -1325,7 +1435,7 @@ function ResultsPage({
         });
         if (!response.ok) throw new Error(await responseError(response));
         const result = await response.json() as { saved: string[] };
-        setNotice(`Guardado en la carpeta elegida: ${result.saved.join(', ')}`);
+        notify(`Guardado en la carpeta elegida: ${result.saved.join(', ')}`, 'success');
         return;
       }
 
@@ -1348,33 +1458,31 @@ function ResultsPage({
         : await apiFetch(url);
       if (!response.ok) throw new Error(await responseError(response));
       triggerDownload(await response.blob(), filename);
-      setNotice(includeOriginal ? 'Video original descargado.' : clipIds.length > 1
+      notify(includeOriginal ? 'Video original descargado.' : clipIds.length > 1
         ? `ZIP creado con ${clipIds.length} clips reales.`
         : 'Clip descargado.');
     } catch (downloadError) {
-      setNotice(downloadError instanceof Error ? downloadError.message : 'No se pudieron guardar los archivos.');
+      notify(downloadError instanceof Error ? downloadError.message : 'No se pudieron guardar los archivos.', 'error');
     } finally {
       setBusyAction('');
     }
   };
   const downloadSubtitles = async (clipId: string, format: 'srt' | 'vtt') => {
     if (!project) return;
-    setNotice('');
     try {
       const response = await apiFetch(
         `${API_BASE}/api/projects/${project.id}/clips/${clipId}/subtitles/${format}`,
       );
       if (!response.ok) throw new Error(await responseError(response));
       triggerDownload(await response.blob(), `${clipId}.${format}`);
-      setNotice(`Subtítulos ${format.toUpperCase()} descargados.`);
+      notify(`Subtítulos ${format.toUpperCase()} descargados.`, 'success');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudieron descargar los subtítulos.');
+      notify(error instanceof Error ? error.message : 'No se pudieron descargar los subtítulos.', 'error');
     }
   };
   const changeResolution = async (clip: ClipResult, resolution: 720 | 1080) => {
     if (!project || resolution === (clip.resolution ?? 720)) return;
     setBusyAction(clip.id);
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clip.id}/quality`, {
         method: 'POST',
@@ -1383,9 +1491,9 @@ function ResultsPage({
       });
       if (!response.ok) throw new Error(await responseError(response));
       await onProjectUpdated(project.id);
-      setNotice(`Clip re-renderizado a ${resolution}p.`);
+      notify(`Clip re-renderizado a ${resolution}p.`, 'success');
     } catch (renderError) {
-      setNotice(renderError instanceof Error ? renderError.message : 'No se pudo re-renderizar el clip.');
+      notify(renderError instanceof Error ? renderError.message : 'No se pudo re-renderizar el clip.', 'error');
     } finally {
       setBusyAction('');
     }
@@ -1393,16 +1501,15 @@ function ResultsPage({
   const improveAudio = async (clip: ClipResult) => {
     if (!project || clip.audio_enhanced) return;
     setBusyAction(clip.id);
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clip.id}/improve`, {
         method: 'POST',
       });
       if (!response.ok) throw new Error(await responseError(response));
       await onProjectUpdated(project.id);
-      setNotice('Audio mejorado con normalización de volumen y realce ligero.');
+      notify('Audio mejorado con normalización de volumen y realce ligero.', 'success');
     } catch (improveError) {
-      setNotice(improveError instanceof Error ? improveError.message : 'No se pudo mejorar el audio.');
+      notify(improveError instanceof Error ? improveError.message : 'No se pudo mejorar el audio.', 'error');
     } finally {
       setBusyAction('');
     }
@@ -1411,7 +1518,6 @@ function ResultsPage({
     if (!project) return;
     setSharingClip(clipId);
     setShareLink(null);
-    setNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/clips/${clipId}/share`, {
         method: 'POST',
@@ -1422,12 +1528,12 @@ function ResultsPage({
       setShareLink({ url, clipId, expiresAt: result.expires_at });
       try {
         await navigator.clipboard.writeText(url);
-        setNotice('Enlace local copiado al portapapeles.');
+        notify('Enlace local copiado al portapapeles.', 'success');
       } catch {
-        setNotice('Enlace local listo. Puedes abrirlo o copiarlo desde el enlace mostrado.');
+        notify('Enlace local listo. Puedes abrirlo o copiarlo desde el enlace mostrado.');
       }
     } catch (shareError) {
-      setNotice(shareError instanceof Error ? shareError.message : 'No se pudo crear el enlace compartido.');
+      notify(shareError instanceof Error ? shareError.message : 'No se pudo crear el enlace compartido.', 'error');
     } finally {
       setSharingClip('');
     }
@@ -1443,16 +1549,16 @@ function ResultsPage({
       );
       if (!response.ok) throw new Error(await responseError(response));
       setShareLink(null);
-      setNotice('El enlace compartido quedó revocado.');
+      notify('El enlace compartido quedó revocado.', 'success');
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'No se pudo revocar el enlace.');
+      notify(error instanceof Error ? error.message : 'No se pudo revocar el enlace.', 'error');
     } finally {
       setBusyAction('');
     }
   };
   const editSelected = () => {
     if (selectedClips.length !== 1) {
-      setNotice('Selecciona exactamente un clip para editarlo.');
+      notify('Selecciona exactamente un clip para editarlo.');
       return;
     }
     onEdit(selectedClips[0].id);
@@ -1535,8 +1641,8 @@ function ResultsPage({
                 {job.download_url && <button className="job-link" type="button" onClick={() => void downloadWithAuth(
                   `${API_BASE}${job.download_url}`,
                   `${job.id}.mp4`,
-                ).catch((downloadError: unknown) => setNotice(
-                  downloadError instanceof Error ? downloadError.message : 'No se pudo descargar el video.',
+                ).catch((downloadError: unknown) => notify(
+                  downloadError instanceof Error ? downloadError.message : 'No se pudo descargar el video.', 'error',
                 ))}>Descargar MP4</button>}
                 {job.error && <p role="status">{job.error}</p>}
                 {job.confirmation_required && (
@@ -1571,7 +1677,13 @@ function ResultsPage({
           <button type="button" className="retry-button" onClick={onRetry}><WandSparkles size={16} /> Reintentar</button>
         </div>
       )}
-      {notice && <p className="notice-message" role="status"><AlertCircle size={17} />{notice}<button type="button" onClick={() => setNotice('')} aria-label="Cerrar aviso"><X size={14} /></button></p>}
+      {project?.status === 'cancelled' && (
+        <div className="project-failure">
+          <p className="error-message" role="alert"><AlertCircle size={16} />El procesamiento se canceló. Puedes reprocesar el proyecto con la misma configuración.</p>
+          <button type="button" className="retry-button" onClick={onRetry}><WandSparkles size={16} /> Reprocesar</button>
+        </div>
+      )}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
       {shareLink && (
         <p className="share-link-message">
           <a href={shareLink.url} target="_blank" rel="noreferrer">{shareLink.url}</a>
@@ -1690,7 +1802,7 @@ function ResultsPage({
           </article>
         ))}
       </div>
-      {project?.status !== 'completed' && project?.status !== 'failed' && !error && <p className="results-loading"><LoaderCircle size={17} className="spin" /> Cargando el estado real del proyecto…</p>}
+      {project?.status !== 'completed' && project?.status !== 'failed' && project?.status !== 'cancelled' && !error && <p className="results-loading"><LoaderCircle size={17} className="spin" /> Cargando el estado real del proyecto…</p>}
       <a className="back-button results-back" href="/">Volver al inicio</a>
     </main>
   );
@@ -1752,7 +1864,7 @@ function ClipEditorPage({
   };
 
   const saveDraft = async () => {
-    if (!editor) return;
+    if (!editor || saving) return;
     setSaving(true);
     setError('');
     setMessage('');
@@ -1771,6 +1883,20 @@ function ClipEditorPage({
       setSaving(false);
     }
   };
+
+  // Ctrl/Cmd+S: guardar borrador sin abrir el diálogo del navegador.
+  const saveDraftRef = useRef(saveDraft);
+  saveDraftRef.current = saveDraft;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        void saveDraftRef.current();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const createPreview = async () => {
     if (!editor) return;
@@ -2048,14 +2174,13 @@ function SubtitleStyleControls({
   );
 }
 
-function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNotice, notice }: {
+function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNotice }: {
   provider: string;
   setProvider: (value: string) => void;
   whisper: string;
   setWhisper: (value: string) => void;
   onBack: () => void;
-  onNotice: (value: string) => void;
-  notice: string;
+  onNotice: (message: string, kind?: ToastKind) => void;
 }) {
   const settingsLocation = useLocation();
   const settingsNavigate = useNavigate();
@@ -2112,20 +2237,20 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
     const message = params.get('message');
     onNotice(status === 'connected'
       ? `${integration} se conectó correctamente.`
-      : message || `No se pudo conectar ${integration}.`);
+      : message || `No se pudo conectar ${integration}.`,
+    status === 'connected' ? 'success' : 'error');
     settingsNavigate(settingsLocation.pathname, { replace: true });
   }, [onNotice, settingsLocation.pathname, settingsLocation.search, settingsNavigate]);
 
   const connectIntegration = async (integration: string) => {
     setIntegrationBusy(integration);
-    onNotice('');
     try {
       const response = await apiFetch(`${API_BASE}/api/integrations/${integration}/connect`);
       if (!response.ok) throw new Error(await responseError(response));
       const result = await response.json() as { authorization_url: string };
       window.location.assign(result.authorization_url);
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'No se pudo iniciar la conexión.');
+      onNotice(error instanceof Error ? error.message : 'No se pudo iniciar la conexión.', 'error');
       setIntegrationBusy('');
     }
   };
@@ -2139,9 +2264,9 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
         ...current,
         [integration]: { ...current[integration], connected: false, display_name: null },
       }));
-      onNotice(`Se desconectó ${integration}.`);
+      onNotice(`Se desconectó ${integration}.`, 'success');
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'No se pudo desconectar la cuenta.');
+      onNotice(error instanceof Error ? error.message : 'No se pudo desconectar la cuenta.', 'error');
     } finally {
       setIntegrationBusy('');
     }
@@ -2157,15 +2282,16 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
           api_key: apiKey.trim(),
           model: model.trim(),
           base_url: baseUrl.trim(),
+          whisper_model: whisper,
         }),
       });
       if (!response.ok) throw new Error(await responseError(response));
       setApiKey('');
       setHasSavedKey(true);
       setSaved(true);
-      onNotice('Ajustes guardados. La clave se cifra con DPAPI de Windows y no vuelve a mostrarse.');
+      onNotice('Ajustes guardados. La clave se cifra con DPAPI de Windows y no vuelve a mostrarse.', 'success');
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'No se pudieron guardar los ajustes.');
+      onNotice(error instanceof Error ? error.message : 'No se pudieron guardar los ajustes.', 'error');
     }
   };
 
@@ -2176,9 +2302,9 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
       setHasSavedKey(false);
       setApiKey('');
       setSaved(false);
-      onNotice('Se eliminó la clave guardada para esta cuenta.');
+      onNotice('Se eliminó la clave guardada para esta cuenta.', 'success');
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'No se pudo eliminar la clave guardada.');
+      onNotice(error instanceof Error ? error.message : 'No se pudo eliminar la clave guardada.', 'error');
     }
   };
 
@@ -2263,7 +2389,6 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
           );
         })}
       </section>
-      {notice && <p className="notice-message" role="status"><AlertCircle size={17} />{notice}</p>}
     </main>
   );
 }

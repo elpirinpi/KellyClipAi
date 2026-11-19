@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -15,6 +16,13 @@ from .credential_store import (
     encrypt_oauth_token,
     is_oauth_token_encrypted,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class ProjectBusyError(RuntimeError):
+    """El proyecto está encolado o procesándose y no se puede borrar."""
+
 
 _lock = threading.RLock()
 _LATEST_SCHEMA_VERSION = 3
@@ -154,6 +162,12 @@ def initialize(database_path: Path) -> None:
                 encrypted_api_key BLOB NOT NULL,
                 model TEXT NOT NULL,
                 base_url TEXT NOT NULL DEFAULT '',
+                -- 1 cuando el usuario eligió el modelo explícitamente en
+                -- Ajustes: las migraciones no deben reescribirlo (B21).
+                model_customized INTEGER NOT NULL DEFAULT 0,
+                -- Modelo Whisper elegido en Ajustes; NULL = nunca guardado
+                -- (se usa el de entorno). (B2)
+                whisper_model TEXT,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
@@ -180,6 +194,23 @@ def initialize(database_path: Path) -> None:
             );
             """
         )
+        # Columnas añadidas en v1.0.11 sin subir la versión de esquema: las
+        # bases creadas por versiones anteriores (ya en versión 3) no
+        # volverían a pasar por ninguna migración, así que se añaden aquí de
+        # forma idempotente, antes de ejecutar las migraciones versionadas
+        # (v2/v3 consultan model_customized).
+        llm_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(llm_credentials)")
+        }
+        if "model_customized" not in llm_columns:
+            conn.execute(
+                "ALTER TABLE llm_credentials "
+                "ADD COLUMN model_customized INTEGER NOT NULL DEFAULT 0"
+            )
+        if "whisper_model" not in llm_columns:
+            conn.execute(
+                "ALTER TABLE llm_credentials ADD COLUMN whisper_model TEXT"
+            )
         _run_migrations(conn)
 
 
@@ -272,11 +303,13 @@ def _migrate_schema_v1(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
+    # Solo reescribe el modelo en filas que el usuario nunca personalizó
+    # (model_customized = 0): quien eligió un modelo a propósito lo conserva.
     conn.execute(
         """
         UPDATE llm_credentials
         SET model = ?, updated_at = ?
-        WHERE provider = ? AND model = ?
+        WHERE provider = ? AND model = ? AND model_customized = 0
         """,
         (
             "openai/gpt-oss-120b",
@@ -291,12 +324,13 @@ def _migrate_schema_v3(conn: sqlite3.Connection) -> None:
     # Modelo predeterminado de Groq: qwen/qwen3.8-27b (250K TPM, muy por
     # encima de los límites de los modelos anteriores). Actualiza tanto a
     # los usuarios que venían de gpt-oss-120b como a los que aún tenían
-    # llama-3.3-70b-versatile (si saltaron la migración v2).
+    # llama-3.3-70b-versatile (si saltaron la migración v2). Como en v2,
+    # respeta las filas personalizadas por el usuario.
     conn.execute(
         """
         UPDATE llm_credentials
         SET model = ?, updated_at = ?
-        WHERE provider = ? AND model IN (?, ?)
+        WHERE provider = ? AND model IN (?, ?) AND model_customized = 0
         """,
         (
             "qwen/qwen3.8-27b",
@@ -327,6 +361,11 @@ def _migrate_owned_table(
 
 
 def _migrate_oauth_tokens(conn: sqlite3.Connection) -> None:
+    # Migración tolerante a fallos (A10): cada cuenta se migra de forma
+    # aislada. Si DPAPI falla (otro usuario de Windows, perfil dañado, BD
+    # abierta en otro SO) o el metadata_json está corrupto, esa cuenta se
+    # marca como "necesita reconectar" (tokens limpiados + nota en
+    # metadata) en vez de impedir el arranque de toda la aplicación.
     rows = conn.execute(
         """
         SELECT owner_id, provider, access_token, refresh_token, metadata_json
@@ -334,30 +373,69 @@ def _migrate_oauth_tokens(conn: sqlite3.Connection) -> None:
         """
     ).fetchall()
     for row in rows:
-        access_token = row["access_token"]
-        refresh_token = row["refresh_token"]
-        metadata = json.loads(row["metadata_json"])
-        user_access_token = metadata.get("user_access_token")
-        if not is_oauth_token_encrypted(access_token):
-            access_token = encrypt_oauth_token(access_token)
-        if refresh_token and not is_oauth_token_encrypted(refresh_token):
-            refresh_token = encrypt_oauth_token(refresh_token)
-        if user_access_token and not is_oauth_token_encrypted(user_access_token):
-            metadata["user_access_token"] = encrypt_oauth_token(user_access_token)
-        conn.execute(
-            """
-            UPDATE connected_accounts
-            SET access_token = ?, refresh_token = ?, metadata_json = ?
-            WHERE owner_id = ? AND provider = ?
-            """,
-            (
-                access_token,
-                refresh_token,
-                json.dumps(metadata, ensure_ascii=False),
-                row["owner_id"],
+        try:
+            access_token = row["access_token"]
+            refresh_token = row["refresh_token"]
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except ValueError:
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            user_access_token = metadata.get("user_access_token")
+            if not is_oauth_token_encrypted(access_token):
+                access_token = encrypt_oauth_token(access_token)
+            if refresh_token and not is_oauth_token_encrypted(refresh_token):
+                refresh_token = encrypt_oauth_token(refresh_token)
+            if user_access_token and not is_oauth_token_encrypted(user_access_token):
+                metadata["user_access_token"] = encrypt_oauth_token(user_access_token)
+            conn.execute(
+                """
+                UPDATE connected_accounts
+                SET access_token = ?, refresh_token = ?, metadata_json = ?
+                WHERE owner_id = ? AND provider = ?
+                """,
+                (
+                    access_token,
+                    refresh_token,
+                    json.dumps(metadata, ensure_ascii=False),
+                    row["owner_id"],
+                    row["provider"],
+                ),
+            )
+        except Exception as error:
+            logger.warning(
+                "No se pudo migrar el token de %s (%s); la cuenta queda "
+                "pendiente de reconectar: %s",
                 row["provider"],
-            ),
-        )
+                row["owner_id"],
+                error,
+            )
+            note = {
+                "needs_reconnect": True,
+                "migration_error": (
+                    str(error).strip() or "No se pudo migrar el token guardado."
+                )[:240],
+            }
+            try:
+                conn.execute(
+                    """
+                    UPDATE connected_accounts
+                    SET access_token = '', refresh_token = NULL, metadata_json = ?
+                    WHERE owner_id = ? AND provider = ?
+                    """,
+                    (
+                        json.dumps(note, ensure_ascii=False),
+                        row["owner_id"],
+                        row["provider"],
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "No se pudo marcar la cuenta %s (%s) como pendiente de reconectar",
+                    row["provider"],
+                    row["owner_id"],
+                )
 
 
 def claim_legacy_data(database_path: Path, owner_id: str) -> None:
@@ -372,6 +450,40 @@ def claim_legacy_data(database_path: Path, owner_id: str) -> None:
             conn.execute(
                 f"UPDATE {table} SET owner_id = ? WHERE owner_id IS NULL OR owner_id = 'legacy'",
                 (owner_id,),
+            )
+        # llm_credentials también se reclama (B20): la clave guardada antes
+        # del primer inicio de sesión no debe quedar huérfana. Como
+        # owner_id es la clave primaria, solo se puede reclamar una fila
+        # legacy y solo si el usuario aún no tiene credenciales propias;
+        # las filas legacy restantes se descartan para que no las reclame
+        # otro usuario después.
+        legacy_rows = conn.execute(
+            "SELECT rowid FROM llm_credentials "
+            "WHERE owner_id IS NULL OR owner_id = 'legacy' ORDER BY rowid"
+        ).fetchall()
+        if not legacy_rows:
+            return
+        has_credentials = (
+            conn.execute(
+                "SELECT 1 FROM llm_credentials WHERE owner_id = ?",
+                (owner_id,),
+            ).fetchone()
+            is not None
+        )
+        if has_credentials:
+            conn.execute(
+                "DELETE FROM llm_credentials "
+                "WHERE owner_id IS NULL OR owner_id = 'legacy'"
+            )
+            return
+        conn.execute(
+            "UPDATE llm_credentials SET owner_id = ? WHERE rowid = ?",
+            (owner_id, legacy_rows[0]["rowid"]),
+        )
+        if len(legacy_rows) > 1:
+            conn.executemany(
+                "DELETE FROM llm_credentials WHERE rowid = ?",
+                [(row["rowid"],) for row in legacy_rows[1:]],
             )
 
 
@@ -551,12 +663,16 @@ def claim_staged_media(database_path: Path, staged_id: str) -> bool:
 
 
 def claim_staged_media_for_deletion(database_path: Path, staged_id: str) -> bool:
+    # 'downloading' también se puede reclamar: cancelar una descarga por
+    # enlace en curso es el caso principal del botón "Cancelar descarga".
+    # La tarea de descarga detecta el estado 'deleting' (o la fila
+    # borrada) y limpia los archivos parciales en vez de completarla.
     with _lock, connection(database_path) as conn:
         cursor = conn.execute(
             """
             UPDATE staged_media
             SET status = 'deleting', updated_at = ?
-            WHERE id = ? AND status IN ('receiving', 'ready', 'failed')
+            WHERE id = ? AND status IN ('receiving', 'downloading', 'ready', 'failed')
             """,
             (utc_now(), staged_id),
         )
@@ -708,13 +824,23 @@ def delete_project(
     owner_id: str | None = None,
 ) -> list[str] | None:
     with _lock, connection(database_path) as conn:
-        query = "SELECT id FROM projects WHERE id = ?"
+        query = "SELECT id, status FROM projects WHERE id = ?"
         parameters: tuple[Any, ...] = (project_id,)
         if owner_id is not None:
             query += " AND owner_id = ?"
             parameters += (owner_id,)
-        if conn.execute(query, parameters).fetchone() is None:
+        row = conn.execute(query, parameters).fetchone()
+        if row is None:
             return None
+        # Guarda atómica (B5): el estado se comprueba dentro de la misma
+        # transacción que el borrado, así que un proceso que encole el
+        # proyecto entre la comprobación de la ruta y el borrado no puede
+        # dejar un pipeline escribiendo sobre un proyecto ya borrado. Para
+        # borrar un proyecto en curso hay que cancelarlo primero.
+        if row["status"] in {"processing", "queued"}:
+            raise ProjectBusyError(
+                "No se puede eliminar un proyecto mientras se procesa."
+            )
         staged_ids = [
             str(row["id"])
             for row in conn.execute(
@@ -754,13 +880,18 @@ def queue_project(
     *,
     preserve_clips: bool = False,
 ) -> bool:
-    clips_update = "clips_json = clips_json" if preserve_clips else "clips_json = '[]'"
+    # A1: encolar NUNCA borra clips_json. Los clips anteriores se
+    # conservan hasta que el reproceso renderiza al menos un clip nuevo
+    # (el pipeline hace el swap); si el reproceso falla, los viejos
+    # siguen intactos. El parámetro preserve_clips queda como no-op por
+    # compatibilidad: preservar es ahora el único comportamiento.
+    del preserve_clips
     with _lock, connection(database_path) as conn:
         cursor = conn.execute(
-            f"""
+            """
             UPDATE projects
             SET config_json = ?, status = 'queued', step = 'upload', progress = 0,
-                error = NULL, {clips_update}, updated_at = ?
+                error = NULL, updated_at = ?
             WHERE id = ? AND status NOT IN ('processing', 'queued')
             """,
             (json.dumps(config, ensure_ascii=False), utc_now(), project_id),
@@ -1081,21 +1212,43 @@ def save_llm_credentials(
     encrypted_api_key: bytes,
     model: str,
     base_url: str,
+    *,
+    model_customized: bool = False,
+    whisper_model: str | None = None,
 ) -> None:
+    # model_customized es "pegajoso": una vez que el usuario personalizó
+    # el modelo, un guardado posterior sin la marca no lo despersonaliza.
+    # whisper_model None = sin cambio: conserva el valor guardado.
     with _lock, connection(database_path) as conn:
         conn.execute(
             """
             INSERT INTO llm_credentials (
-                owner_id, provider, encrypted_api_key, model, base_url, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                owner_id, provider, encrypted_api_key, model, base_url,
+                model_customized, whisper_model, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(owner_id) DO UPDATE SET
                 provider = excluded.provider,
                 encrypted_api_key = excluded.encrypted_api_key,
                 model = excluded.model,
                 base_url = excluded.base_url,
+                model_customized = MAX(
+                    llm_credentials.model_customized, excluded.model_customized
+                ),
+                whisper_model = COALESCE(
+                    excluded.whisper_model, llm_credentials.whisper_model
+                ),
                 updated_at = excluded.updated_at
             """,
-            (owner_id, provider, encrypted_api_key, model, base_url, utc_now()),
+            (
+                owner_id,
+                provider,
+                encrypted_api_key,
+                model,
+                base_url,
+                1 if model_customized else 0,
+                whisper_model,
+                utc_now(),
+            ),
         )
 
 
@@ -1105,11 +1258,16 @@ def get_llm_credentials(
 ) -> dict[str, Any] | None:
     with connection(database_path) as conn:
         row = conn.execute(
-            "SELECT owner_id, provider, encrypted_api_key, model, base_url, updated_at "
+            "SELECT owner_id, provider, encrypted_api_key, model, base_url, "
+            "model_customized, whisper_model, updated_at "
             "FROM llm_credentials WHERE owner_id = ?",
             (owner_id,),
         ).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    credentials = dict(row)
+    credentials["model_customized"] = bool(credentials.get("model_customized"))
+    return credentials
 
 
 def delete_llm_credentials(database_path: Path, owner_id: str) -> None:

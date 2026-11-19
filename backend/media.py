@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html
 import json
 import os
@@ -596,6 +597,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     dialogues: list[str] = []
     censor_ranges: list[tuple[float, float]] = []
+    # Copia profunda antes de censurar: la transcripción guardada del clip
+    # debe conservar las palabras originales y solo el .ass renderizado
+    # sale censurado. Sin la copia, _render_clip devolvería las palabras
+    # ya reemplazadas por "****".
+    words = copy.deepcopy(words)
     for word in words:
         if _censored(str(word["text"])) and config.options.censor:
             censor_ranges.append((float(word["preview_start"]), float(word["preview_end"])))

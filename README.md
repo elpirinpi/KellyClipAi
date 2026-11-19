@@ -90,9 +90,12 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.9.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.0.11.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
-oficial de Microsoft WebView2. El instalador requiere internet para instalar
+oficial de Microsoft WebView2. El instalador no está firmado con un certificado
+de código, por lo que Windows SmartScreen puede mostrar la advertencia
+"Windows protegió tu PC": pulsa **Más información** y luego **Ejecutar de
+todas formas** para continuar. El instalador requiere internet para instalar
 WebView2 si hace falta; el modelo Whisper seleccionado se descarga la primera
 vez que procesas un video. No incluye credenciales LLM ni de redes sociales:
 configúralas en Ajustes o en `%LOCALAPPDATA%\kellyClipAi\.env`.
@@ -108,8 +111,8 @@ durante los segmentos de voz detectados; si no hay una señal fiable, vuelve al
 rostro dominante. También puedes elegir pantalla dividida, fondo desenfocado o
 encuadre centrado. Los modelos se incluyen localmente y ningún fotograma,
 detección ni cálculo de labios se envía a servicios externos.
-Las transcripciones de más de 15 minutos se analizan en ventanas de 15 minutos
-con 3 minutos de solape; los tiempos de cada clip se restauran a la línea
+Las transcripciones de más de 5 minutos se analizan en ventanas de 5 minutos
+con 1 minuto de solape; los tiempos de cada clip se restauran a la línea
 temporal original y las propuestas duplicadas o solapadas se descartan.
 Whisper reutiliza en memoria el último modelo seleccionado y procesa con
 inferencia por lotes en CPU, conservando timestamps por palabra. El idioma se
@@ -152,7 +155,9 @@ de eventos SSE se conservan en SQLite.
 Los enlaces se descargan con yt-dlp únicamente desde plataformas compatibles;
 importa solo contenido propio o para el que tengas autorización. La clave del
 proveedor LLM es obligatoria. Si falta, el procesamiento se bloquea con un
-mensaje visible y no se crean clips ficticios.
+mensaje visible y no se crean clips ficticios. El modelo predeterminado es
+`qwen/qwen3.8-27b` (Groq); se puede cambiar en Ajustes o con `LLM_MODEL`
+en `.env`.
 
 ## Editor por transcripción
 

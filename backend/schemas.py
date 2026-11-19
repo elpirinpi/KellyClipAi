@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import ipaddress
 from datetime import UTC, datetime
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# Límites de entrada (Fase 1, A2): un video mayor que estos límites genera
+# decenas de ventanas LLM y horas de transcripción en CPU. Otro módulo
+# (main.py) aplica estos límites al subir y al procesar.
+MAX_UPLOAD_BYTES = 4294967296  # 4 GiB
+MAX_VIDEO_DURATION_SECONDS = 14400  # 4 h
+
 Ratio = Literal["9:16", "16:9", "1:1", "4:5"]
+WhisperModel = Literal["tiny", "small", "medium", "large-v3"]
 DurationChoice = Literal["Cualquiera", "<30s", "30–60s", "60–90s", "90s–3min"]
 PublishingPlatform = Literal["youtube", "tiktok", "instagram"]
 
@@ -81,8 +90,78 @@ class ProjectConfig(BaseModel):
     subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
     options: EditOptions = Field(default_factory=EditOptions)
     moment: str = Field(default="", max_length=500)
-    whisper_model: Literal["tiny", "small", "medium", "large-v3"] = "small"
+    whisper_model: WhisperModel = "small"
     schedule: ScheduledPublishing | None = None
+
+
+_BLOCKED_LLM_HOSTS = {"metadata.google.internal"}
+_LOOPBACK_HOSTNAMES = {"localhost"}
+
+
+def _validate_llm_base_url(value: str | None) -> str | None:
+    """Valida la URL base del proveedor LLM contra SSRF y robo de la clave.
+
+    Reglas (Fase 1, A12/B-S1):
+    - None o vacío: permitido, significa "usar el default del proveedor".
+    - https: permitido salvo hosts bloqueados.
+    - http: solo loopback (localhost, 127.0.0.0/8, ::1); en claro la clave
+      viajaría sin cifrar.
+    - Si el host se parsea como IP, se rechazan las privadas, link-local
+      (169.254.0.0/16, incluido 169.254.169.254, endpoint de metadatos en la
+      nube), reservadas, multicast y no especificadas.
+    - Se rechaza el hostname conocido de metadatos metadata.google.internal.
+    - Un nombre DNS que no es IP se permite: no se puede resolver de forma
+      fiable en validación (el DNS puede cambiar entre la validación y la
+      petición, y resolver aquí añadiría latencia y fallos de red al guardar
+      ajustes). La protección real contra DNS rebinding queda en la capa de
+      red; aquí solo se bloquean los literales IP peligrosos y el hostname
+      de metadatos conocido.
+    """
+    if value is None or not value.strip():
+        return value
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(
+            "La URL base del proveedor debe empezar por https:// "
+            "(http:// solo se admite en localhost)."
+        )
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("La URL base del proveedor no incluye un host válido.")
+    if host in _BLOCKED_LLM_HOSTS:
+        raise ValueError(
+            "La URL base del proveedor apunta a un host de metadatos bloqueado."
+        )
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        if address.is_loopback:
+            return value
+        if (
+            address.is_private
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise ValueError(
+                "La URL base del proveedor apunta a una dirección IP interna "
+                "o reservada, no permitida."
+            )
+        if parsed.scheme != "https":
+            raise ValueError(
+                "La URL base del proveedor debe usar https:// fuera de localhost."
+            )
+        return value
+    if host in _LOOPBACK_HOSTNAMES:
+        return value
+    if parsed.scheme != "https":
+        raise ValueError(
+            "La URL base del proveedor debe usar https:// fuera de localhost."
+        )
+    return value
 
 
 class LLMConfig(BaseModel):
@@ -92,6 +171,11 @@ class LLMConfig(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     model: str | None = Field(default=None, max_length=200)
     base_url: str | None = Field(default=None, max_length=500)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str | None) -> str | None:
+        return _validate_llm_base_url(value)
 
 
 class LLMSettingsRequest(BaseModel):
@@ -107,6 +191,14 @@ class LLMSettingsRequest(BaseModel):
     api_key: str = Field(default="", max_length=4096)
     model: str = Field(min_length=1, max_length=200)
     base_url: str = Field(default="", max_length=500)
+    # Modelo Whisper elegido en Ajustes. None = sin cambio (el cliente no lo
+    # envió); el endpoint PUT lo persiste y el GET lo devuelve.
+    whisper_model: WhisperModel | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return _validate_llm_base_url(value) or ""
 
 
 class ProcessRequest(BaseModel):
@@ -121,7 +213,7 @@ class ZoomImportRequest(BaseModel):
 
 class StagedUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
-    file_size: int = Field(gt=0)
+    file_size: int = Field(gt=0, le=MAX_UPLOAD_BYTES)
     content_type: str = Field(default="application/octet-stream", max_length=100)
     duration: float = Field(default=0, ge=0)
     width: int = Field(default=0, ge=0)

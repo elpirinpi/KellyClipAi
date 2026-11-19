@@ -13,6 +13,13 @@ from . import database
 from .settings import AppSettings
 
 _GRAPH_VERSION = "v27.0"
+# Guarda anti-bucle en la subida TikTok: la lectura de un archivo regular
+# devuelve chunk_size bytes salvo al final, así que el número de fragmentos
+# esperado es ceil(tamaño / chunk). El +2 da margen a lecturas cortas
+# esporádicas sin permitir un bucle infinito.
+_TIKTOK_CHUNK_SLACK = 2
+# Timeout por fragmento de subida a TikTok (10 MB por fragmento).
+_TIKTOK_CHUNK_TIMEOUT = httpx.Timeout(300, connect=30)
 _OAUTH_PROVIDERS = {"youtube", "tiktok", "instagram", "zoom"}
 _PROVIDER_ENV = {
     "youtube": ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET"),
@@ -725,12 +732,30 @@ def _publish_tiktok(
         try:
             with file_path.open("rb") as media:
                 offset = 0
+                iterations = 0
+                max_iterations = chunks + _TIKTOK_CHUNK_SLACK
                 while offset < file_size:
+                    iterations += 1
+                    if iterations > max_iterations:
+                        raise IntegrationError(
+                            "La carga a TikTok superó el número máximo de "
+                            "fragmentos esperado; se abortó la publicación."
+                        )
                     chunk = media.read(chunk_size)
+                    if not chunk:
+                        # Un read() vacío antes de enviar todos los bytes
+                        # significa EOF prematuro (archivo truncado o
+                        # modificado durante la subida): abortar en vez de
+                        # seguir el bucle con un Content-Range inválido.
+                        raise IntegrationError(
+                            "La lectura del MP4 terminó antes de enviar todos "
+                            "los bytes a TikTok; se abortó la publicación."
+                        )
                     end = offset + len(chunk) - 1
                     response = client.put(
                         upload_url,
                         content=chunk,
+                        timeout=_TIKTOK_CHUNK_TIMEOUT,
                         headers={
                             "Content-Type": "video/mp4",
                             "Content-Length": str(len(chunk)),

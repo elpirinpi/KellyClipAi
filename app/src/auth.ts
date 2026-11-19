@@ -103,14 +103,19 @@ export async function streamApiEvents(
 }
 
 export async function signOut(apiBase: string): Promise<void> {
-  const token = await accessToken();
-  if (token) {
-    const response = await fetch(`${apiBase}/api/auth/media-cookie`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-      credentials: 'include',
-    });
-    if (!response.ok) throw new Error('No se pudo cerrar la sesión multimedia local.');
+  // Best-effort: que falle el borrado de la cookie local no debe impedir
+  // cerrar la sesión de Supabase.
+  try {
+    const token = await accessToken();
+    if (token) {
+      await fetch(`${apiBase}/api/auth/media-cookie`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'include',
+      });
+    }
+  } catch {
+    // Se ignora: el cierre de sesión de Supabase se ejecuta igualmente.
   }
   const { error } = await getSupabase().auth.signOut();
   if (error) throw new Error(`No se pudo cerrar la sesión: ${error.message}`);
