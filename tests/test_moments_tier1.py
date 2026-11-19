@@ -125,9 +125,27 @@ def _audio(seconds: int, *, peak_at: float | None = None) -> np.ndarray:
 
 
 def test_import_audio_events_does_not_import_onnxruntime() -> None:
-    assert "onnxruntime" not in sys.modules
-    assert audio_events._YAMNET_REPO_ID == "audiomagic/yamnet-onnx"
-    assert "onnxruntime" not in sys.modules
+    """Importar audio_events no debe importar onnxruntime (perezoso).
+
+    Se comprueba en un intérprete nuevo: en la suite, otros tests ya
+    pueden haber importado onnxruntime (p. ej. al ejercitar el Tier 1
+    real), y lo que importa es que el import en limpio no lo arrastre.
+    """
+    code = (
+        "import sys\n"
+        "from backend import audio_events\n"
+        "assert 'onnxruntime' not in sys.modules\n"
+        "assert audio_events._YAMNET_REPO_ID == 'audiomagic/yamnet-onnx'\n"
+        "assert 'onnxruntime' not in sys.modules\n"
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=repo_root,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 # --- umbrales por clase --------------------------------------------------------

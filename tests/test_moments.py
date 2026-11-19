@@ -355,8 +355,11 @@ def test_tfidf_dedup_keeps_highest_scoring_copy() -> None:
     assert len(clips) == 1
 
 
-def test_tier0_works_without_onnxruntime() -> None:
-    assert "onnxruntime" not in sys.modules
+def test_tier0_works_without_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Quitar onnxruntime del proceso si otro test lo importó: lo que se
+    # prueba es que detect_moments (Tier 0) no lo importa por sí mismo.
+    # monkeypatch lo restaura al terminar el test.
+    monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
     transcript = _transcript(600, exciting_at=300)
     audio = _audio(600, peak_at=300)
     clips = moments.detect_moments(transcript, ProjectConfig(), 600, audio_timeline=audio)
@@ -637,6 +640,10 @@ def _mock_render_projects(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any
 def test_process_project_signals_records_engine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # El Tier 1 no es objeto de este test: sin mock, el pipeline intentaría
+    # descargar el modelo YAMNet real e importar onnxruntime.
+    audio_events = pytest.importorskip("backend.audio_events")
+    monkeypatch.setattr(audio_events, "get_event_timeline", lambda *a, **k: None)
     settings = _settings(tmp_path)
     database.initialize(settings.database_path)
     project_id = "signals-project"
@@ -669,6 +676,10 @@ def test_process_project_signals_records_engine(
 def test_process_project_signals_ai_without_key_keeps_templates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # El Tier 1 no es objeto de este test: sin mock, el pipeline intentaría
+    # descargar el modelo YAMNet real e importar onnxruntime.
+    audio_events = pytest.importorskip("backend.audio_events")
+    monkeypatch.setattr(audio_events, "get_event_timeline", lambda *a, **k: None)
     settings = _settings(tmp_path, llm_api_key="")
     database.initialize(settings.database_path)
     project_id = "signals-ai-no-key"
