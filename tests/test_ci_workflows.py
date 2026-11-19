@@ -14,6 +14,9 @@ def test_ci_and_windows_release_workflows_run_security_checks_and_pin_actions() 
 
     for workflow in (ci, release):
         assert re.search(r"uses:\s+[\w.-]+/[\w.-]+@[0-9a-f]{40}", workflow)
+        assert "Set up verified FFmpeg for media tests" in workflow
+        assert "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba" in workflow
+        assert workflow.index("Set up verified FFmpeg") < workflow.index("pytest")
 
     assert re.search(r"(?m)^on:\s*$[\s\S]*?^  push:", ci)
     assert re.search(r"(?m)^  pull_request:", ci)
