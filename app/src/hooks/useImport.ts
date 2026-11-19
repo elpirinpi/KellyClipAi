@@ -1,9 +1,38 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import { accessToken, apiFetch } from '../auth';
 import type { StagedMedia, UploadInfo } from '../types';
+import { responseError } from '../utils';
 
 const ALLOWED_EXTENSIONS = new Set(['mp4', 'mov', '3gp', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'm4a']);
 export const ACCEPT = '.mp4,.mov,.3gp,.avi,.mkv,.webm,.mp3,.wav,.m4a,video/mp4,video/quicktime,video/3gpp,video/x-msvideo,video/webm,audio/mpeg,audio/wav,audio/mp4';
+
+// Fase 2 (ítem 22): límite de subida del backend (backend/schemas.py,
+// MAX_UPLOAD_BYTES = 4 GiB). Se valida en cliente antes de subir y se
+// muestra en la zona de subida para que el usuario lo conozca por
+// adelantado, en vez de descubrirlo con un error del servidor.
+export const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB
+export const MAX_UPLOAD_LABEL = '4 GB';
+
+// Subida por fragmentos con reanudación (Fase 2, ítem 22): el archivo se
+// envía en trozos de UPLOAD_CHUNK_BYTES con `Content-Range: bytes
+// <inicio>-<fin>/<total>`. El backend conserva el .part ante cualquier
+// interrupción y expone bytes_received en el GET, así que un reintento
+// reanuda desde el último byte confirmado en vez de empezar de cero.
+const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MiB por fragmento
+const MAX_UPLOAD_ATTEMPTS = 3;
+const MAX_CHUNK_ATTEMPTS = 3;
+const UPLOAD_STALL_TIMEOUT_MS = 60_000;
+const UPLOAD_RETRY_DELAYS_MS = [1000, 2000];
+
+class UploadAttemptError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = 'UploadAttemptError';
+    this.retryable = retryable;
+  }
+}
 
 type UseImportOptions = {
   apiBase: string;
@@ -12,15 +41,6 @@ type UseImportOptions = {
   onImportStart: () => void;
   onNotice: (message: string) => void;
 };
-
-async function responseError(response: Response): Promise<string> {
-  try {
-    const body = await response.json() as { detail?: string };
-    return body.detail ?? `El servidor respondió con error (${response.status}).`;
-  } catch {
-    return `El servidor respondió con error (${response.status}).`;
-  }
-}
 
 function extensionOf(name: string): string {
   return name.split('.').pop()?.toLowerCase() ?? '';
@@ -38,49 +58,149 @@ function stagedUploadInfo(staged: StagedMedia): UploadInfo {
   };
 }
 
+async function fetchStagedMedia(apiBase: string, stagedId: string): Promise<StagedMedia> {
+  const response = await apiFetch(`${apiBase}/api/staged-media/${stagedId}`);
+  if (!response.ok) throw new Error(await responseError(response));
+  return response.json() as Promise<StagedMedia>;
+}
+
+async function sendChunk(
+  apiBase: string,
+  stagedId: string,
+  chunk: Blob,
+  start: number,
+  total: number,
+  onProgress: (progress: number) => void,
+  onRequest: (request: XMLHttpRequest | null) => void,
+): Promise<StagedMedia> {
+  const token = await accessToken();
+  if (!token) throw new UploadAttemptError('Inicia sesión antes de cargar un video.', false);
+  const end = start + chunk.size - 1;
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    let stalled = false;
+    let lastProgressAt = Date.now();
+    // Detección de conexión colgada: sin un timeout fijo (un fragmento
+    // puede tardar legítimamente en una conexión lenta), se aborta solo
+    // si no llega ningún evento de progreso durante UPLOAD_STALL_TIMEOUT_MS.
+    const stallTimer = window.setInterval(() => {
+      if (Date.now() - lastProgressAt > UPLOAD_STALL_TIMEOUT_MS) {
+        stalled = true;
+        request.abort();
+      }
+    }, 5000);
+    const settle = (finish: () => void) => {
+      window.clearInterval(stallTimer);
+      onRequest(null);
+      finish();
+    };
+    request.open('POST', `${apiBase}/api/staged-media/${stagedId}/content`);
+    request.setRequestHeader('Content-Type', 'application/octet-stream');
+    request.setRequestHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    request.setRequestHeader('Authorization', `Bearer ${token}`);
+    request.upload.onprogress = (event) => {
+      lastProgressAt = Date.now();
+      if (event.lengthComputable && event.total > 0) {
+        const uploaded = start + Math.round((event.loaded / event.total) * chunk.size);
+        onProgress(Math.min(99, Math.floor((uploaded / total) * 100)));
+      }
+    };
+    request.onload = () => {
+      settle(() => {
+        if (request.status >= 200 && request.status < 300) {
+          try {
+            resolve(JSON.parse(request.responseText) as StagedMedia);
+          } catch {
+            reject(new UploadAttemptError('El servidor respondió sin los datos de la carga.', true));
+          }
+          return;
+        }
+        let detail = `El servidor respondió con error (${request.status}).`;
+        try {
+          const body = JSON.parse(request.responseText) as { detail?: string };
+          detail = body.detail ?? detail;
+        } catch {
+          // Se conserva el mensaje genérico con el código de estado.
+        }
+        // 5xx: transitorio. 409 (offset por delante) y 400 (fragmento
+        // interrumpido, .part conservado): se reanuda desde
+        // bytes_received. El resto de 4xx no se reintenta.
+        const retryable = request.status >= 500 || request.status === 409 || request.status === 400;
+        reject(new UploadAttemptError(detail, retryable));
+      });
+    };
+    request.onerror = () => {
+      settle(() => reject(new UploadAttemptError(
+        'No se pudo conectar con el almacenamiento local.',
+        true,
+      )));
+    };
+    request.onabort = () => {
+      settle(() => reject(stalled
+        ? new UploadAttemptError(
+          'La conexión se quedó sin responder durante la subida.',
+          true,
+        )
+        : new UploadAttemptError('Importación cancelada.', false)));
+    };
+    onRequest(request);
+    request.send(chunk);
+  });
+}
+
 async function uploadStagedFile(
   apiBase: string,
   stagedId: string,
   file: File,
   onProgress: (progress: number) => void,
   onRequest: (request: XMLHttpRequest | null) => void,
+  startAt = 0,
 ): Promise<void> {
-  const token = await accessToken();
-  if (!token) throw new Error('Inicia sesión antes de cargar un video.');
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open('POST', `${apiBase}/api/staged-media/${stagedId}/content`);
-    request.setRequestHeader('Content-Type', 'application/octet-stream');
-    request.setRequestHeader('Authorization', `Bearer ${token}`);
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
+  let offset = startAt;
+  let chunkAttempts = 0;
+  while (offset < file.size) {
+    const chunk = file.slice(offset, Math.min(offset + UPLOAD_CHUNK_BYTES, file.size));
+    try {
+      const staged = await sendChunk(apiBase, stagedId, chunk, offset, file.size, onProgress, onRequest);
+      // El servidor es la fuente de verdad: bytes_received manda.
+      if (staged.status === 'failed') {
+        throw new UploadAttemptError(staged.error ?? 'La carga falló en el servidor.', false);
       }
-    };
-    request.onload = () => {
-      onRequest(null);
-      if (request.status >= 200 && request.status < 300) {
-        resolve();
+      if (staged.status === 'ready') {
+        onProgress(100);
         return;
       }
-      try {
-        const body = JSON.parse(request.responseText) as { detail?: string };
-        reject(new Error(body.detail ?? `El servidor respondió con error (${request.status}).`));
-      } catch {
-        reject(new Error(`El servidor respondió con error (${request.status}).`));
+      if (staged.bytes_received <= offset) {
+        // El fragmento se aceptó pero no avanzó nada: anomalía del
+        // servidor; reintentarlo no ayudaría.
+        throw new UploadAttemptError('El servidor no confirmó el fragmento enviado.', false);
       }
-    };
-    request.onerror = () => {
-      onRequest(null);
-      reject(new Error('No se pudo conectar con el almacenamiento local.'));
-    };
-    request.onabort = () => {
-      onRequest(null);
-      reject(new Error('Importación cancelada.'));
-    };
-    onRequest(request);
-    request.send(file);
-  });
+      offset = staged.bytes_received;
+      onProgress(Math.min(99, Math.floor((offset / file.size) * 100)));
+      chunkAttempts = 0;
+    } catch (error) {
+      const retryable = error instanceof UploadAttemptError
+        ? error.retryable
+        : error instanceof TypeError;
+      if (!retryable) throw error;
+      chunkAttempts += 1;
+      if (chunkAttempts >= MAX_CHUNK_ATTEMPTS) throw error;
+      await new Promise((resolve) => window.setTimeout(
+        resolve,
+        UPLOAD_RETRY_DELAYS_MS[chunkAttempts - 1] ?? 2000,
+      ));
+      // Reanudar desde lo confirmado por el servidor.
+      const staged = await fetchStagedMedia(apiBase, stagedId);
+      if (staged.status === 'ready') {
+        onProgress(100);
+        return;
+      }
+      if (staged.status === 'failed') {
+        throw new UploadAttemptError(staged.error ?? 'La carga falló en el servidor.', false);
+      }
+      offset = staged.bytes_received;
+    }
+  }
 }
 
 function metadataFor(file: File): Promise<{ duration: number; width: number; height: number; thumbnail: string }> {
@@ -160,6 +280,8 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
   const [thumbnail, setThumbnail] = useState('');
   const [progress, setProgress] = useState<number | null>(null);
   const [uploadError, setUploadError] = useState('');
+  // Fase 2 (ítem 22): intento actual de subida (null fuera de un reintento).
+  const [uploadAttempt, setUploadAttempt] = useState<{ attempt: number; maxAttempts: number } | null>(null);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const cancelImportRef = useRef(false);
@@ -228,6 +350,12 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
       setUploadError('El archivo está vacío. Elige otro archivo.');
       return;
     }
+    // Fase 2 (ítem 22): validación en cliente del tamaño máximo (4 GiB),
+    // antes de crear la carga en el servidor.
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setUploadError(`El archivo supera el tamaño máximo admitido de ${MAX_UPLOAD_LABEL}. Elige un archivo más pequeño o comprímelo antes de subirlo.`);
+      return;
+    }
 
     uploadRequestRef.current?.abort();
     cancelImportRef.current = false;
@@ -235,57 +363,120 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
     onImportStart();
     setFileInfo(null);
     setThumbnail('');
+    setUploadAttempt(null);
     setProgress(0);
     const kind = file.type.startsWith('audio/') || ['mp3', 'wav', 'm4a'].includes(extension) ? 'audio' : 'video';
+    const wasCancelled = () => cancelImportRef.current || generation !== importGenerationRef.current;
     try {
       const metadata = await metadataFor(file);
-      if (cancelImportRef.current || generation !== importGenerationRef.current) {
+      if (wasCancelled()) {
         setProgress(null);
         return;
       }
-      const createResponse = await apiFetch(`${apiBase}/api/staged-media/uploads`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filename: file.name,
-          file_size: file.size,
-          content_type: file.type || 'application/octet-stream',
-          duration: metadata.duration,
-          width: metadata.width,
-          height: metadata.height,
-          kind,
-        }),
-      });
-      if (!createResponse.ok) throw new Error(await responseError(createResponse));
-      const staged = await createResponse.json() as StagedMedia;
-      if (cancelImportRef.current || generation !== importGenerationRef.current) {
-        const deleteResponse = await apiFetch(`${apiBase}/api/staged-media/${staged.id}`, { method: 'DELETE' });
-        if (!deleteResponse.ok) throw new Error(await responseError(deleteResponse));
-        setProgress(null);
-        return;
+      // Subida por fragmentos con reanudación: la carga se crea UNA vez;
+      // cada reintento reanuda desde los bytes confirmados por el
+      // servidor en vez de recrear la carga y empezar de cero.
+      let lastError: Error | null = null;
+      let stagedId: string | null = null;
+      for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+        if (wasCancelled()) {
+          setProgress(null);
+          return;
+        }
+        setUploadAttempt({ attempt, maxAttempts: MAX_UPLOAD_ATTEMPTS });
+        try {
+          let resumeFrom = 0;
+          if (stagedId === null) {
+            const createResponse = await apiFetch(`${apiBase}/api/staged-media/uploads`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                filename: file.name,
+                file_size: file.size,
+                content_type: file.type || 'application/octet-stream',
+                duration: metadata.duration,
+                width: metadata.width,
+                height: metadata.height,
+                kind,
+              }),
+            });
+            if (!createResponse.ok) {
+              throw new UploadAttemptError(
+                await responseError(createResponse),
+                createResponse.status >= 500,
+              );
+            }
+            const staged = await createResponse.json() as StagedMedia;
+            stagedId = staged.id;
+            if (wasCancelled()) {
+              const deleteResponse = await apiFetch(`${apiBase}/api/staged-media/${staged.id}`, { method: 'DELETE' });
+              if (!deleteResponse.ok) throw new Error(await responseError(deleteResponse));
+              setProgress(null);
+              return;
+            }
+            setFileInfo(stagedUploadInfo(staged));
+            setThumbnail(metadata.thumbnail);
+          } else {
+            // Reanudar: preguntar al servidor desde dónde seguir.
+            const staged = await fetchStagedMedia(apiBase, stagedId);
+            if (staged.status === 'ready') {
+              if (generation === importGenerationRef.current) {
+                setProgress(100);
+                setUploadError('');
+                setUploadAttempt(null);
+              }
+              return;
+            }
+            if (staged.status === 'failed') {
+              throw new UploadAttemptError(staged.error ?? 'La carga falló en el servidor.', false);
+            }
+            resumeFrom = staged.bytes_received;
+            setProgress(Math.min(99, Math.floor((resumeFrom / file.size) * 100)));
+          }
+          await uploadStagedFile(
+            apiBase,
+            stagedId,
+            file,
+            (value) => {
+              if (generation === importGenerationRef.current) setProgress(value);
+            },
+            (request) => {
+              if (generation === importGenerationRef.current) uploadRequestRef.current = request;
+            },
+            resumeFrom,
+          );
+          if (generation === importGenerationRef.current) {
+            setProgress(100);
+            setUploadError('');
+            setUploadAttempt(null);
+          }
+          return;
+        } catch (attemptError) {
+          if (wasCancelled()) {
+            setProgress(null);
+            return;
+          }
+          lastError = attemptError instanceof Error
+            ? attemptError
+            : new Error('No se pudo guardar el archivo en este dispositivo.');
+          const retryable = attemptError instanceof UploadAttemptError
+            ? attemptError.retryable
+            // Un fallo de red de fetch (TypeError) también se reintenta.
+            : attemptError instanceof TypeError;
+          if (!retryable || attempt === MAX_UPLOAD_ATTEMPTS) throw lastError;
+          await new Promise((resolve) => window.setTimeout(
+            resolve,
+            UPLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 2000,
+          ));
+        }
       }
-      setFileInfo(stagedUploadInfo(staged));
-      setThumbnail(metadata.thumbnail);
-      await uploadStagedFile(
-        apiBase,
-        staged.id,
-        file,
-        (value) => {
-          if (generation === importGenerationRef.current) setProgress(value);
-        },
-        (request) => {
-          if (generation === importGenerationRef.current) uploadRequestRef.current = request;
-        },
-      );
-      if (generation === importGenerationRef.current) {
-        setProgress(100);
-        setUploadError('');
-      }
+      throw lastError ?? new Error('No se pudo guardar el archivo en este dispositivo.');
     } catch (error) {
       if (generation !== importGenerationRef.current) return;
       if (uploadRequestRef.current) uploadRequestRef.current = null;
       setProgress(null);
       setFileInfo(null);
+      setUploadAttempt(null);
       setUploadError(error instanceof Error ? error.message : 'No se pudo guardar el archivo en este dispositivo.');
     }
   }, [apiBase, onImportStart, onNotice]);
@@ -307,6 +498,7 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
     cancelImportRef.current = true;
     uploadRequestRef.current?.abort();
     setProgress(null);
+    setUploadAttempt(null);
     setUploadError('Importación cancelada.');
   };
 
@@ -318,6 +510,7 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
     setProgress,
     uploadError,
     setUploadError,
+    uploadAttempt,
     dragging,
     setDragging,
     inputRef,

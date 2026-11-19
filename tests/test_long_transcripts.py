@@ -30,6 +30,7 @@ def test_long_transcripts_use_overlapping_windows_and_restore_absolute_times(
         window_duration: float,
         _llm: ResolvedLLM,
         validation_feedback: list[str] | None = None,
+        **_kwargs: object,
     ) -> list[ClipProposal]:
         assert validation_feedback is None
         calls.append((window_duration, window_transcript))

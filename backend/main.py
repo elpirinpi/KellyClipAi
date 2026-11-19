@@ -4,11 +4,13 @@ import asyncio
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -26,6 +28,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
 )
@@ -51,6 +54,7 @@ from .credential_store import (
     encrypt_api_key,
 )
 from .editor import (
+    EditorRenderJobManager,
     editor_preview_path,
     editor_state,
     find_clip,
@@ -72,11 +76,14 @@ from .pipeline import process_project
 from .process_queue import ProjectProcessingQueue, request_project_cancellation
 from .scheduler import schedule_worker
 from .schemas import (
+    DEFAULT_PROJECTS_PAGE_SIZE,
+    MAX_PROJECTS_PAGE_SIZE,
     MAX_UPLOAD_BYTES,
     ClipArchiveRequest,
     ClipEditRequest,
     ClipResolutionRequest,
     CustomTemplateRequest,
+    EditorRenderJobResponse,
     LLMConfig,
     LLMSettingsRequest,
     OverdueScheduleResolution,
@@ -123,6 +130,55 @@ class _StagedDownloadCancelled(RuntimeError):
     """
 
 
+class _ChunkTooLargeError(RuntimeError):
+    """El cuerpo supera el rango declarado o el tamaño del archivo."""
+
+
+# --- Locks por staged_id para la subida reanudable (Fase 2, B4/B-F11) -------
+# Dos POST /content concurrentes al mismo staged_id se truncaban
+# mutuamente (ambos abrían el .part con "wb"). Cada staged tiene su lock
+# asyncio: las subidas de distintos staged siguen en paralelo, pero las
+# del mismo staged (y su borrado) se serializan. Los locks se conservan
+# (son pequeños y su número está acotado por el número de staged creados):
+# borrarlos al soltarlos abriría una carrera entre quien suelta y quien
+# está a punto de adquirir.
+_STAGED_UPLOAD_LOCKS: dict[str, asyncio.Lock] = {}
+_STAGED_UPLOAD_LOCKS_GUARD = threading.Lock()
+
+
+def _staged_upload_lock(staged_id: str) -> asyncio.Lock:
+    with _STAGED_UPLOAD_LOCKS_GUARD:
+        lock = _STAGED_UPLOAD_LOCKS.get(staged_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _STAGED_UPLOAD_LOCKS[staged_id] = lock
+        return lock
+
+
+_CONTENT_RANGE_PATTERN = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+
+
+def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
+    """Parsea `Content-Range: bytes <inicio>-<fin>/<total>`.
+
+    Devuelve (inicio, fin, total) o None si no hay cabecera. Lanza
+    ValueError si la cabecera está presente pero mal formada o el rango
+    es incoherente (fin < inicio, fin >= total, total <= 0).
+    """
+    if value is None or not value.strip():
+        return None
+    match = _CONTENT_RANGE_PATTERN.match(value.strip())
+    if match is None:
+        raise ValueError(
+            "La cabecera Content-Range debe tener el formato "
+            "'bytes <inicio>-<fin>/<total>'."
+        )
+    start, end, total = (int(part) for part in match.groups())
+    if end < start or total <= 0 or end >= total:
+        raise ValueError("El rango de la cabecera Content-Range no es válido.")
+    return start, end, total
+
+
 class SPAStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Scope) -> Response:
         try:
@@ -145,7 +201,12 @@ def _parse_config(value: str) -> ProjectConfig:
         raise HTTPException(status_code=422, detail=f"Configuración de proyecto no válida: {error}") from error
 
 
-def _serialize_project(project: dict, *, include_transcript: bool = False) -> dict:
+def _serialize_project(
+    project: dict,
+    *,
+    include_transcript: bool = False,
+    include_clip_transcripts: bool = True,
+) -> dict:
     project.pop("owner_id", None)
     if not include_transcript:
         project.pop("transcript", None)
@@ -153,8 +214,9 @@ def _serialize_project(project: dict, *, include_transcript: bool = False) -> di
     project["thumbnail_url"] = (
         f"/api/projects/{project_id}/thumbnail" if project.get("metadata") else None
     )
-    project["clips"] = [
-        {
+    serialized_clips = []
+    for clip in project.get("clips") or []:
+        serialized = {
             **clip,
             "video_url": (
                 f"/api/projects/{project_id}/clips/{clip['id']}/file"
@@ -167,8 +229,13 @@ def _serialize_project(project: dict, *, include_transcript: bool = False) -> di
                 else None
             ),
         }
-        for clip in project.get("clips") or []
-    ]
+        if not include_clip_transcripts:
+            # B-R10: en el listado, cada clip traía su transcripción
+            # palabra por palabra (kilobytes por clip). El detalle de
+            # proyecto y el editor sí la necesitan; el listado, no.
+            serialized.pop("transcript", None)
+        serialized_clips.append(serialized)
+    project["clips"] = serialized_clips
     return project
 
 
@@ -497,6 +564,11 @@ def create_app(
                 app_settings,
                 retry_failed_only=retry_failed_only,
             ),
+            # Cola persistente (Fase 2, B-S10): con database_path, los
+            # trabajos encolados sobreviven a un reinicio y start()
+            # recupera los pendientes. fail_interrupted_projects (arriba)
+            # ya no falla los proyectos con trabajo recuperable.
+            database_path=app_settings.database_path,
         )
         await processing_queue.start()
         application.state.processing_queue = processing_queue
@@ -1024,14 +1096,35 @@ def create_app(
             ) from error
 
     @application.get("/api/projects")
-    def projects(request: Request) -> list[dict]:
-        return [
-            _serialize_project(project)
+    def projects(
+        request: Request,
+        limit: int = Query(
+            DEFAULT_PROJECTS_PAGE_SIZE, ge=1, le=MAX_PROJECTS_PAGE_SIZE
+        ),
+        offset: int = Query(0, ge=0),
+    ) -> dict:
+        """Listado paginado de proyectos (Fase 2, B-R10).
+
+        Respuesta: {"items": [...], "total": N, "limit": L, "offset": O}.
+        El cambio de forma (antes devolvía una lista plana) es
+        deliberado: el frontend actual no consume este endpoint (solo
+        pide proyectos por id), y la vista "Mis proyectos" necesita el
+        total para paginar. Cada clip del listado viene SIN su
+        transcripción palabra por palabra; el detalle de proyecto
+        (GET /api/projects/{id}) la sigue incluyendo.
+        """
+        owner_id = request_user_id(request)
+        total = database.count_projects(app_settings.database_path, owner_id)
+        items = [
+            _serialize_project(project, include_clip_transcripts=False)
             for project in database.list_projects(
                 app_settings.database_path,
-                request_user_id(request),
+                owner_id,
+                limit=limit,
+                offset=offset,
             )
         ]
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
 
     @application.get("/api/storage")
     def storage_usage() -> dict[str, int]:
@@ -1080,92 +1173,232 @@ def create_app(
 
     @application.post("/api/staged-media/{staged_id}/content")
     async def receive_staged_upload(staged_id: str, request: Request) -> dict:
-        staged = database.get_staged_media(app_settings.database_path, staged_id)
-        if staged is None or staged["source_type"] != "upload":
-            raise HTTPException(status_code=404, detail="No se encontró la carga local.")
-        if staged["status"] != "receiving":
-            raise HTTPException(status_code=409, detail="La carga local ya no está disponible.")
+        """Recibe el contenido de una carga local, con reanudación (B-F11).
 
-        staging_root = app_settings.data_dir / "staging"
-        partial_path = staging_root / f"{staged_id}.part"
-        staged_path = staging_root / f"{staged_id}.source"
-        received = 0
-        last_saved = 0
-        try:
-            with partial_path.open("wb") as target:
-                async for chunk in request.stream():
-                    if not chunk:
-                        continue
-                    received += len(chunk)
-                    if received > staged["file_size"]:
-                        raise HTTPException(
-                            status_code=413,
-                            detail="La carga supera el tamaño del archivo seleccionado.",
-                        )
-                    for offset in range(0, len(chunk), _STAGED_WRITE_SIZE):
-                        block = memoryview(chunk)[offset : offset + _STAGED_WRITE_SIZE]
-                        await asyncio.to_thread(target.write, block)
-                    if received - last_saved >= 4 * _STAGED_WRITE_SIZE:
-                        database.update_staged_media(
-                            app_settings.database_path,
-                            staged_id,
-                            bytes_received=received,
-                        )
-                        last_saved = received
-                await asyncio.to_thread(target.flush)
-            if received != staged["file_size"]:
+        Protocolo:
+        - Sin cabecera ni parámetro: subida de un solo disparo (como
+          antes): el cuerpo debe ser el archivo completo.
+        - Con `Content-Range: bytes <inicio>-<fin>/<total>` (o el
+          parámetro `?offset=<inicio>`): subida por fragmentos. El total
+          debe coincidir con el file_size declarado al crear el staged.
+          El inicio debe ser <= a los bytes ya guardados en disco (el
+          .part es la fuente de verdad; si el cliente reenvía desde
+          antes, se sobrescribe desde ahí). Un inicio mayor se rechaza
+          con 409 indicando desde dónde reanudar.
+        - Cada fragmento aceptado devuelve 200 con el staged actualizado
+          (status "receiving", bytes_received al día); solo al completar
+          el último byte el staged pasa a "ready" y el .part se mueve
+          a .source.
+        - Ante una interrupción (desconexión, fragmento incompleto o
+          error de disco) NO se borra el .part ni se marca failed: el
+          staged queda en "receiving" con bytes_received actualizado
+          (visible en el GET) y el cliente reanuda desde ahí.
+        - La subida legacy sin rango que llega corta sigue siendo 400 +
+          failed, como antes: sin rango no hay forma de saber si el
+          cliente reintentará.
+        El lock por staged_id serializa fragmentos concurrentes y el
+        borrado del staged (carrera B4).
+        """
+        async with _staged_upload_lock(staged_id):
+            staged = database.get_staged_media(app_settings.database_path, staged_id)
+            if staged is None or staged["source_type"] != "upload":
+                raise HTTPException(status_code=404, detail="No se encontró la carga local.")
+            if staged["status"] != "receiving":
+                raise HTTPException(status_code=409, detail="La carga local ya no está disponible.")
+            file_size = int(staged["file_size"])
+            try:
+                content_range = _parse_content_range(
+                    request.headers.get("content-range")
+                )
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            offset_param = request.query_params.get("offset")
+            resumable = content_range is not None or offset_param is not None
+            chunk_start = 0
+            chunk_length: int | None = None
+            if content_range is not None:
+                chunk_start, chunk_end, range_total = content_range
+                if range_total != file_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="El total de Content-Range no coincide con el tamaño declarado del archivo.",
+                    )
+                chunk_length = chunk_end - chunk_start + 1
+            elif offset_param is not None:
+                try:
+                    chunk_start = int(offset_param)
+                except ValueError as error:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="El parámetro offset debe ser un número entero.",
+                    ) from error
+                if chunk_start < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="El parámetro offset no puede ser negativo.",
+                    )
+
+            staging_root = app_settings.data_dir / "staging"
+            partial_path = staging_root / f"{staged_id}.part"
+            staged_path = staging_root / f"{staged_id}.source"
+            part_size = partial_path.stat().st_size if partial_path.is_file() else 0
+            if chunk_start > part_size:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"El offset {chunk_start} supera los {part_size} bytes ya "
+                        f"recibidos. Reanuda desde {part_size}."
+                    ),
+                )
+            received_in_request = 0
+            last_saved = 0
+            try:
+                mode = "r+b" if partial_path.is_file() else "wb"
+                with partial_path.open(mode) as target:
+                    if chunk_start < part_size:
+                        # El cliente reenvía desde antes de lo guardado
+                        # (su vista de bytes_received iba por detrás): se
+                        # trunca y se sobrescribe desde ahí.
+                        target.truncate(chunk_start)
+                    target.seek(chunk_start)
+                    async for chunk in request.stream():
+                        if not chunk:
+                            continue
+                        if (
+                            chunk_length is not None
+                            and received_in_request + len(chunk) > chunk_length
+                        ):
+                            raise _ChunkTooLargeError(
+                                "El cuerpo supera el rango declarado en Content-Range."
+                            )
+                        if chunk_start + received_in_request + len(chunk) > file_size:
+                            raise _ChunkTooLargeError(
+                                "La carga supera el tamaño del archivo seleccionado."
+                            )
+                        received_in_request += len(chunk)
+                        for offset in range(0, len(chunk), _STAGED_WRITE_SIZE):
+                            block = memoryview(chunk)[offset : offset + _STAGED_WRITE_SIZE]
+                            await asyncio.to_thread(target.write, block)
+                        if received_in_request - last_saved >= 4 * _STAGED_WRITE_SIZE:
+                            database.update_staged_media(
+                                app_settings.database_path,
+                                staged_id,
+                                bytes_received=chunk_start + received_in_request,
+                            )
+                            last_saved = received_in_request
+                    await asyncio.to_thread(target.flush)
+            except _ChunkTooLargeError as error:
+                if resumable:
+                    # Se revierte solo este fragmento: el .part vuelve a
+                    # su tamaño previo y el cliente puede reintentarlo.
+                    try:
+                        with partial_path.open("r+b") as target:
+                            target.truncate(chunk_start)
+                    except OSError:
+                        pass
+                    database.update_staged_media(
+                        app_settings.database_path,
+                        staged_id,
+                        bytes_received=chunk_start,
+                    )
+                else:
+                    partial_path.unlink(missing_ok=True)
+                    database.update_staged_media(
+                        app_settings.database_path,
+                        staged_id,
+                        status="failed",
+                        error=str(error),
+                    )
+                raise HTTPException(status_code=413, detail=str(error)) from error
+            except ClientDisconnect as error:
+                # Interrupción: NO se borra el .part ni se marca failed.
+                # El cliente reanuda desde los bytes guardados en disco.
+                bytes_on_disk = (
+                    partial_path.stat().st_size if partial_path.is_file() else chunk_start
+                )
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    bytes_received=bytes_on_disk,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "La conexión se interrumpió durante la carga. "
+                        f"Reanuda desde el byte {bytes_on_disk}."
+                    ),
+                ) from error
+            except OSError as error:
+                # Error de disco (p. ej. sin espacio): se conserva lo
+                # recibido para reanudar cuando haya espacio.
+                bytes_on_disk = (
+                    partial_path.stat().st_size if partial_path.is_file() else chunk_start
+                )
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    bytes_received=bytes_on_disk,
+                    error=f"No se pudo guardar el archivo en disco: {error}",
+                )
+                raise HTTPException(
+                    status_code=507,
+                    detail=f"No se pudo guardar el archivo en disco. Revisa el espacio disponible: {error}",
+                ) from error
+
+            total_received = chunk_start + received_in_request
+            if chunk_length is not None and received_in_request < chunk_length:
+                # El fragmento quedó incompleto (el cliente cerró antes
+                # de enviar el rango declarado): se conservan los bytes
+                # recibidos y el estado receiving para reanudar.
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    bytes_received=total_received,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"El fragmento quedó incompleto: se recibieron "
+                        f"{received_in_request} de {chunk_length} bytes. "
+                        f"Reanuda desde {total_received}."
+                    ),
+                )
+            if total_received == file_size:
+                partial_path.replace(staged_path)
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    status="ready",
+                    bytes_received=total_received,
+                    total_bytes=total_received,
+                    speed=None,
+                    eta=None,
+                    error=None,
+                )
+            elif resumable:
+                # Fragmento aceptado; quedan más por venir.
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    bytes_received=total_received,
+                )
+            else:
+                # Subida legacy sin rango que llega corta: como antes,
+                # 400 y failed (sin rango no se puede reanudar).
+                partial_path.unlink(missing_ok=True)
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    status="failed",
+                    error="La carga se interrumpió antes de recibir el archivo completo.",
+                )
                 raise HTTPException(
                     status_code=400,
                     detail="La carga se interrumpió antes de recibir el archivo completo.",
                 )
-            partial_path.replace(staged_path)
-        except HTTPException as error:
-            partial_path.unlink(missing_ok=True)
-            database.update_staged_media(
-                app_settings.database_path,
-                staged_id,
-                status="failed",
-                error=str(error.detail),
+            return _serialize_staged_media(
+                database.get_staged_media(app_settings.database_path, staged_id)
             )
-            raise
-        except ClientDisconnect as error:
-            partial_path.unlink(missing_ok=True)
-            database.update_staged_media(
-                app_settings.database_path,
-                staged_id,
-                status="failed",
-                error="La conexión se interrumpió durante la carga. Vuelve a seleccionarlo.",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail="La conexión se interrumpió durante la carga. Vuelve a seleccionarlo.",
-            ) from error
-        except OSError as error:
-            partial_path.unlink(missing_ok=True)
-            database.update_staged_media(
-                app_settings.database_path,
-                staged_id,
-                status="failed",
-                error=f"No se pudo guardar el archivo en disco: {error}",
-            )
-            raise HTTPException(
-                status_code=507,
-                detail=f"No se pudo guardar el archivo en disco. Revisa el espacio disponible: {error}",
-            ) from error
-
-        database.update_staged_media(
-            app_settings.database_path,
-            staged_id,
-            status="ready",
-            bytes_received=received,
-            total_bytes=received,
-            speed=None,
-            eta=None,
-            error=None,
-        )
-        return _serialize_staged_media(
-            database.get_staged_media(app_settings.database_path, staged_id)
-        )
 
     @application.post("/api/staged-media/downloads", status_code=202)
     def create_staged_download(
@@ -1204,35 +1437,39 @@ def create_app(
         return _serialize_staged_media(staged)
 
     @application.delete("/api/staged-media/{staged_id}", status_code=204)
-    def delete_staged_media(staged_id: str) -> Response:
-        staged = database.get_staged_media(app_settings.database_path, staged_id)
-        if staged is None:
-            raise HTTPException(status_code=404, detail="No se encontró la importación.")
-        if not database.claim_staged_media_for_deletion(
-            app_settings.database_path, staged_id
-        ):
-            raise HTTPException(status_code=409, detail="No se puede cancelar esta importación ahora.")
-        try:
-            if staged["source_type"] == "upload":
-                for suffix in (".part", ".source"):
-                    (app_settings.data_dir / "staging" / f"{staged_id}{suffix}").unlink(missing_ok=True)
-            else:
-                shutil.rmtree(app_settings.data_dir / "staging" / staged_id, ignore_errors=True)
-                (app_settings.data_dir / "staging" / f"{staged_id}.source").unlink(missing_ok=True)
-        except OSError as error:
-            database.update_staged_media(
-                app_settings.database_path,
-                staged_id,
-                status="failed",
-                error=f"No se pudo limpiar el archivo temporal: {error}",
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"No se pudo limpiar el archivo temporal: {error}",
-            ) from error
-        if not database.delete_staged_media(app_settings.database_path, staged_id):
-            raise HTTPException(status_code=409, detail="La importación cambió mientras se cancelaba.")
-        return Response(status_code=204)
+    async def delete_staged_media(staged_id: str) -> Response:
+        # El mismo lock de la subida (B4): si hay un fragmento en curso,
+        # el borrado espera a que termine en vez de borrar el .part
+        # mientras se escribe.
+        async with _staged_upload_lock(staged_id):
+            staged = database.get_staged_media(app_settings.database_path, staged_id)
+            if staged is None:
+                raise HTTPException(status_code=404, detail="No se encontró la importación.")
+            if not database.claim_staged_media_for_deletion(
+                app_settings.database_path, staged_id
+            ):
+                raise HTTPException(status_code=409, detail="No se puede cancelar esta importación ahora.")
+            try:
+                if staged["source_type"] == "upload":
+                    for suffix in (".part", ".source"):
+                        (app_settings.data_dir / "staging" / f"{staged_id}{suffix}").unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(app_settings.data_dir / "staging" / staged_id, ignore_errors=True)
+                    (app_settings.data_dir / "staging" / f"{staged_id}.source").unlink(missing_ok=True)
+            except OSError as error:
+                database.update_staged_media(
+                    app_settings.database_path,
+                    staged_id,
+                    status="failed",
+                    error=f"No se pudo limpiar el archivo temporal: {error}",
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"No se pudo limpiar el archivo temporal: {error}",
+                ) from error
+            if not database.delete_staged_media(app_settings.database_path, staged_id):
+                raise HTTPException(status_code=409, detail="La importación cambió mientras se cancelaba.")
+            return Response(status_code=204)
 
     @application.post("/api/staged-media/{staged_id}/project", status_code=201)
     def create_project_from_staged_media(
@@ -1796,6 +2033,149 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+
+    # --- Renders del editor como trabajos asíncronos (Fase 2, B-P8) --------
+    # Los endpoints síncronos de arriba se MANTIENEN por compatibilidad
+    # (el frontend actual los usa y los tests de contrato los cubren).
+    # Los endpoints /jobs son la vía nueva: encolan el render en vez de
+    # bloquear la petición HTTP minutos, exponen el progreso por SSE y
+    # permiten cancelar. El resultado del trabajo, al completarse, tiene
+    # la misma forma que la respuesta del endpoint síncrono equivalente.
+    def editor_job_manager() -> EditorRenderJobManager:
+        manager = getattr(application.state, "editor_jobs", None)
+        if manager is None:
+            manager = EditorRenderJobManager(app_settings)
+            application.state.editor_jobs = manager
+        return manager
+
+    def editor_job_or_404(job_id: str) -> dict:
+        job = editor_job_manager().get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404, detail="No se encontró el trabajo de render."
+            )
+        return job.to_dict()
+
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/edit/preview/jobs",
+        status_code=202,
+        response_model=EditorRenderJobResponse,
+    )
+    async def create_preview_job(
+        project_id: str,
+        clip_id: str,
+        edit: ClipEditRequest,
+    ) -> dict:
+        project, clip = editable_project_clip(project_id, clip_id)
+        try:
+            job = editor_job_manager().submit(project, clip, edit, "preview")
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return job.to_dict()
+
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/edit/export/jobs",
+        status_code=202,
+        response_model=EditorRenderJobResponse,
+    )
+    async def create_export_job(
+        project_id: str,
+        clip_id: str,
+        edit: ClipEditRequest,
+    ) -> dict:
+        project, clip = editable_project_clip(project_id, clip_id)
+        try:
+            job = editor_job_manager().submit(project, clip, edit, "export")
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return job.to_dict()
+
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/quality/jobs",
+        status_code=202,
+        response_model=EditorRenderJobResponse,
+    )
+    async def create_quality_job(
+        project_id: str,
+        clip_id: str,
+        request: ClipResolutionRequest,
+    ) -> dict:
+        project, clip = editable_project_clip(project_id, clip_id)
+        edit = stored_editor_request(project, clip)
+        try:
+            job = editor_job_manager().submit(
+                project, clip, edit, "quality", output_resolution=request.resolution
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return job.to_dict()
+
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/improve/jobs",
+        status_code=202,
+        response_model=EditorRenderJobResponse,
+    )
+    async def create_improve_job(project_id: str, clip_id: str) -> dict:
+        project, clip = editable_project_clip(project_id, clip_id)
+        edit = stored_editor_request(project, clip)
+        try:
+            job = editor_job_manager().submit(
+                project, clip, edit, "improve", enhance_audio=True
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return job.to_dict()
+
+    @application.get(
+        "/api/editor-jobs/{job_id}",
+        response_model=EditorRenderJobResponse,
+    )
+    def get_editor_job(job_id: str) -> dict:
+        return editor_job_or_404(job_id)
+
+    @application.get("/api/editor-jobs/{job_id}/events")
+    async def editor_job_events(job_id: str, request: Request) -> EventSourceResponse:
+        if editor_job_manager().get(job_id) is None:
+            raise HTTPException(
+                status_code=404, detail="No se encontró el trabajo de render."
+            )
+
+        async def event_stream():
+            last_state: tuple[str, float] | None = None
+            while True:
+                job = editor_job_manager().get(job_id)
+                if job is None:
+                    break
+                state = (job.status, round(job.progress, 1))
+                if state != last_state:
+                    last_state = state
+                    yield {
+                        "event": "progress",
+                        "data": json.dumps(job.to_dict(), ensure_ascii=False),
+                    }
+                if job.status in {"completed", "failed", "cancelled"}:
+                    break
+                if await request.is_disconnected():
+                    break
+                await asyncio.sleep(0.35)
+
+        return EventSourceResponse(event_stream(), ping=15)
+
+    @application.post(
+        "/api/editor-jobs/{job_id}/cancel",
+        response_model=EditorRenderJobResponse,
+    )
+    def cancel_editor_job(job_id: str) -> dict:
+        job = editor_job_manager().get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404, detail="No se encontró el trabajo de render."
+            )
+        if not editor_job_manager().cancel(job_id):
+            raise HTTPException(
+                status_code=409, detail="Este trabajo ya terminó y no se puede cancelar."
+            )
+        return job.to_dict()
 
     @application.get(
         "/api/projects/{project_id}/clips/{clip_id}/subtitles/{format_name}"

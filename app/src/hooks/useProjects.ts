@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { apiFetch, streamApiEvents } from '../auth';
 import type { ProjectResult } from '../types';
+import { responseError } from '../utils';
 
 type ProjectRouteMode = 'configure' | 'processing' | 'edit' | 'results';
 
@@ -13,15 +14,6 @@ type UseProjectsOptions = {
   navigate: (path: string) => void;
   onConfigureProject: (project: ProjectResult) => void;
 };
-
-async function responseError(response: Response): Promise<string> {
-  try {
-    const body = await response.json() as { detail?: string };
-    return body.detail ?? `El servidor respondió con error (${response.status}).`;
-  } catch {
-    return `El servidor respondió con error (${response.status}).`;
-  }
-}
 
 function isProjectResult(value: unknown): value is ProjectResult {
   return typeof value === 'object'

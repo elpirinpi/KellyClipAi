@@ -90,12 +90,13 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.11.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.1.0.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador no está firmado con un certificado
 de código, por lo que Windows SmartScreen puede mostrar la advertencia
 "Windows protegió tu PC": pulsa **Más información** y luego **Ejecutar de
-todas formas** para continuar. El instalador requiere internet para instalar
+todas formas** para continuar. Para firmar el instalador, ver la sección
+«Firma de código» más abajo. El instalador requiere internet para instalar
 WebView2 si hace falta; el modelo Whisper seleccionado se descarga la primera
 vez que procesas un video. No incluye credenciales LLM ni de redes sociales:
 configúralas en Ajustes o en `%LOCALAPPDATA%\kellyClipAi\.env`.
@@ -123,6 +124,50 @@ En resultados puedes descargar subtítulos SRT o WebVTT; la fuente, tamaño,
 colores y posición se pueden ajustar en la configuración y en el editor.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
+
+## Firma de código
+
+El instalador y `KellyClipAi.exe` se pueden firmar para que Windows no
+muestre la advertencia de SmartScreen ("Windows protegió tu PC") y para
+que el actualizador tenga una verificación de origen independiente del
+hash SHA-256. La firma es opcional: sin credenciales configuradas,
+`build_windows.ps1` y el workflow de release generan el instalador sin
+firmar, como hasta ahora, sin fallar. Si la firma está configurada pero
+falla, el build falla para no publicar un instalador que debería ir
+firmado. Hay dos formas de firmar (el script usa la primera que
+encuentre configurada):
+
+1. **Certificado de código PFX.** Un certificado de firma de código
+   (OV o EV) emitido por una autoridad de certificación pública
+   (DigiCert, Sectigo, GlobalSign, etc.). Se compra en la web de la CA
+   y requiere validar la identidad o la organización; un certificado EV
+   además exige un token USB o HSM para guardar la clave. Con el
+   certificado en formato `.pfx`, configura una de estas dos opciones:
+   - En local: `KELLYCLIP_SIGN_PFX_PATH` con la ruta al `.pfx` y
+     `KELLYCLIP_SIGN_PFX_PASSWORD` con su contraseña.
+   - En GitHub Actions: los secretos del repositorio
+     `CODE_SIGN_PFX_BASE64` (el `.pfx` codificado en base64) y
+     `CODE_SIGN_PFX_PASSWORD`. Opcionalmente,
+     `CODE_SIGN_TIMESTAMP_URL` para usar otro servidor de sello de
+     tiempo (por defecto, `http://timestamp.digicert.com`).
+   La firma la hace `signtool.exe` del SDK de Windows 10/11.
+2. **Azure Trusted Signing.** El servicio de firma de Microsoft: el
+   certificado lo emite Microsoft como parte del servicio, sin token
+   USB que gestionar. Requiere una suscripción de Azure con el recurso
+   Trusted Signing creado y un perfil de certificado. Configura los
+   secretos del repositorio `AZURE_TRUSTED_SIGNING_ENDPOINT` (p. ej.
+   `https://weu.codesigning.azure.net/`),
+   `AZURE_TRUSTED_SIGNING_ACCOUNT` y
+   `AZURE_TRUSTED_SIGNING_CERT_PROFILE`, además de autenticación de
+   Azure (variables `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` y
+   `AZURE_TENANT_ID` de una entidad de servicio con permiso para
+   firmar, o `az login` en local). La firma la hace la CLI
+   `azcodesign` (`dotnet tool install --global
+   Azure.CodeSigning.CommandLine`).
+
+Nunca guardes un `.pfx` ni su contraseña en el repositorio: van solo
+como secretos de GitHub o variables de entorno locales. El script
+borra el `.pfx` temporal que decodifica del secreto después de firmar.
 
 ## Actualizaciones automáticas
 

@@ -17,7 +17,23 @@ _LOG_MAX_BYTES = 5 * 1024 * 1024
 _LOG_BACKUP_COUNT = 3
 _WINDOW_TITLE = "kellyClipAi"
 _SINGLE_INSTANCE_MUTEX = "Local\\kellyClipAi-desktop"
+# Puerto preferido del backend local y último puerto de respaldo: si el
+# 8000 está ocupado se prueba 8001-8010 en orden (B34).
+_DEFAULT_PORT = 8000
+_MAX_FALLBACK_PORT = 8010
 _logger = logging.getLogger(__name__)
+
+
+def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+    """Backstop para excepciones no capturadas en hilos secundarios: sin
+    esto van a stderr, que en el build --windowed es devnull y el fallo
+    de arranque queda invisible (B35)."""
+    thread_name = args.thread.name if args.thread is not None else "desconocido"
+    _logger.error(
+        "Excepción no capturada en el hilo %s",
+        thread_name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
 
 
 def _resource_path(*parts: str) -> Path:
@@ -154,6 +170,9 @@ def _prepare_user_directory() -> Path:
         env_file.write_bytes(template.read_bytes())
     os.environ["KELLYCLIP_ENV_FILE"] = str(env_file)
     os.environ["KELLYCLIP_DATA_DIR"] = str(user_dir / "data")
+    # Valores por defecto para el puerto preferido (8000); _run_app los
+    # sobrescribe con el puerto finalmente elegido antes de leer la
+    # configuración.
     os.environ["KELLYCLIP_OAUTH_REDIRECT_BASE_URL"] = "http://127.0.0.1:8000"
     os.environ["KELLYCLIP_FRONTEND_BASE_URL"] = "http://127.0.0.1:8000"
     ffmpeg_dir = _resource_path("bin")
@@ -161,19 +180,42 @@ def _prepare_user_directory() -> Path:
     return user_dir
 
 
-def _ensure_port_available(host: str, port: int) -> None:
+def _is_port_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         try:
             listener.bind((host, port))
-        except OSError as error:
-            raise RuntimeError(
-                f"El puerto local {port} ya está ocupado. Cierra la otra app o servicio que lo usa e inténtalo de nuevo."
-            ) from error
+        except OSError:
+            return False
+    return True
 
 
-def _wait_for_backend(thread: threading.Thread) -> None:
+def _find_available_port(
+    host: str,
+    start: int = _DEFAULT_PORT,
+    end: int = _MAX_FALLBACK_PORT,
+) -> int:
+    """Primer puerto libre entre `start` y `end` (ambos incluidos).
+
+    El puerto preferido es el 8000, pero cualquier otro servicio local
+    puede ocuparlo; probar los siguientes evita que la app quede
+    inutilizable por un puerto ocupado.
+    """
+    for port in range(start, end + 1):
+        if _is_port_free(host, port):
+            return port
+    raise RuntimeError(
+        f"No hay puertos locales libres entre {start} y {end}. Cierra la "
+        "otra app o servicio que los usa e inténtalo de nuevo."
+    )
+
+
+def _wait_for_backend(
+    thread: threading.Thread,
+    port: int,
+    startup_error: dict[str, BaseException | None] | None = None,
+) -> None:
     deadline = time.monotonic() + 30
-    health_url = "http://127.0.0.1:8000/api/health"
+    health_url = f"http://127.0.0.1:{port}/api/health"
     while time.monotonic() < deadline and thread.is_alive():
         try:
             with urllib.request.urlopen(health_url, timeout=1) as response:
@@ -181,9 +223,45 @@ def _wait_for_backend(thread: threading.Thread) -> None:
                     return
         except (OSError, urllib.error.URLError):
             time.sleep(0.25)
+    if startup_error is not None and startup_error.get("error") is not None:
+        raise RuntimeError(
+            "El backend local no inició correctamente: "
+            f"{startup_error['error']}. Consulta el registro de la "
+            "aplicación para más detalles."
+        )
     raise RuntimeError(
         "El backend local no inició correctamente. Consulta el registro de la aplicación para más detalles."
     )
+
+
+def _configure_uvicorn_logging(log_handler: logging.Handler) -> None:
+    """Dirige los loggers de uvicorn al mismo archivo que desktop.log.
+
+    Se comparte el handler del log principal (no se crea otro sobre el
+    mismo archivo, para no romper la rotación) y se desactiva la
+    propagación para no duplicar cada registro en el logger raíz.
+    Con log_config=None uvicorn no instala handlers propios, así que
+    esta configuración sobrevive a su configure_logging().
+    """
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(name)
+        logger.handlers = [log_handler]
+        logger.propagate = False
+
+
+def _run_server(
+    server: object,
+    startup_error: dict[str, BaseException | None],
+) -> None:
+    """Arranque del servidor en su hilo: cualquier excepción queda
+    registrada en desktop.log y guardada para el mensaje de error del
+    hilo principal, en vez de perderse en stderr (devnull en el build
+    --windowed)."""
+    try:
+        server.run()  # type: ignore[attr-defined]
+    except Exception as error:
+        startup_error["error"] = error
+        _logger.exception("El servidor local terminó con un error")
 
 
 class DesktopApi:
@@ -194,7 +272,11 @@ class DesktopApi:
         return selected[0] if selected else None
 
 
-def _run_app(user_dir: Path, smoke_test: bool) -> None:
+def _run_app(
+    user_dir: Path,
+    smoke_test: bool,
+    log_handler: logging.Handler | None = None,
+) -> None:
     web_dir = _resource_path("web")
     if not (web_dir / "index.html").is_file():
         raise FileNotFoundError("No se encontraron los archivos de la interfaz incluidos en el instalador.")
@@ -202,7 +284,20 @@ def _run_app(user_dir: Path, smoke_test: bool) -> None:
         if not (_resource_path("bin") / binary).is_file():
             raise FileNotFoundError(f"No se encontró {binary} incluido en el instalador.")
 
-    _ensure_port_available("127.0.0.1", 8000)
+    port = _find_available_port("127.0.0.1")
+    if port != _DEFAULT_PORT:
+        _logger.warning(
+            "El puerto %d está ocupado; el backend usará el puerto %d. "
+            "Si algún proveedor OAuth exige la URL de redirección exacta, "
+            "actualízala en su consola para este puerto.",
+            _DEFAULT_PORT,
+            port,
+        )
+    _logger.info("Backend local en http://127.0.0.1:%d", port)
+    # Las URLs base deben apuntar al puerto elegido y fijarse antes de
+    # leer la configuración, que las toma de estas variables.
+    os.environ["KELLYCLIP_OAUTH_REDIRECT_BASE_URL"] = f"http://127.0.0.1:{port}"
+    os.environ["KELLYCLIP_FRONTEND_BASE_URL"] = f"http://127.0.0.1:{port}"
 
     import uvicorn
     import webview
@@ -212,6 +307,8 @@ def _run_app(user_dir: Path, smoke_test: bool) -> None:
     from backend.updater import UpdateManager
     from backend.version import APP_VERSION
 
+    if log_handler is not None:
+        _configure_uvicorn_logging(log_handler)
     updater = UpdateManager(
         APP_VERSION,
         user_dir,
@@ -221,19 +318,25 @@ def _run_app(user_dir: Path, smoke_test: bool) -> None:
         uvicorn.Config(
             create_app(get_settings(), web_dir=web_dir, updater=updater),
             host="127.0.0.1",
-            port=8000,
+            port=port,
             log_level="warning",
             access_log=False,
             log_config=None,
         )
     )
-    server_thread = threading.Thread(target=server.run, name="kellyclipai-api", daemon=True)
+    startup_error: dict[str, BaseException | None] = {"error": None}
+    server_thread = threading.Thread(
+        target=_run_server,
+        args=(server, startup_error),
+        name="kellyclipai-api",
+        daemon=True,
+    )
     server_thread.start()
     try:
-        _wait_for_backend(server_thread)
+        _wait_for_backend(server_thread, port, startup_error)
         if smoke_test:
             for path in ("/", "/settings", "/api/health"):
-                with urllib.request.urlopen(f"http://127.0.0.1:8000{path}", timeout=5) as response:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
                     if response.status != 200:
                         raise RuntimeError(f"La comprobación local {path} respondió HTTP {response.status}.")
             for binary in ("ffmpeg.exe", "ffprobe.exe"):
@@ -247,7 +350,7 @@ def _run_app(user_dir: Path, smoke_test: bool) -> None:
             return
         webview.create_window(
             _WINDOW_TITLE,
-            "http://127.0.0.1:8000/",
+            f"http://127.0.0.1:{port}/",
             min_size=(360, 600),
             width=1440,
             height=940,
@@ -261,12 +364,14 @@ def _run_app(user_dir: Path, smoke_test: bool) -> None:
 
 def main(smoke_test: bool = False) -> None:
     user_dir = _prepare_user_directory()
+    log_handler = _create_log_handler(user_dir / "desktop.log")
     logging.basicConfig(
-        handlers=[_create_log_handler(user_dir / "desktop.log")],
+        handlers=[log_handler],
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         force=True,
     )
+    threading.excepthook = _log_thread_exception
     instance = _SingleInstance()
     if not instance.acquire():
         if not _focus_existing_window():
@@ -277,7 +382,7 @@ def main(smoke_test: bool = False) -> None:
             )
         return
     try:
-        _run_app(user_dir, smoke_test)
+        _run_app(user_dir, smoke_test, log_handler)
     finally:
         instance.close()
 

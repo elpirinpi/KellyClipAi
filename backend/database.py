@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -39,6 +40,25 @@ _PROJECT_COLUMNS = {
     "clips",
     "updated_at",
 }
+
+# --- Backup automático de la BD (Fase 2, B-S8) -------------------------------
+# Las copias quedan en <data_dir>/backups/kellyclipai-<timestamp>-<motivo>.sqlite3
+# (data_dir es la carpeta que contiene kellyclipai.sqlite3, p. ej.
+# %LOCALAPPDATA%\kellyClipAi\data\backups en Windows). Se conserva solo
+# las _BACKUP_RETENTION_COUNT más recientes; las antiguas se borran al
+# crear una nueva. Para restaurar: cerrar la app, copiar el archivo de
+# respaldo sobre kellyclipai.sqlite3 (borrando antes kellyclipai.sqlite3-wal
+# y -shm si existen) y volver a abrir. La copia se hace con la API
+# sqlite3.Connection.backup, segura con la BD abierta y en modo WAL.
+_BACKUP_DIR_NAME = "backups"
+_BACKUP_FILE_PREFIX = "kellyclipai-"
+_BACKUP_RETENTION_COUNT = 5
+_BACKUP_PERIODIC_MAX_AGE_SECONDS = 24 * 3600  # 24 h
+
+# Caché de transcripción: entradas más recientes que se conservan. Cada
+# entrada guarda la transcripción completa con tiempos por palabra, así
+# que el límite es deliberadamente bajo.
+_TRANSCRIPT_CACHE_MAX_ENTRIES = 10
 
 
 def utc_now() -> str:
@@ -192,6 +212,39 @@ def initialize(database_path: Path) -> None:
                 job_id TEXT PRIMARY KEY REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
                 detected_at TEXT NOT NULL
             );
+            -- Caché de transcripción por hash de archivo (Fase 2, B-R5):
+            -- el mismo video en dos proyectos no se transcribe dos veces.
+            -- La clave incluye modelo e idioma de Whisper: si cambian, la
+            -- entrada no se reutiliza (regla de la Fase 1, A6).
+            CREATE TABLE IF NOT EXISTS transcript_cache (
+                file_hash TEXT NOT NULL,
+                whisper_model TEXT NOT NULL,
+                whisper_language TEXT NOT NULL,
+                language TEXT NOT NULL DEFAULT '',
+                transcript_json TEXT NOT NULL,
+                duration REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (file_hash, whisper_model, whisper_language)
+            );
+            -- Cola de procesamiento persistente (Fase 2, B-S10): los
+            -- trabajos sobreviven a un reinicio y se recuperan al
+            -- arrancar. El índice parcial impide dos trabajos activos
+            -- (pending/running) del mismo proyecto: deduplicación.
+            -- La configuración LLM NO se persiste aquí (contiene la clave
+            -- API en claro); al recuperar, el pipeline la resuelve desde
+            -- las credenciales cifradas del dueño del proyecto.
+            CREATE TABLE IF NOT EXISTS processing_jobs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                retry_failed_only INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed', 'cancelled')),
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS processing_jobs_active_project
+                ON processing_jobs(project_id) WHERE status IN ('pending', 'running');
             """
         )
         # Columnas añadidas en v1.0.11 sin subir la versión de esquema: las
@@ -211,7 +264,27 @@ def initialize(database_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE llm_credentials ADD COLUMN whisper_model TEXT"
             )
+        if version < _LATEST_SCHEMA_VERSION:
+            # Copia de seguridad ANTES de migrar (B-S8): si una migración
+            # corrompe algo, la BD previa está en <data_dir>/backups/.
+            # Best-effort: un fallo del respaldo nunca debe impedir el
+            # arranque. Se copia el estado confirmado en disco (la
+            # transacción DDL de arriba aún no se ha confirmado), que es
+            # exactamente el estado previo a la migración.
+            try:
+                backup_database(database_path, reason=f"pre-migration-v{version}")
+            except Exception as error:
+                logger.warning(
+                    "No se pudo respaldar la base de datos antes de migrar: %s",
+                    error,
+                )
         _run_migrations(conn)
+    # Copia periódica al arrancar si la última tiene más de 24 h (B-S8).
+    # Fuera del bloque anterior para copiar el estado ya migrado.
+    try:
+        ensure_periodic_backup(database_path)
+    except Exception as error:
+        logger.warning("No se pudo hacer la copia periódica de la base de datos: %s", error)
 
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
@@ -321,8 +394,9 @@ def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_v3(conn: sqlite3.Connection) -> None:
-    # Modelo predeterminado de Groq: qwen/qwen3.8-27b (250K TPM, muy por
-    # encima de los límites de los modelos anteriores). Actualiza tanto a
+    # Modelo predeterminado de Groq: qwen/qwen3.8-27b (plan gratuito:
+    # 8K TPM / 200K TPD, los mismos límites que gpt-oss-120b; los planes
+    # de pago tienen límites mayores). Actualiza tanto a
     # los usuarios que venían de gpt-oss-120b como a los que aún tenían
     # llama-3.3-70b-versatile (si saltaron la migración v2). Como en v2,
     # respeta las filas personalizadas por el usuario.
@@ -438,6 +512,87 @@ def _migrate_oauth_tokens(conn: sqlite3.Connection) -> None:
                 )
 
 
+def _backup_files(backup_dir: Path) -> list[Path]:
+    """Copias existentes, de la más reciente a la más antigua."""
+    if not backup_dir.is_dir():
+        return []
+    backups = [
+        path
+        for path in backup_dir.glob(f"{_BACKUP_FILE_PREFIX}*.sqlite3")
+        if path.is_file()
+    ]
+    backups.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return backups
+
+
+def _prune_backups(backup_dir: Path) -> None:
+    """Borra las copias más antiguas, conservando las N más recientes."""
+    for stale in _backup_files(backup_dir)[_BACKUP_RETENTION_COUNT:]:
+        try:
+            stale.unlink()
+        except OSError as error:
+            logger.warning("No se pudo borrar la copia antigua %s: %s", stale, error)
+
+
+def backup_database(database_path: Path, *, reason: str = "manual") -> Path | None:
+    """Copia la base de datos con la API sqlite3 Connection.backup.
+
+    Destino: ``<data_dir>/backups/kellyclipai-<AAAAMMDD-HHMMSS>-<motivo>.sqlite3``
+    (ver las constantes _BACKUP_* al inicio del módulo). La copia es
+    consistente aunque la app esté usando la BD (la API backup lee a
+    través de WAL) y no interfiere con las escrituras: se toma el lock
+    global solo para serializarla con otras operaciones de este módulo.
+    Devuelve la ruta de la copia, o None si la BD no existe o está vacía
+    (una BD nueva sin confirmar no merece respaldo).
+    """
+    try:
+        if not database_path.is_file() or database_path.stat().st_size == 0:
+            return None
+    except OSError:
+        return None
+    backup_dir = database_path.parent / _BACKUP_DIR_NAME
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    safe_reason = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "-"
+        for character in reason
+    )[:40] or "manual"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"{_BACKUP_FILE_PREFIX}{timestamp}-{safe_reason}"
+    target = backup_dir / f"{stem}.sqlite3"
+    suffix = 2
+    while target.exists():
+        target = backup_dir / f"{stem}-{suffix}.sqlite3"
+        suffix += 1
+    with _lock:
+        source = sqlite3.connect(database_path, timeout=30)
+        try:
+            destination = sqlite3.connect(target)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+        finally:
+            source.close()
+    _prune_backups(backup_dir)
+    logger.info("Copia de seguridad de la base de datos en %s", target)
+    return target
+
+
+def ensure_periodic_backup(database_path: Path) -> Path | None:
+    """Copia periódica: solo si no hay copia o la última tiene más de 24 h.
+
+    Se llama al arrancar (desde initialize). Devuelve la ruta de la copia
+    creada, o None si no hacía falta ninguna.
+    """
+    backup_dir = database_path.parent / _BACKUP_DIR_NAME
+    backups = _backup_files(backup_dir)
+    if backups:
+        newest_age = time.time() - backups[0].stat().st_mtime
+        if newest_age < _BACKUP_PERIODIC_MAX_AGE_SECONDS:
+            return None
+    return backup_database(database_path, reason="periodic")
+
+
 def claim_legacy_data(database_path: Path, owner_id: str) -> None:
     with _lock, connection(database_path) as conn:
         for table in (
@@ -501,14 +656,38 @@ def fail_interrupted_staged_media(database_path: Path) -> None:
         )
 
 
+def _has_processing_jobs_table(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'processing_jobs'"
+        ).fetchone()
+        is not None
+    )
+
+
 def fail_interrupted_projects(database_path: Path) -> int:
     error = (
         "El procesamiento se interrumpió al cerrar o reiniciar la aplicación. "
         "Puedes volver a intentarlo."
     )
     with _lock, connection(database_path) as conn:
+        # Los proyectos con un trabajo persistido (pending/running) NO se
+        # marcan como fallidos: la cola los recupera al arrancar (B-S10).
+        # Solo se fallan los que no tienen trabajo que recuperar (p. ej.
+        # encolados por una versión anterior a la cola persistente).
+        recoverable_filter = (
+            " AND NOT EXISTS ("
+            " SELECT 1 FROM processing_jobs"
+            " WHERE processing_jobs.project_id = projects.id"
+            " AND processing_jobs.status IN ('pending', 'running')"
+            ")"
+            if _has_processing_jobs_table(conn)
+            else ""
+        )
         rows = conn.execute(
             "SELECT id, progress FROM projects WHERE status IN ('queued', 'processing')"
+            + recoverable_filter
         ).fetchall()
         if not rows:
             return 0
@@ -518,7 +697,8 @@ def fail_interrupted_projects(database_path: Path) -> int:
             UPDATE projects
             SET status = 'failed', step = 'failed', error = ?, updated_at = ?
             WHERE status IN ('queued', 'processing')
-            """,
+            """
+            + recoverable_filter,
             (error, now),
         )
         for row in rows:
@@ -765,19 +945,69 @@ def get_project_status(database_path: Path, project_id: str) -> str | None:
     return str(row["status"]) if row else None
 
 
-def list_projects(
+def get_project_outcome(
+    database_path: Path, project_id: str
+) -> tuple[str | None, str | None]:
+    """Estado y error de un proyecto, sin parsear los JSON pesados.
+
+    La usa la cola de procesamiento para decidir si un trabajo fallido
+    merece reintentarse (B-S10): necesita el mensaje de error sin pagar
+    el coste de leer clips_json/transcript_json.
+    """
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT status, error FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+    if row is None:
+        return None, None
+    return str(row["status"]), row["error"]
+
+
+def count_projects(
     database_path: Path,
     owner_id: str | None = None,
-) -> list[dict[str, Any]]:
-    query = (
-        "SELECT id, owner_id, title, input_path, status, step, progress, error, "
-        "config_json, metadata_json, clips_json, created_at, updated_at FROM projects"
-    )
+) -> int:
+    """Número total de proyectos (para la paginación de GET /api/projects)."""
+    query = "SELECT COUNT(*) FROM projects"
     parameters: tuple[Any, ...] = ()
     if owner_id is not None:
         query += " WHERE owner_id = ?"
         parameters = (owner_id,)
+    with connection(database_path) as conn:
+        row = conn.execute(query, parameters).fetchone()
+    return int(row[0])
+
+
+def list_projects(
+    database_path: Path,
+    owner_id: str | None = None,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Lista proyectos, sin la transcripción del proyecto (B-R10).
+
+    `limit=None` (defecto) devuelve todos, como antes; los llamadores
+    del listado HTTP pasan limit/offset para paginar. La transcripción
+    por clip se excluye en la serialización HTTP, no aquí: el detalle
+    de proyecto la necesita.
+    """
+    query = (
+        "SELECT id, owner_id, title, input_path, status, step, progress, error, "
+        "config_json, metadata_json, clips_json, created_at, updated_at FROM projects"
+    )
+    parameters: list[Any] = []
+    if owner_id is not None:
+        query += " WHERE owner_id = ?"
+        parameters.append(owner_id)
     query += " ORDER BY created_at DESC"
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("El límite de paginación debe ser mayor que cero.")
+        if offset < 0:
+            raise ValueError("El desplazamiento de paginación no puede ser negativo.")
+        query += " LIMIT ? OFFSET ?"
+        parameters.extend([limit, offset])
     with connection(database_path) as conn:
         rows = conn.execute(query, parameters).fetchall()
     return [project_from_row(row, include_transcript=False) for row in rows]
@@ -1520,3 +1750,244 @@ def finish_schedule_job(
             """,
             (status, output_path, external_id, external_url, error, utc_now(), job_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Caché de transcripción por hash de archivo (Fase 2, B-R5)
+# ---------------------------------------------------------------------------
+
+
+def get_cached_transcript(
+    database_path: Path,
+    file_hash: str,
+    whisper_model: str,
+    whisper_language: str,
+) -> dict[str, Any] | None:
+    """Transcripción guardada para este archivo, modelo e idioma.
+
+    None si no hay entrada: la clave incluye modelo e idioma, así que un
+    cambio en cualquiera de ellos invalida la caché (regla de la Fase 1).
+    """
+    with connection(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT language, transcript_json, duration FROM transcript_cache
+            WHERE file_hash = ? AND whisper_model = ? AND whisper_language = ?
+            """,
+            (file_hash, whisper_model, whisper_language),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "language": str(row["language"]),
+        "transcript": json.loads(row["transcript_json"]),
+        "duration": float(row["duration"]),
+    }
+
+
+def save_cached_transcript(
+    database_path: Path,
+    file_hash: str,
+    whisper_model: str,
+    whisper_language: str,
+    language: str,
+    transcript: list[dict[str, Any]],
+    duration: float,
+) -> None:
+    """Guarda una transcripción en la caché y poda las entradas viejas."""
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO transcript_cache (
+                file_hash, whisper_model, whisper_language, language,
+                transcript_json, duration, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_hash, whisper_model, whisper_language) DO UPDATE SET
+                language = excluded.language,
+                transcript_json = excluded.transcript_json,
+                duration = excluded.duration,
+                created_at = excluded.created_at
+            """,
+            (
+                file_hash,
+                whisper_model,
+                whisper_language,
+                language,
+                json.dumps(transcript, ensure_ascii=False),
+                duration,
+                now,
+            ),
+        )
+        # Se conservan las N entradas más recientes; cada una guarda una
+        # transcripción completa con tiempos por palabra.
+        conn.execute(
+            """
+            DELETE FROM transcript_cache
+            WHERE rowid NOT IN (
+                SELECT rowid FROM transcript_cache
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+            )
+            """,
+            (_TRANSCRIPT_CACHE_MAX_ENTRIES,),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cola de procesamiento persistente (Fase 2, B-S10)
+# ---------------------------------------------------------------------------
+
+
+def enqueue_processing_job(
+    database_path: Path,
+    project_id: str,
+    retry_failed_only: bool = False,
+) -> tuple[str, bool]:
+    """Persiste un trabajo de procesamiento. Devuelve (id, creado).
+
+    Si el proyecto ya tiene un trabajo activo (pending/running), no se
+    crea otro: devuelve el existente con creado=False (deduplicación).
+    """
+    job_id = str(uuid.uuid4())
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO processing_jobs (
+                id, project_id, retry_failed_only, attempts, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 0, 'pending', ?, ?)
+            """,
+            (job_id, project_id, 1 if retry_failed_only else 0, now, now),
+        )
+        if cursor.rowcount == 1:
+            return job_id, True
+        row = conn.execute(
+            """
+            SELECT id FROM processing_jobs
+            WHERE project_id = ? AND status IN ('pending', 'running')
+            ORDER BY created_at LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+    if row is None:  # No debería pasar: el IGNORE implica que existe uno.
+        return job_id, True
+    return str(row["id"]), False
+
+
+def get_processing_job(
+    database_path: Path, job_id: str
+) -> dict[str, Any] | None:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM processing_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    job = dict(row)
+    job["retry_failed_only"] = bool(job["retry_failed_only"])
+    return job
+
+
+def claim_processing_job(
+    database_path: Path, job_id: str, attempts: int
+) -> bool:
+    """Marca un trabajo como en curso (pending/running -> running)."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'running', attempts = ?, error = NULL, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'running')
+            """,
+            (attempts, utc_now(), job_id),
+        )
+    return cursor.rowcount == 1
+
+
+def requeue_processing_job(database_path: Path, job_id: str) -> bool:
+    """Devuelve un trabajo en curso a pendiente (para reintentarlo)."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'pending', updated_at = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (utc_now(), job_id),
+        )
+    return cursor.rowcount == 1
+
+
+def finish_processing_job(
+    database_path: Path,
+    job_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+) -> None:
+    if status not in {"done", "failed", "cancelled"}:
+        raise ValueError(f"Estado terminal no válido para un trabajo: {status}")
+    with _lock, connection(database_path) as conn:
+        # Un estado terminal es final: un trabajo cancelado desde el
+        # endpoint no se sobrescribe cuando el worker termina de drenar.
+        conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = ?, error = ?, updated_at = ?
+            WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')
+            """,
+            (status, error, utc_now(), job_id),
+        )
+
+
+def cancel_processing_jobs(database_path: Path, project_id: str) -> int:
+    """Cancela los trabajos activos de un proyecto. Devuelve cuántos."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'cancelled', updated_at = ?
+            WHERE project_id = ? AND status IN ('pending', 'running')
+            """,
+            (utc_now(), project_id),
+        )
+    return cursor.rowcount
+
+
+def reset_interrupted_processing_jobs(database_path: Path) -> int:
+    """Trabajos 'running' de un arranque anterior -> 'pending'.
+
+    Se llama al recuperar la cola: un trabajo en curso cuando la app se
+    cerró quedó a medias y debe reencolarse, no quedarse en 'running'
+    para siempre.
+    """
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'pending', updated_at = ?
+            WHERE status = 'running'
+            """,
+            (utc_now(),),
+        )
+    return cursor.rowcount
+
+
+def list_recoverable_processing_jobs(database_path: Path) -> list[dict[str, Any]]:
+    """Trabajos pendientes de recuperar al arrancar, en orden de llegada."""
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM processing_jobs
+            WHERE status = 'pending'
+            ORDER BY created_at, rowid
+            """
+        ).fetchall()
+    jobs = []
+    for row in rows:
+        job = dict(row)
+        job["retry_failed_only"] = bool(job["retry_failed_only"])
+        jobs.append(job)
+    return jobs

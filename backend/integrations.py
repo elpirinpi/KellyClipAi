@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import random
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,6 +22,25 @@ _GRAPH_VERSION = "v27.0"
 _TIKTOK_CHUNK_SLACK = 2
 # Timeout por fragmento de subida a TikTok (10 MB por fragmento).
 _TIKTOK_CHUNK_TIMEOUT = httpx.Timeout(300, connect=30)
+# Fragmento de subida reanudable para YouTube e Instagram: 8 MiB es
+# múltiplo de 256 KiB, como exige la API de subida reanudable de YouTube;
+# Instagram no impone un tamaño, así que se comparte el mismo.
+_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+# Intentos por fragmento antes de dar por fallida la publicación. El
+# contador se reinicia cada vez que el servidor confirma progreso, así que
+# una conexión inestable puede tardar más pero no aborta por acumular
+# fallos en fragmentos distintos.
+_UPLOAD_MAX_ATTEMPTS = 5
+# Backoff exponencial entre reintentos de un fragmento: 1s, 2s, 4s, 8s,
+# 16s (+jitter de hasta 0,5 s), con tope de 30 s. Si el proveedor envía
+# Retry-After se respeta su valor, con tope de 60 s.
+_UPLOAD_BACKOFF_BASE_SECONDS = 1.0
+_UPLOAD_BACKOFF_MAX_SECONDS = 30.0
+_UPLOAD_MAX_RETRY_AFTER_SECONDS = 60.0
+# Timeout por fragmento de subida reanudable (8 MiB por fragmento): el
+# timeout de escritura por defecto del cliente (30 s) es demasiado corto
+# para conexiones lentas.
+_UPLOAD_CHUNK_TIMEOUT = httpx.Timeout(300, connect=30)
 _OAUTH_PROVIDERS = {"youtube", "tiktok", "instagram", "zoom"}
 _PROVIDER_ENV = {
     "youtube": ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET"),
@@ -612,6 +633,286 @@ def publish_clip(
     return _publish_instagram(token, account, clip, file_path)
 
 
+def _upload_retry_after_seconds(response: httpx.Response) -> float | None:
+    """Segundos de la cabecera Retry-After, si viene como número válido."""
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw.strip())
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, _UPLOAD_MAX_RETRY_AFTER_SECONDS)
+
+
+def _upload_retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
+    """Espera antes del reintento `attempt` (0 = primer reintento).
+
+    Respeta Retry-After cuando el proveedor la envía; si no, backoff
+    exponencial con jitter.
+    """
+    if response is not None:
+        retry_after = _upload_retry_after_seconds(response)
+        if retry_after is not None:
+            return retry_after
+    delay = _UPLOAD_BACKOFF_BASE_SECONDS * (2**attempt) + random.uniform(0, 0.5)
+    return min(delay, _UPLOAD_BACKOFF_MAX_SECONDS)
+
+
+def _is_retryable_upload_error(response: httpx.Response) -> bool:
+    """429 y 5xx son transitorios y merecen reintento; otros 4xx no."""
+    return response.status_code == 429 or response.status_code >= 500
+
+
+def _parse_youtube_range(response: httpx.Response) -> int | None:
+    """Último byte confirmado por YouTube según la cabecera Range
+    ("bytes=0-1234567"), o None si no viene o no se puede interpretar."""
+    match = re.fullmatch(r"bytes=0-(\d+)", response.headers.get("Range", "").strip())
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _youtube_upload_offset(
+    client: httpx.Client,
+    upload_url: str,
+    file_size: int,
+) -> tuple[int, dict[str, Any] | None]:
+    """Consulta cuántos bytes recibió YouTube en la sesión reanudable.
+
+    Devuelve (siguiente_offset, payload): si la subida ya terminó, el
+    offset es `file_size` y el payload es el recurso del video; si la
+    sesión expiró o ya no existe, el offset es -1. La consulta en sí
+    reintenta errores de red y 429/5xx con backoff: sin saber cuánto
+    recibió el servidor no se puede reenviar con seguridad, porque
+    reenviar un rango que YouTube ya tiene puede rechazarse.
+    """
+    for attempt in range(_UPLOAD_MAX_ATTEMPTS):
+        try:
+            response = client.put(
+                upload_url,
+                content=b"",
+                headers={
+                    "Content-Length": "0",
+                    "Content-Range": f"bytes */{file_size}",
+                },
+            )
+        except httpx.RequestError as error:
+            if attempt < _UPLOAD_MAX_ATTEMPTS - 1:
+                time.sleep(_upload_retry_delay(attempt))
+                continue
+            raise IntegrationError(
+                "YouTube no respondió a la consulta del estado de la carga."
+            ) from error
+        if response.status_code in (404, 410):
+            return -1, None
+        if response.status_code in (200, 201):
+            return file_size, _response_json(response, "YouTube")
+        if response.status_code == 308:
+            confirmed = _parse_youtube_range(response)
+            # Sin cabecera Range, YouTube no confirma ningún byte.
+            return (confirmed + 1 if confirmed is not None else 0), None
+        if _is_retryable_upload_error(response):
+            if attempt < _UPLOAD_MAX_ATTEMPTS - 1:
+                time.sleep(_upload_retry_delay(attempt, response))
+                continue
+            raise IntegrationError(
+                "YouTube no está disponible temporalmente "
+                f"(HTTP {response.status_code}). Inténtalo más tarde."
+            )
+        _response_json(response, "YouTube")
+        raise IntegrationError(
+            "YouTube devolvió una respuesta inesperada al consultar la carga."
+        )
+    raise IntegrationError("YouTube no respondió a la consulta del estado de la carga.")
+
+
+def _upload_youtube_resumable(
+    client: httpx.Client,
+    upload_url: str,
+    file_path: Path,
+    file_size: int,
+) -> dict[str, Any]:
+    """Sube el MP4 a YouTube por fragmentos con reanudación real.
+
+    Cada fragmento se envía con su Content-Range; ante un error de red o
+    un 429/5xx se espera con backoff y se consulta al servidor cuánto
+    recibió para continuar desde ahí, en vez de reiniciar desde cero.
+    """
+    offset = 0
+    attempts = 0
+    with file_path.open("rb") as media:
+        while offset < file_size:
+            media.seek(offset)
+            chunk = media.read(_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                # Un read() vacío antes de enviar todos los bytes significa
+                # EOF prematuro (archivo truncado o modificado durante la
+                # subida): abortar en vez de seguir con un Content-Range
+                # inválido.
+                raise IntegrationError(
+                    "La lectura del MP4 terminó antes de enviar todos los "
+                    "bytes a YouTube; se abortó la publicación."
+                )
+            end = offset + len(chunk) - 1
+            try:
+                response = client.put(
+                    upload_url,
+                    content=chunk,
+                    timeout=_UPLOAD_CHUNK_TIMEOUT,
+                    headers={
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(len(chunk)),
+                        "Content-Range": f"bytes {offset}-{end}/{file_size}",
+                    },
+                )
+            except httpx.RequestError:
+                response = None
+            if response is not None and response.status_code in (200, 201):
+                return _response_json(response, "YouTube")
+            if response is not None and response.status_code == 308:
+                confirmed = _parse_youtube_range(response)
+                offset = confirmed + 1 if confirmed is not None else end + 1
+                attempts = 0
+                continue
+            if response is not None and not _is_retryable_upload_error(response):
+                _response_json(response, "YouTube")
+                raise IntegrationError(
+                    "YouTube devolvió una respuesta inesperada durante la carga."
+                )
+            if attempts >= _UPLOAD_MAX_ATTEMPTS - 1:
+                raise IntegrationError(
+                    "YouTube no aceptó la carga del clip tras varios "
+                    "intentos. Revisa la conexión e inténtalo de nuevo."
+                )
+            time.sleep(_upload_retry_delay(attempts, response))
+            attempts += 1
+            previous_offset = offset
+            offset, payload = _youtube_upload_offset(client, upload_url, file_size)
+            if offset < 0:
+                raise IntegrationError(
+                    "La sesión de carga de YouTube expiró antes de completar "
+                    "la subida. Inténtalo de nuevo."
+                )
+            if payload is not None:
+                return payload
+            if offset > previous_offset:
+                # El servidor sí recibió el fragmento aunque la respuesta
+                # se perdió: hay progreso, así que el contador de
+                # intentos se reinicia.
+                attempts = 0
+    raise IntegrationError("YouTube no confirmó la carga completa del clip.")
+
+
+def _instagram_upload_offset(
+    client: httpx.Client,
+    graph_url: str,
+    container_id: str,
+    token: str,
+) -> int | None:
+    """Bytes que Meta confirma haber recibido para el contenedor, según
+    `video_status.uploading_phase.bytes_transfered`; None si el dato no
+    está disponible (en ese caso se reenvía desde el último offset
+    confirmado localmente, que en rupload es seguro porque la subida va
+    direccionada por offset).
+    """
+    try:
+        status = _request_json(
+            client,
+            "GET",
+            f"{graph_url}/{container_id}",
+            "Instagram",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"fields": "status_code,video_status"},
+        )
+    except IntegrationError:
+        return None
+    video_status = status.get("video_status")
+    if not isinstance(video_status, dict):
+        return None
+    uploading = video_status.get("uploading_phase")
+    if not isinstance(uploading, dict):
+        return None
+    transferred = uploading.get("bytes_transfered")
+    if isinstance(transferred, bool):
+        return None
+    try:
+        transferred = int(transferred)
+    except (TypeError, ValueError):
+        return None
+    if transferred < 0:
+        return None
+    return transferred
+
+
+def _upload_instagram_resumable(
+    client: httpx.Client,
+    upload_url: str,
+    graph_url: str,
+    container_id: str,
+    token: str,
+    file_path: Path,
+    file_size: int,
+) -> None:
+    """Sube el MP4 a Instagram por fragmentos con reanudación real.
+
+    Cada fragmento se envía con su offset; ante un error de red o un
+    429/5xx se espera con backoff y se consulta al contenedor cuántos
+    bytes recibió Meta para continuar desde ahí.
+    """
+    offset = 0
+    attempts = 0
+    with file_path.open("rb") as media:
+        while offset < file_size:
+            media.seek(offset)
+            chunk = media.read(_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                raise IntegrationError(
+                    "La lectura del MP4 terminó antes de enviar todos los "
+                    "bytes a Instagram; se abortó la publicación."
+                )
+            try:
+                response = client.post(
+                    upload_url,
+                    content=chunk,
+                    timeout=_UPLOAD_CHUNK_TIMEOUT,
+                    headers={
+                        "Authorization": f"OAuth {token}",
+                        "offset": str(offset),
+                        "file_size": str(file_size),
+                        "Content-Type": "application/octet-stream",
+                    },
+                )
+            except httpx.RequestError:
+                response = None
+            if response is not None and response.status_code < 400:
+                result = _response_json(response, "Instagram")
+                if result.get("success") is not True:
+                    raise IntegrationError("Instagram no confirmó la carga del reel.")
+                offset += len(chunk)
+                attempts = 0
+                continue
+            if response is not None and not _is_retryable_upload_error(response):
+                _response_json(response, "Instagram")
+                raise IntegrationError(
+                    "Instagram devolvió una respuesta inesperada durante la carga."
+                )
+            if attempts >= _UPLOAD_MAX_ATTEMPTS - 1:
+                raise IntegrationError(
+                    "Instagram no aceptó la carga del reel tras varios "
+                    "intentos. Revisa la conexión e inténtalo de nuevo."
+                )
+            time.sleep(_upload_retry_delay(attempts, response))
+            attempts += 1
+            confirmed = _instagram_upload_offset(client, graph_url, container_id, token)
+            if confirmed is not None and 0 <= confirmed <= file_size:
+                if confirmed > offset:
+                    attempts = 0
+                offset = confirmed
+
+
 def _publish_youtube(
     token: str,
     clip: dict[str, Any],
@@ -620,6 +921,9 @@ def _publish_youtube(
 ) -> dict[str, str]:
     if visibility not in {"private", "public", "unlisted"}:
         raise IntegrationError("La visibilidad de YouTube debe ser privada, pública o no listada.")
+    file_size = file_path.stat().st_size
+    if file_size <= 0:
+        raise IntegrationError("El MP4 del clip está vacío; no se puede publicar en YouTube.")
     with httpx.Client(timeout=httpx.Timeout(30, read=600), follow_redirects=False) as client:
         try:
             start = client.post(
@@ -629,7 +933,7 @@ def _publish_youtube(
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json; charset=UTF-8",
                     "X-Upload-Content-Type": "video/mp4",
-                    "X-Upload-Content-Length": str(file_path.stat().st_size),
+                    "X-Upload-Content-Length": str(file_size),
                 },
                 json={
                     "snippet": {
@@ -654,19 +958,7 @@ def _publish_youtube(
         parsed = urlparse(upload_url or "")
         if parsed.scheme != "https" or parsed.hostname not in {"www.googleapis.com", "youtube.googleapis.com"}:
             raise IntegrationError("YouTube devolvió una URL de carga no válida.")
-        try:
-            with file_path.open("rb") as media:
-                uploaded = client.put(
-                    upload_url,
-                    content=media,
-                    headers={
-                        "Content-Type": "video/mp4",
-                        "Content-Length": str(file_path.stat().st_size),
-                    },
-                )
-        except httpx.RequestError as error:
-            raise IntegrationError("Se interrumpió la carga del MP4 a YouTube.") from error
-        payload = _response_json(uploaded, "YouTube")
+        payload = _upload_youtube_resumable(client, upload_url, file_path, file_size)
     video_id = _required_token(payload, "id", "YouTube")
     return {"external_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}"}
 
@@ -800,6 +1092,9 @@ def _publish_instagram(
     clip: dict[str, Any],
     file_path: Path,
 ) -> dict[str, str]:
+    file_size = file_path.stat().st_size
+    if file_size <= 0:
+        raise IntegrationError("El MP4 del clip está vacío; no se puede publicar en Instagram.")
     account_id = account["account_id"]
     graph_url = f"https://graph.facebook.com/{_GRAPH_VERSION}"
     with httpx.Client(timeout=httpx.Timeout(30, read=300), follow_redirects=False) as client:
@@ -819,23 +1114,9 @@ def _publish_instagram(
         )
         container_id = _required_token(container, "id", "Instagram")
         upload_url = f"https://rupload.facebook.com/ig-api-upload/{_GRAPH_VERSION}/{container_id}"
-        try:
-            with file_path.open("rb") as media:
-                uploaded = client.post(
-                    upload_url,
-                    content=media,
-                    headers={
-                        "Authorization": f"OAuth {token}",
-                        "offset": "0",
-                        "file_size": str(file_path.stat().st_size),
-                        "Content-Type": "application/octet-stream",
-                    },
-                )
-        except httpx.RequestError as error:
-            raise IntegrationError("Se interrumpió la carga del MP4 a Instagram.") from error
-        upload_result = _response_json(uploaded, "Instagram")
-        if upload_result.get("success") is not True:
-            raise IntegrationError("Instagram no confirmó la carga del reel.")
+        _upload_instagram_resumable(
+            client, upload_url, graph_url, container_id, token, file_path, file_size
+        )
         state = ""
         for _ in range(36):
             status = _request_json(

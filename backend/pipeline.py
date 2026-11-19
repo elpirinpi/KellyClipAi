@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
+import threading
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -11,8 +14,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from . import database
+from .credential_store import CredentialStoreError, decrypt_api_key
 from .integrations import download_broll
 from .llm import (
+    LLM_MAX_OUTPUT_TOKENS,
     LLMConfigurationError,
     LLMResponseError,
     ResolvedLLM,
@@ -64,6 +69,104 @@ logger = logging.getLogger(__name__)
 _LLM_WINDOW_SECONDS = 5 * 60
 _LLM_WINDOW_OVERLAP_SECONDS = 1 * 60
 
+# --- Pacing TPM (Fase 2) ----------------------------------------------------
+# El plan gratuito de Groq permite 8K TPM por modelo (qwen/qwen3.8-27b).
+# Cada ventana de 5 min consume ~1.500-2.000 tokens de entrada + hasta
+# 2.000 de salida (max_tokens, incluido el razonamiento de Qwen3 antes
+# del JSON): dos ventanas seguidas sin pausa ya superan el límite, la
+# segunda recibe 429 y los reintentos rápidos caen dentro del mismo
+# minuto. El pacer estima los tokens de cada llamada y duerme lo
+# necesario para mantenerse bajo el presupuesto en la ventana móvil de
+# 60 s. El presupuesto por defecto (7.000) deja margen bajo 8.000. El
+# pacing previene la mayoría de 429; el backoff paciente de llm.py cubre
+# el resto. Puro Python, sin suposiciones de hardware (cualquier PC).
+_LLM_TPM_BUDGET_TOKENS = 7000
+_LLM_TPM_WINDOW_SECONDS = 60.0
+# Caracteres de instrucciones fijas del prompt (system + reglas), ~500 tokens.
+_LLM_PROMPT_OVERHEAD_CHARS = 2000
+# ~4 caracteres por token (regla de oro para texto en español/inglés).
+_LLM_CHARS_PER_TOKEN = 4
+
+
+def _estimate_request_tokens(transcript: list[TranscriptSegment]) -> int:
+    """Tokens estimados de una llamada de propuestas: entrada + salida.
+
+    Entrada: el texto de la transcripción + las instrucciones fijas del
+    prompt, a ~4 caracteres por token. Salida: el máximo (max_tokens),
+    porque el razonamiento de Qwen3 antes del JSON también consume
+    tokens de salida. La estimación es conservadora a propósito.
+    """
+    text_chars = sum(len(segment.text) for segment in transcript)
+    return (
+        (text_chars + _LLM_PROMPT_OVERHEAD_CHARS) // _LLM_CHARS_PER_TOKEN
+        + LLM_MAX_OUTPUT_TOKENS
+    )
+
+
+class _TokenPacer:
+    """Regula las llamadas LLM para no superar el presupuesto TPM.
+
+    Lleva la cuenta de los tokens estimados en la ventana móvil de 60 s;
+    antes de cada llamada, duerme lo necesario para que la petición quepa
+    bajo el presupuesto. Una instancia por proyecto (sin estado global).
+    `sleep` y `monotonic` son inyectables para los tests. `on_wait` se
+    invoca antes de dormir para avisar al usuario (el pipeline lo conecta
+    a los eventos de progreso SSE).
+    """
+
+    def __init__(
+        self,
+        *,
+        budget_tokens: int = _LLM_TPM_BUDGET_TOKENS,
+        window_seconds: float = _LLM_TPM_WINDOW_SECONDS,
+        sleep: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        on_wait: Callable[[float], None] | None = None,
+    ) -> None:
+        self._budget = budget_tokens
+        self._window = window_seconds
+        self._sleep = sleep or time.sleep
+        self._monotonic = monotonic or time.monotonic
+        self._on_wait = on_wait
+        self._usage: list[tuple[float, int]] = []
+
+    def wait_before_call(self, estimated_tokens: int) -> float:
+        """Duerme lo necesario antes de una llamada; devuelve lo esperado."""
+        now = self._monotonic()
+        self._prune(now)
+        used = sum(tokens for _, tokens in self._usage)
+        if used + estimated_tokens <= self._budget:
+            self._usage.append((now, estimated_tokens))
+            return 0.0
+        # Quitar las entradas más antiguas hasta que la petición quepa;
+        # hay que esperar a que caduque la última quitada. Si ni vaciando
+        # la ventana cabe (una sola petición mayor que el presupuesto),
+        # se espera a que se vacíe del todo y se procede: una petición no
+        # se puede dividir y el backoff de 429 cubre ese caso.
+        freed = 0
+        wait_until = now
+        for timestamp, tokens in self._usage:
+            freed += tokens
+            wait_until = timestamp + self._window
+            if used - freed + estimated_tokens <= self._budget:
+                break
+        wait = max(0.0, wait_until - now)
+        if wait > 0:
+            if self._on_wait is not None:
+                self._on_wait(wait)
+            self._sleep(wait)
+            now = self._monotonic()
+            self._prune(now)
+        self._usage.append((now, estimated_tokens))
+        return wait
+
+    def _prune(self, now: float) -> None:
+        self._usage = [
+            (timestamp, tokens)
+            for timestamp, tokens in self._usage
+            if now - timestamp < self._window
+        ]
+
 # Espacio libre mínimo para empezar a procesar: un proyecto puede producir
 # ~10 clips renderizados, B-roll y la descarga del modelo Whisper. Si hay
 # menos, se falla rápido con un mensaje claro en vez de dejar el disco
@@ -75,6 +178,23 @@ _LLM_WINDOW_OVERLAP_SECONDS = 1 * 60
 # exactamente 1 GiB.
 _MIN_FREE_DISK_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
 _MIN_FREE_DISK_FRACTION = 0.10  # 10 % del total en sistemas pequeños
+
+# Throttle de progreso (Fase 2, B-R3): cada _publish son dos escrituras a
+# SQLite y los callbacks llegan decenas de veces por segundo (ffmpeg, el
+# análisis facial a 4 Hz, la transcripción por segmento). Se publica solo
+# si cambia el % entero o han pasado 500 ms desde la última publicación
+# del proyecto. Los estados terminales (completed/failed/cancelled)
+# siempre se publican y limpian el estado, para que un reproceso del
+# mismo proyecto no herede el throttle del anterior.
+_PROGRESS_THROTTLE_SECONDS = 0.5
+_last_progress_publish: dict[str, tuple[int | None, str, float]] = {}
+_last_progress_publish_lock = threading.Lock()
+
+
+def _reset_progress_throttle() -> None:
+    """Vacía el estado del throttle de progreso (tests)."""
+    with _last_progress_publish_lock:
+        _last_progress_publish.clear()
 
 
 def _is_cancelled(settings: AppSettings, project_id: str) -> bool:
@@ -195,6 +315,22 @@ def _publish(
     progress: int | None,
     message: str,
 ) -> None:
+    terminal = status in {"completed", "failed", "cancelled"}
+    if terminal:
+        with _last_progress_publish_lock:
+            _last_progress_publish.pop(project_id, None)
+    elif progress is not None:
+        now = time.monotonic()
+        with _last_progress_publish_lock:
+            last = _last_progress_publish.get(project_id)
+            if (
+                last is not None
+                and last[0] == progress
+                and last[1] == step
+                and now - last[2] < _PROGRESS_THROTTLE_SECONDS
+            ):
+                return
+            _last_progress_publish[project_id] = (progress, step, now)
     payload = {
         "status": status,
         "step": step,
@@ -215,6 +351,63 @@ def _publish(
         "failed" if status == "failed" else "progress",
         payload,
     )
+
+
+def _file_sha256(path: Path) -> str:
+    """SHA-256 del archivo, por bloques de 1 MiB (B-R5)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_llm_for_project(
+    stored: dict[str, Any],
+    request_llm: LLMConfig | None,
+    settings: AppSettings,
+) -> ResolvedLLM:
+    """Resuelve el LLM del proyecto, con respaldo a las credenciales guardadas.
+
+    Con configuración explícita (el flujo normal desde /process) se usa
+    tal cual. Sin ella — el caso de la cola persistente al recuperar un
+    trabajo tras un reinicio, donde la clave API no se guardó en la cola
+    por seguridad — se leen las credenciales cifradas del dueño del
+    proyecto; si tampoco las hay, manda el entorno (.env) como antes.
+    """
+    if request_llm is not None:
+        return resolve_llm(request_llm, settings)
+    owner_id = stored.get("owner_id")
+    if owner_id:
+        try:
+            credentials = database.get_llm_credentials(
+                settings.database_path, str(owner_id)
+            )
+        except Exception as error:
+            logger.warning(
+                "No se pudieron leer las credenciales LLM guardadas: %s", error
+            )
+            credentials = None
+        if credentials is not None:
+            try:
+                return resolve_llm(
+                    LLMConfig(
+                        provider=credentials["provider"],
+                        api_key=decrypt_api_key(
+                            bytes(credentials["encrypted_api_key"])
+                        ),
+                        model=credentials["model"],
+                        base_url=credentials["base_url"],
+                    ),
+                    settings,
+                )
+            except (CredentialStoreError, ValidationError, LLMConfigurationError) as error:
+                logger.warning(
+                    "Las credenciales LLM guardadas no son válidas (%s); "
+                    "se usa la configuración de entorno.",
+                    error,
+                )
+    return resolve_llm(None, settings)
 
 
 def _duration_bounds(choice: str) -> tuple[float, float]:
@@ -305,11 +498,26 @@ def _propose_valid_clips(
     duration: float,
     llm: ResolvedLLM,
     should_cancel: Callable[[], bool] | None = None,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
+    token_pacer: _TokenPacer | None = None,
 ) -> list[ClipProposal]:
+    """Propuestas válidas para todo el video, por ventanas de 5 min.
+
+    token_pacer regula el ritmo de las llamadas LLM (presupuesto TPM);
+    si es None no hay pacing (process_project siempre pasa uno).
+    """
     if should_cancel is not None and should_cancel():
         raise ProjectCancelled()
     if duration <= _LLM_WINDOW_SECONDS:
-        return _propose_valid_window(transcript, project, duration, llm)
+        return _propose_valid_window(
+            transcript,
+            project,
+            duration,
+            llm,
+            on_rate_limit=on_rate_limit,
+            token_pacer=token_pacer,
+        )
 
     stride = _LLM_WINDOW_SECONDS - _LLM_WINDOW_OVERLAP_SECONDS
     proposals: list[ClipProposal] = []
@@ -324,7 +532,12 @@ def _propose_valid_clips(
         window_duration = window_end - window_start
         try:
             window_proposals = _propose_valid_window(
-                window_transcript, project, window_duration, llm
+                window_transcript,
+                project,
+                window_duration,
+                llm,
+                on_rate_limit=on_rate_limit,
+                token_pacer=token_pacer,
             )
         except (
             MediaProcessingError,
@@ -421,18 +634,30 @@ def _propose_valid_window(
     project: ProjectConfig,
     duration: float,
     llm: ResolvedLLM,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
+    token_pacer: _TokenPacer | None = None,
 ) -> list[ClipProposal]:
-    candidates = propose_clips(transcript, project, duration, llm)
+    # Cada llamada al LLM (la inicial y el reintento por validación) pasa
+    # por el pacer: son peticiones independientes que consumen TPM.
+    if token_pacer is not None:
+        token_pacer.wait_before_call(_estimate_request_tokens(transcript))
+    candidates = propose_clips(
+        transcript, project, duration, llm, on_rate_limit=on_rate_limit
+    )
     proposals, errors = _validate_and_complete_proposals(
         candidates, transcript, duration, project.duration
     )
     if errors:
+        if token_pacer is not None:
+            token_pacer.wait_before_call(_estimate_request_tokens(transcript))
         retry_candidates = propose_clips(
             transcript,
             project,
             duration,
             llm,
             validation_feedback=errors,
+            on_rate_limit=on_rate_limit,
         )
         retried, retry_errors = _validate_and_complete_proposals(
             retry_candidates, transcript, duration, project.duration
@@ -558,6 +783,14 @@ def _render_projects(
     # Los parámetros nuevos van al final y se pasan por posición desde
     # process_project: algunos tests sustituyen esta función por un mock
     # que acepta *args pero no kwargs.
+    #
+    # clips_json NO se escribe por clip (Fase 2, B-R3): reescribir el
+    # JSON completo tras cada clip es O(n²) en escrituras a SQLite. Los
+    # clips se acumulan en `rendered` y process_project escribe una sola
+    # vez al final (o al cancelar, con lo acumulado hasta ese momento).
+    # El parámetro persist_clips queda como no-op por compatibilidad de
+    # firma: persistir es ahora siempre al final, nunca por clip.
+    del persist_clips
     project_dir = input_path.parent
     if output_dir is None:
         output_dir = project_dir / "clips"
@@ -572,6 +805,9 @@ def _render_projects(
         for record in proposal_records
     ]
     replacing_ids = {str(record["id"]) for record in proposal_records}
+    original_by_id = {
+        str(clip.get("id")): clip for clip in existing_clips or []
+    }
     rendered = [
         clip
         for clip in existing_clips or []
@@ -583,8 +819,17 @@ def _render_projects(
 
     for index, record in enumerate(proposal_records):
         if should_cancel is not None and should_cancel():
-            # Se conservan los clips ya renderizados en esta tanda.
-            raise ProjectCancelled(rendered)
+            # Se conservan los clips ya renderizados en esta tanda Y las
+            # entradas originales de los que aún no se re-renderizaron
+            # (en el reintento de fallidos, los fallidos pendientes no
+            # deben desaparecer del listado al cancelar).
+            cancelled_clips = list(rendered)
+            for pending in proposal_records[index:]:
+                original = original_by_id.get(str(pending["id"]))
+                if original is not None:
+                    cancelled_clips.append(original)
+            cancelled_clips.sort(key=lambda item: float(item.get("start") or 0))
+            raise ProjectCancelled(cancelled_clips)
         clip_id = str(record["id"])
         proposal = ClipProposal.model_validate(record["proposal"])
         output_path = output_dir / f"{clip_id}.mp4"
@@ -714,12 +959,6 @@ def _render_projects(
         rendered = [item for item in rendered if str(item.get("id")) != clip_id]
         rendered.append(clip)
         rendered.sort(key=lambda item: float(item.get("start") or 0))
-        if persist_clips:
-            # Al renderizar en staging (reproceso completo) no se toca
-            # clips_json hasta el swap: si el reproceso falla, los clips
-            # viejos siguen publicados. En el reintento de fallidos se
-            # renderiza directo en clips/ y sí se persiste por clip.
-            database.update_project(settings.database_path, project_id, clips=rendered)
     return rendered
 
 
@@ -744,7 +983,11 @@ def process_project(
         _check_not_cancelled(settings, project_id)
         _check_free_disk_space(project_dir)
         project_config = ProjectConfig.model_validate(stored["config"])
-        llm = None if retry_failed_only else resolve_llm(request_llm, settings)
+        llm = (
+            None
+            if retry_failed_only
+            else _resolve_llm_for_project(stored, request_llm, settings)
+        )
         ffmpeg_path = shutil.which("ffmpeg")
         ffprobe_path = shutil.which("ffprobe")
         if not ffmpeg_path or not ffprobe_path:
@@ -839,13 +1082,52 @@ def process_project(
                     f"Descargando el modelo Whisper… {percent:.0f}%",
                 )
 
-            transcript, language = transcribe(
-                input_path,
-                project_config.whisper_model or settings.whisper_model,
-                on_transcription_progress,
-                language=project_config.whisper_language,
-                on_model_download_progress=on_whisper_download_progress,
-            )
+            # Caché por hash de archivo (B-R5): si este mismo video ya se
+            # transcribió en otro proyecto con el mismo modelo e idioma de
+            # Whisper, se reutiliza sin volver a transcribir. La clave
+            # incluye modelo e idioma, así que un cambio en cualquiera de
+            # ellos invalida la entrada (regla de la Fase 1, A6).
+            cached_transcript: dict[str, Any] | None = None
+            file_hash: str | None = None
+            try:
+                file_hash = _file_sha256(input_path)
+                cached_transcript = database.get_cached_transcript(
+                    settings.database_path,
+                    file_hash,
+                    project_config.whisper_model or settings.whisper_model,
+                    project_config.whisper_language,
+                )
+            except Exception as error:
+                logger.warning(
+                    "No se pudo consultar la caché de transcripción por hash: %s",
+                    error,
+                )
+            if cached_transcript is not None:
+                transcript = [
+                    TranscriptSegment.model_validate(segment)
+                    for segment in cached_transcript["transcript"]
+                ]
+                if not any(segment.words for segment in transcript):
+                    raise MediaProcessingError(
+                        "La transcripción guardada no contiene tiempos por palabra. Reintenta el análisis."
+                    )
+                language = str(cached_transcript["language"])
+                _publish(
+                    settings,
+                    project_id,
+                    "processing",
+                    "finding",
+                    100,
+                    "Reutilizando la transcripción de otro proyecto con el mismo video…",
+                )
+            else:
+                transcript, language = transcribe(
+                    input_path,
+                    project_config.whisper_model or settings.whisper_model,
+                    on_transcription_progress,
+                    language=project_config.whisper_language,
+                    on_model_download_progress=on_whisper_download_progress,
+                )
             _check_not_cancelled(settings, project_id)
             transcript_data = [segment.model_dump() for segment in transcript]
             metadata["language"] = language
@@ -861,6 +1143,26 @@ def process_project(
                 metadata=metadata,
                 transcript=transcript_data,
             )
+            if cached_transcript is None and file_hash is not None:
+                # Caché por hash de archivo (B-R5): el mismo video en otro
+                # proyecto reutiliza esta transcripción sin volver a llamar
+                # a Whisper. Best-effort: si el guardado falla, el
+                # proyecto sigue adelante con su propia transcripción.
+                try:
+                    database.save_cached_transcript(
+                        settings.database_path,
+                        file_hash,
+                        project_config.whisper_model or settings.whisper_model,
+                        project_config.whisper_language,
+                        language,
+                        transcript_data,
+                        float(metadata["duration"]),
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "No se pudo guardar la transcripción en la caché por hash: %s",
+                        error,
+                    )
         previous_clips = stored.get("clips") or []
         existing_clips = previous_clips
         if retry_failed_only:
@@ -897,12 +1199,42 @@ def process_project(
             if llm is None:
                 raise LLMConfigurationError("No se pudo configurar el proveedor de IA.")
             _progress_for_llm(settings, project_id, llm.provider)
+
+            def on_rate_limit(wait_seconds: float, _attempt: int) -> None:
+                # Aviso visible mientras se espera por un 429: el usuario
+                # ve que la app está esperando y no colgada (Fase 2).
+                _publish(
+                    settings,
+                    project_id,
+                    "processing",
+                    "finding",
+                    None,
+                    f"Límite de {llm.provider} alcanzado, esperando "
+                    f"{wait_seconds:.0f}s antes de reintentar…",
+                )
+
+            def on_pacing_wait(wait_seconds: float) -> None:
+                # Aviso visible mientras el pacer TPM espera entre
+                # ventanas: sin él, la pausa de hasta un minuto parecería
+                # un cuelgue (Fase 2).
+                _publish(
+                    settings,
+                    project_id,
+                    "processing",
+                    "finding",
+                    None,
+                    f"Esperando {wait_seconds:.0f}s para respetar el límite de {llm.provider}…",
+                )
+
+            token_pacer = _TokenPacer(on_wait=on_pacing_wait)
             proposals = _propose_valid_clips(
                 transcript,
                 project_config,
                 float(metadata["duration"]),
                 llm,
                 should_cancel,
+                on_rate_limit=on_rate_limit,
+                token_pacer=token_pacer,
             )
             proposal_records = [
                 {
@@ -929,22 +1261,32 @@ def process_project(
                 return
 
         if retry_failed_only:
-            # El reintento renderiza directo en clips/ y persiste por clip:
-            # solo repone los fallidos, sin tocar los que ya estaban listos.
-            clips = _render_projects(
-                settings,
-                project_id,
-                input_path,
-                project_config,
-                proposal_records,
-                transcript,
-                ffmpeg_path,
-                str(stored["owner_id"]),
-                existing_clips,
-                None,
-                True,
-                should_cancel,
-            )
+            # El reintento renderiza directo en clips/: solo repone los
+            # fallidos, sin tocar los que ya estaban listos. clips_json
+            # se escribe una sola vez al final (B-R3); si se cancela a
+            # mitad, se escriben los acumulados (Fase 1: la cancelación
+            # publica los clips ya renderizados) y se relanza para que el
+            # handler general publique el estado cancelled.
+            try:
+                clips = _render_projects(
+                    settings,
+                    project_id,
+                    input_path,
+                    project_config,
+                    proposal_records,
+                    transcript,
+                    ffmpeg_path,
+                    str(stored["owner_id"]),
+                    existing_clips,
+                    None,
+                    True,
+                    should_cancel,
+                )
+            except ProjectCancelled as cancelled:
+                database.update_project(
+                    settings.database_path, project_id, clips=cancelled.clips
+                )
+                raise
             database.update_project(settings.database_path, project_id, clips=clips)
         else:
             # Reproceso completo: se renderiza en clips.new/ y solo se

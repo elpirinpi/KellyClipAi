@@ -1,5 +1,5 @@
-import { useEffect, useState, type FormEvent } from 'react';
-import { AlertCircle, Check, Circle, FileVideo2, LoaderCircle, WandSparkles, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { AlertCircle, Check, Circle, Clock, FileVideo2, LoaderCircle, WandSparkles, X } from 'lucide-react';
 import { apiFetch, getSupabase } from '../auth';
 import type { ProjectResult, SharedClip } from '../types';
 import { formatDuration, responseError } from '../utils';
@@ -43,7 +43,7 @@ export function AuthPage({ configurationError }: { configurationError: string })
   };
 
   return (
-    <main className="auth-page">
+    <main className="auth-page" id="main-content">
       <section className="auth-card" aria-labelledby="auth-title">
         <div className="auth-brand" aria-label="kellyClipAi">
           <span className="brand-mark" aria-hidden="true"><span /><span /><span /></span>
@@ -163,8 +163,45 @@ export function ProcessingPage({
   const cancellable = project?.status === 'queued' || project?.status === 'processing';
   const cancelled = project?.status === 'cancelled';
 
+  // Fase 2 (ítem 19): tiempo restante estimado.
+  // Sin marca de inicio en el servidor, el tiempo transcurrido se mide
+  // desde que esta página observa el proyecto en procesamiento. Con
+  // progreso real (> 0 %), se extrapola linealmente; sin progreso todavía,
+  // se estima a partir de la duración del video (el procesamiento en CPU
+  // suele durar aproximadamente lo mismo que el video). Al reprocesar, el
+  // reloj se reinicia.
+  const startedAtRef = useRef<number | null>(null);
+  const prevStatusRef = useRef<string | undefined>(undefined);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const status = project?.status;
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if ((status === 'queued' || status === 'processing')
+      && (startedAtRef.current === null
+        || (prev !== undefined && prev !== 'queued' && prev !== 'processing'))) {
+      startedAtRef.current = Date.now();
+    }
+  }, [project?.status]);
+  useEffect(() => {
+    if (!cancellable) return;
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [cancellable]);
+  const etaSeconds = useMemo(() => {
+    if (!cancellable || startedAtRef.current === null) return null;
+    const elapsedSeconds = (now - startedAtRef.current) / 1000;
+    const progress = project?.progress;
+    if (progress !== null && progress !== undefined && progress > 0) {
+      return Math.max(0, (elapsedSeconds * (100 - progress)) / progress);
+    }
+    const duration = project?.metadata?.duration;
+    if (duration && duration > 0) return Math.max(0, duration - elapsedSeconds);
+    return null;
+  }, [cancellable, now, project?.metadata?.duration, project?.progress]);
+
   return (
-    <main className="processing-page">
+    <main className="processing-page" id="main-content">
       <section className="processing-card">
         <div className="processing-video-card">
           {project?.thumbnail_url
@@ -190,6 +227,21 @@ export function ProcessingPage({
         </div>
         {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}
         {cancelMessage && <p className="error-message" role="alert"><AlertCircle size={16} />{cancelMessage}</p>}
+        {cancelled && (
+          <div className="processing-cancelled-banner" role="status">
+            <X size={16} />
+            <div>
+              <strong>Procesamiento cancelado</strong>
+              <span>Los clips ya renderizados se conservan. Puedes reprocesar el proyecto con la misma configuración.</span>
+            </div>
+          </div>
+        )}
+        {cancellable && etaSeconds !== null && (
+          <p className="processing-eta" role="status">
+            <Clock size={15} />
+            Tiempo restante estimado: ~{formatDuration(etaSeconds)}
+          </p>
+        )}
         <ol className="processing-steps">
           {steps.map((step, index) => {
             const complete = index < activeIndex || project?.status === 'completed';
@@ -253,7 +305,7 @@ export function SharedClipPage({ apiBase, token }: { apiBase: string; token: str
   }, [apiBase, token]);
 
   return (
-    <main className="shared-page">
+    <main className="shared-page" id="main-content">
       <a className="back-button" href="/">kellyClipAi</a>
       {loading && <p className="results-loading"><LoaderCircle size={17} className="spin" /> Cargando clip compartido…</p>}
       {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}

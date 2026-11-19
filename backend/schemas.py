@@ -13,6 +13,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 MAX_UPLOAD_BYTES = 4294967296  # 4 GiB
 MAX_VIDEO_DURATION_SECONDS = 14400  # 4 h
 
+# Paginación de GET /api/projects (Fase 2, B-R10): 20 proyectos por página
+# por defecto (la vista "Mis proyectos" muestra una cuadrícula), con un
+# tope de 100 para que ninguna petición devuelva megabytes de clips.
+DEFAULT_PROJECTS_PAGE_SIZE = 20
+MAX_PROJECTS_PAGE_SIZE = 100
+
 Ratio = Literal["9:16", "16:9", "1:1", "4:5"]
 WhisperModel = Literal["tiny", "small", "medium", "large-v3"]
 DurationChoice = Literal["Cualquiera", "<30s", "30–60s", "60–90s", "90s–3min"]
@@ -311,6 +317,31 @@ class OverdueScheduleResolution(BaseModel):
 
 class ClipResolutionRequest(BaseModel):
     resolution: Literal[720, 1080]
+
+
+class EditorRenderJobResponse(BaseModel):
+    """Respuesta de los endpoints de trabajos del editor (Fase 2, B-P8).
+
+    `result` trae la misma carga que devolvía el endpoint síncrono
+    (preview_url/duration/width/height/… o clip_id/duration/…) una vez
+    el trabajo termina; mientras tanto es None y el frontend consulta el
+    progreso por polling o por SSE.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    job_id: str
+    project_id: str
+    clip_id: str
+    kind: Literal["preview", "export", "quality", "improve"]
+    status: Literal["queued", "running", "completed", "failed", "cancelled"]
+    progress: float = Field(ge=0, le=100)
+    message: str
+    result: dict | None = None
+    error: str | None = None
+    created_at: str
+    updated_at: str
 
 
 class CustomTemplateRequest(BaseModel):

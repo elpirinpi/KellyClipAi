@@ -168,6 +168,50 @@ _LIP_MODEL_FILENAME = "face_landmarker.task"
 _LIP_LANDMARKER_LOCK = threading.Lock()
 _LIP_LANDMARKER: tuple[Any, Any] | None = None
 
+# --- Caché de análisis facial (Fase 2, B-R4) ---------------------------------
+# El seguimiento facial muestrea el video a 4 fps con YuNet (+ MediaPipe
+# si hay voz): es el paso más caro del render después del propio encode,
+# y el editor lo repetía entero en cada re-render del mismo clip. Clave:
+# identidad del archivo (ruta + tamaño + mtime) + inicio del clip +
+# rangos retenidos + dimensiones de salida + intervalos de voz. Si cambia
+# cualquiera de ellos, la clave cambia y la caché se invalida sola. Los
+# resultados son listas de FaceCropKeyframe (frozen): seguros de compartir
+# entre renders. Acotada (LRU simple por orden de inserción).
+_FACE_ANALYSIS_CACHE: dict[tuple[Any, ...], list[list[FaceCropKeyframe] | None]] = {}
+_FACE_ANALYSIS_CACHE_LOCK = threading.Lock()
+_FACE_ANALYSIS_CACHE_MAX_ENTRIES = 16
+
+
+def _face_cache_key(
+    input_path: Path,
+    clip_start: float,
+    intervals: list[tuple[float, float]],
+    output_width: int,
+    output_height: int,
+    speech_intervals: list[tuple[float, float]] | None,
+) -> tuple[Any, ...] | None:
+    try:
+        stat = input_path.stat()
+    except OSError:
+        return None
+    identity = (str(input_path.resolve()), stat.st_size, stat.st_mtime_ns)
+    return (
+        identity,
+        round(clip_start, 3),
+        tuple((round(start, 3), round(end, 3)) for start, end in intervals),
+        output_width,
+        output_height,
+        tuple(
+            (round(start, 3), round(end, 3)) for start, end in (speech_intervals or [])
+        ),
+    )
+
+
+def clear_face_analysis_cache() -> None:
+    """Vacía la caché de análisis facial (tests)."""
+    with _FACE_ANALYSIS_CACHE_LOCK:
+        _FACE_ANALYSIS_CACHE.clear()
+
 
 def _crop_geometry(
     source_width: int,
@@ -341,6 +385,53 @@ def _simplify_keyframes(
 
 
 def analyze_face_crop_paths(
+    input_path: Path,
+    clip_start: float,
+    intervals: list[tuple[float, float]],
+    output_width: int,
+    output_height: int,
+    speech_intervals: list[tuple[float, float]] | None = None,
+    on_progress: Callable[[float], None] | None = None,
+) -> list[list[FaceCropKeyframe] | None]:
+    """Rutas de recorte facial, con caché por clip (B-R4).
+
+    En un acierto de caché se devuelve el resultado guardado sin abrir
+    el video ni cargar OpenCV/MediaPipe; se sigue notificando el 100 %
+    de progreso para que el llamador no se quede esperando.
+    """
+    cache_key = _face_cache_key(
+        input_path,
+        clip_start,
+        intervals,
+        output_width,
+        output_height,
+        speech_intervals,
+    )
+    if cache_key is not None:
+        with _FACE_ANALYSIS_CACHE_LOCK:
+            cached = _FACE_ANALYSIS_CACHE.get(cache_key)
+        if cached is not None:
+            if on_progress is not None:
+                on_progress(100.0)
+            return cached
+    result = _analyze_face_crop_paths_uncached(
+        input_path,
+        clip_start,
+        intervals,
+        output_width,
+        output_height,
+        speech_intervals=speech_intervals,
+        on_progress=on_progress,
+    )
+    if cache_key is not None:
+        with _FACE_ANALYSIS_CACHE_LOCK:
+            _FACE_ANALYSIS_CACHE[cache_key] = result
+            while len(_FACE_ANALYSIS_CACHE) > _FACE_ANALYSIS_CACHE_MAX_ENTRIES:
+                _FACE_ANALYSIS_CACHE.pop(next(iter(_FACE_ANALYSIS_CACHE)))
+    return result
+
+
+def _analyze_face_crop_paths_uncached(
     input_path: Path,
     clip_start: float,
     intervals: list[tuple[float, float]],

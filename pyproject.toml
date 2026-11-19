@@ -1,0 +1,40 @@
+# Configuración de herramientas del proyecto KellyClipAi.
+#
+# Este archivo solo existe para configurar Ruff (lint + formato). El
+# proyecto no se empaqueta con setuptools/poetry: las dependencias se
+# fijan en requirements*.txt / requirements*.lock y el instalador lo
+# construye build_windows.ps1 con PyInstaller + Inno Setup.
+
+[tool.ruff]
+# Python 3.13: la versión del build (build_windows.ps1, CI).
+target-version = "py313"
+# 100 columnas: el código actual se escribió sin un límite estricto
+# (a 88 columnas habría 354 violaciones E501; a 100 quedan 85). E501
+# está ignorada (ver abajo); line-length guía a `ruff format`.
+line-length = 100
+
+[tool.ruff.lint]
+# E: pycodestyle (salvo E501, ver ignore), F: pyflakes, I: isort,
+# UP: pyupgrade, B: flake8-bugbear.
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    # E501 line-too-long: 361 violaciones preexistentes en el árbol
+    # (19-11-2026), en su mayoría nombres de test largos y URLs que el
+    # formateador no puede partir. El largo de línea lo controla
+    # `ruff format` (line-length = 100) una vez adoptado; hasta entonces
+    # E501 solo sería ruido. Revisar cuando el árbol esté formateado.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Deuda técnica temporal (19-11-2026): 11 violaciones preexistentes en
+# archivos de otros trabajadores. Todas menos las dos E731 se corrigen
+# con `ruff check --fix`; las E731 necesitan convertir dos lambdas en
+# `def` en backend/integrations.py. Al corregir cada una, borrar la
+# entrada correspondiente de esta tabla.
+"backend/integrations.py" = ["E731"]
+"tests/test_phase1_llm_security.py" = ["I001", "UP037"]
+"tests/test_pipeline_contract.py" = ["I001", "UP017"]
+"tests/test_python_dependency_lock.py" = ["I001"]
+"tests/test_revision_phase1.py" = ["I001"]
+"tests/test_updater.py" = ["I001"]

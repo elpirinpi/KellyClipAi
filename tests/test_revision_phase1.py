@@ -141,7 +141,7 @@ def test_invalid_clip_proposals_are_logged_and_retried_once(monkeypatch, caplog)
     responses = [[valid, overlapping, out_of_range], [retried]]
     feedback: list[list[str] | None] = []
 
-    def propose_clips(*_args, validation_feedback=None):
+    def propose_clips(*_args, validation_feedback=None, **_kwargs):
         feedback.append(validation_feedback)
         return responses.pop(0)
 
@@ -186,7 +186,9 @@ def test_project_list_omits_transcript_but_project_detail_retains_it(
         detailed = client.get("/api/projects/project-with-transcript")
 
     assert listed.status_code == 200
-    assert "transcript" not in listed.json()[0]
+    # Fase 2 (B-R10): el listado es paginado {"items", "total", ...}.
+    assert listed.json()["total"] == 1
+    assert "transcript" not in listed.json()["items"][0]
     assert detailed.status_code == 200
     assert detailed.json()["transcript"] == transcript
 
@@ -428,9 +430,28 @@ def test_ffmpeg_timeout_kills_and_reaps_the_process(
 
     class FakeProcess:
         def __init__(self, *_args, **_kwargs) -> None:
+            # subprocess.run (p. ej. la detección de NVENC de media.py)
+            # usa Popen como context manager y lee args/returncode: el
+            # doble debe implementar ese protocolo además de poll/kill/
+            # wait, o el test falla en aislamiento (en la suite completa
+            # la caché de NVENC ya está caliente y no se llega a llamar
+            # a subprocess.run).
+            self.args = _args[0] if _args else []
+            self.returncode: int | None = None
             self.stdout = BlockingStdout()
             self.killed = False
             self.wait_calls = 0
+
+        def __enter__(self) -> FakeProcess:
+            return self
+
+        def __exit__(self, *_exc_info: object) -> bool:
+            return False
+
+        def communicate(self, *_args: object, **_kwargs: object) -> tuple[str, str]:
+            # Sin salida: la detección de NVENC no encuentra el
+            # codificador y el render usa libx264.
+            return ("", "")
 
         def poll(self):
             return -9 if self.killed else None
@@ -475,7 +496,13 @@ def test_ffmpeg_timeout_kills_and_reaps_the_process(
     assert process.killed
     assert process.wait_calls >= 1
     if media_module.os.name == "nt":
-        assert launch_options["creationflags"] == media_module.subprocess.CREATE_NO_WINDOW
+        # El render usa CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        # (grupo propio para el apagado elegante); basta con que el bit
+        # de ocultar la consola esté puesto.
+        assert (
+            launch_options["creationflags"]
+            & media_module.subprocess.CREATE_NO_WINDOW
+        )
     else:
         assert "creationflags" not in launch_options
 

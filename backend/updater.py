@@ -27,6 +27,29 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _remove_quietly(path: Path) -> None:
+    """Borra un archivo parcial sin fallar si ya no existe o está bloqueado."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("No se pudo borrar el archivo parcial %s", path.name)
+
+
+def _parse_content_range(value: str | None) -> tuple[int, int, int | None] | None:
+    """Interpreta una cabecera Content-Range ("bytes inicio-fin/total",
+    con "*" si el total es desconocido). Devuelve None si no se puede
+    interpretar."""
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", value.strip())
+    if match is None:
+        return None
+    total = match.group(3)
+    return int(match.group(1)), int(match.group(2)), None if total == "*" else int(total)
+
+
 class UpdateError(RuntimeError):
     pass
 
@@ -188,7 +211,16 @@ class UpdateManager:
             if not self._latest:
                 raise UpdateError("No hay una actualización disponible para descargar.")
             latest = dict(self._latest)
-            self._status.update(state="downloading", progress=0, error=None)
+            # Si quedó un .part de un intento anterior, el progreso inicial
+            # refleja lo ya descargado en vez de volver a 0.
+            part = (self.update_dir / latest["asset_name"]).with_suffix(".exe.part")
+            expected = int(latest.get("size") or 0)
+            initial_progress = 0
+            if expected > 0 and part.is_file():
+                existing = part.stat().st_size
+                if 0 < existing < expected:
+                    initial_progress = min(99, round(existing * 100 / expected))
+            self._status.update(state="downloading", progress=initial_progress, error=None)
             self._thread = threading.Thread(
                 target=self._download_installer,
                 args=(latest,),
@@ -198,30 +230,116 @@ class UpdateManager:
             self._thread.start()
             return dict(self._status)
 
+    def _kept_progress(self, temporary: Path, expected_size: int) -> int:
+        """Progreso que conserva un .part parcial tras un fallo (0 si no
+        hay nada que reanudar). Así la UI muestra lo ya descargado en vez
+        de volver a 0 cuando la descarga se interrumpe."""
+        if expected_size <= 0 or not temporary.is_file():
+            return 0
+        return min(99, round(temporary.stat().st_size * 100 / expected_size))
+
     def _download_installer(self, release: dict[str, Any]) -> None:
         self.update_dir.mkdir(parents=True, exist_ok=True)
         target = self.update_dir / release["asset_name"]
         temporary = target.with_suffix(".exe.part")
-        request = urllib.request.Request(
-            release["download_url"],
-            headers={"Accept": "application/octet-stream", "User-Agent": "kellyClipAi-updater"},
-        )
-        digest = hashlib.sha256()
-        downloaded = 0
+        expected_size = int(release.get("size") or 0)
+        if expected_size < 0 or expected_size > _MAX_INSTALLER_SIZE:
+            with self._lock:
+                self._status.update(
+                    state="error",
+                    error="El tamaño del instalador no es válido.",
+                    progress=0,
+                )
+            return
+        # Reanudación: si quedó un .part de un intento anterior, continuar
+        # desde su tamaño en vez de descargar desde cero.
+        existing = temporary.stat().st_size if temporary.is_file() else 0
+        resume_from = 0
+        if expected_size > 0 and 0 < existing < expected_size:
+            resume_from = existing
+        elif expected_size > 0 and existing >= expected_size:
+            # El .part ya tiene el tamaño completo: si su hash coincide,
+            # el instalador está listo sin descargar nada; si no, los
+            # bytes están corruptos y hay que empezar de cero.
+            try:
+                complete = _sha256_file(temporary) == release["sha256"]
+            except OSError:
+                complete = False
+            if complete:
+                try:
+                    os.replace(temporary, target)
+                except OSError:
+                    logger.warning(
+                        "No se pudo promover el instalador parcial de %s; "
+                        "se descarga de nuevo.",
+                        release["asset_name"],
+                    )
+                else:
+                    self._cleanup_old_installers(keep=target)
+                    with self._lock:
+                        self._status.update(
+                            state="downloaded",
+                            progress=100,
+                            error=None,
+                        )
+                    return
+            else:
+                logger.warning(
+                    "El instalador parcial de %s no coincide con el hash "
+                    "esperado; se descarga de nuevo.",
+                    release["asset_name"],
+                )
+                _remove_quietly(temporary)
+        headers = {
+            "Accept": "application/octet-stream",
+            "User-Agent": "kellyClipAi-updater",
+        }
+        if resume_from:
+            headers["Range"] = f"bytes={resume_from}-"
+        request = urllib.request.Request(release["download_url"], headers=headers)
+        downloaded = resume_from
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
+                status = getattr(response, "status", 200)
                 content_length = int(response.headers.get("Content-Length", "0"))
-                expected_size = release["size"] or content_length
+                if resume_from and status == 206:
+                    content_range = _parse_content_range(
+                        response.headers.get("Content-Range")
+                    )
+                    if content_range is None or content_range[0] != resume_from:
+                        raise UpdateError(
+                            "El servidor no reanudó la descarga en el punto esperado."
+                        )
+                    if content_range[2] is not None and content_range[2] != expected_size:
+                        raise UpdateError("El tamaño del instalador no coincide con el release.")
+                    mode = "ab"
+                elif resume_from:
+                    # El servidor ignoró la cabecera Range: empezar desde
+                    # cero en vez de mezclar bytes.
+                    logger.warning(
+                        "El servidor no admite reanudación (HTTP %s); "
+                        "descargando el instalador desde cero.",
+                        status,
+                    )
+                    resume_from = 0
+                    downloaded = 0
+                    mode = "wb"
+                else:
+                    mode = "wb"
+                if expected_size <= 0:
+                    expected_size = content_length
                 if expected_size <= 0 or expected_size > _MAX_INSTALLER_SIZE:
                     raise UpdateError("El tamaño del instalador no es válido.")
-                if content_length and content_length != expected_size:
+                if content_length and content_length != expected_size - downloaded:
                     raise UpdateError("El tamaño del instalador no coincide con el release.")
-                with temporary.open("wb") as installer:
+                with temporary.open(mode) as installer:
                     while chunk := response.read(1024 * 1024):
                         downloaded += len(chunk)
                         if downloaded > _MAX_INSTALLER_SIZE or downloaded > expected_size:
+                            # Datos corruptos: el .part no se puede
+                            # reanudar con fiabilidad, así que se borra.
+                            _remove_quietly(temporary)
                             raise UpdateError("La descarga excede el tamaño esperado.")
-                        digest.update(chunk)
                         installer.write(chunk)
                         with self._lock:
                             self._status["progress"] = min(
@@ -229,7 +347,10 @@ class UpdateManager:
                             )
             if downloaded != expected_size:
                 raise UpdateError("La descarga del instalador quedó incompleta.")
-            if digest.hexdigest() != release["sha256"]:
+            # Verificación final con la misma función que usa open_installer
+            # antes de ejecutar el instalador.
+            if _sha256_file(temporary) != release["sha256"]:
+                _remove_quietly(temporary)
                 raise UpdateError("La verificación SHA-256 del instalador falló.")
             os.replace(temporary, target)
             self._cleanup_old_installers(keep=target)
@@ -240,25 +361,29 @@ class UpdateManager:
                     error=None,
                 )
         except UpdateError as error:
-            temporary.unlink(missing_ok=True)
+            # El .part parcial se conserva para reanudar en el próximo
+            # intento; solo se borra en fallos de integridad (hash o
+            # tamaño), que ya lo eliminaron antes de lanzar el error.
             with self._lock:
-                self._status.update(state="error", error=str(error), progress=0)
+                self._status.update(
+                    state="error",
+                    error=str(error),
+                    progress=self._kept_progress(temporary, expected_size),
+                )
         except (urllib.error.URLError, TimeoutError, OSError) as error:
-            temporary.unlink(missing_ok=True)
             with self._lock:
                 self._status.update(
                     state="error",
                     error=f"No se pudo descargar el instalador: {error}",
-                    progress=0,
+                    progress=self._kept_progress(temporary, expected_size),
                 )
         except Exception:
-            temporary.unlink(missing_ok=True)
             logger.exception("Falló la descarga de la actualización")
             with self._lock:
                 self._status.update(
                     state="error",
                     error="Falló la descarga de la actualización.",
-                    progress=0,
+                    progress=self._kept_progress(temporary, expected_size),
                 )
 
     def _cleanup_old_installers(self, keep: Path) -> None:

@@ -148,7 +148,9 @@ def test_project_queue_enforces_configured_concurrency(
     [
         (401, "La clave API", 1),
         (402, "crédito o la facturación", 1),
-        (429, "límite de solicitudes", 3),
+        # El 429 tiene presupuesto propio en la Fase 2: 5 intentos con
+        # backoff 1s, 2s, 4s, 8s (4 esperas entre 5 intentos).
+        (429, "límite de solicitudes", 5),
     ],
 )
 def test_llm_provider_errors_are_translated_without_raw_body(
@@ -179,7 +181,7 @@ def test_llm_provider_errors_are_translated_without_raw_body(
 
     assert "private provider error body" not in str(error.value)
     assert attempts == expected_attempts
-    assert delays == ([0.5, 1.0] if status_code == 429 else [])
+    assert delays == ([1.0, 2.0, 4.0, 8.0] if status_code == 429 else [])
 
 
 def test_groq_http_errors_include_safe_provider_details(

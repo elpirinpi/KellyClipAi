@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import shutil
+import threading
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import database
-from .media import MediaProcessingError, probe_media, render_clip
+from .media import MediaProcessingError, ProgressCallback, probe_media, render_clip
 from .schemas import (
     ClipEditRequest,
     ClipProposal,
@@ -16,6 +20,19 @@ from .schemas import (
     TranscriptSegment,
 )
 from .settings import AppSettings
+
+logger = logging.getLogger(__name__)
+
+
+class EditorRenderCancelled(RuntimeError):
+    """El usuario canceló un render del editor.
+
+    Se lanza desde el callback de progreso (que render_clip invoca dentro
+    de su bucle de lectura de ffmpeg): al propagarse, el finally de
+    _render_clip mata el ffmpeg hijo, así que la cancelación no deja
+    procesos huérfanos. No hereda de ValueError/OSError para que ningún
+    except de media.py la convierta en un error de render.
+    """
 
 
 def find_clip(project: dict[str, Any], clip_id: str) -> dict[str, Any] | None:
@@ -173,6 +190,8 @@ def render_editor_version(
     preview: bool,
     output_resolution: int | None = None,
     enhance_audio: bool | None = None,
+    on_progress: ProgressCallback | None = None,
+    on_analysis_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     document, removed_ranges, subtitle_overrides = _edit_document(clip, edit)
     _save_edit(settings, project, clip, document)
@@ -242,11 +261,12 @@ def render_editor_version(
             project_config,
             transcript,
             ffmpeg_path,
-            lambda _: None,
+            on_progress or (lambda _: None),
             removed_ranges=removed_ranges,
             subtitle_overrides=subtitle_overrides,
             output_resolution=resolution,
             enhance_audio=audio_is_enhanced,
+            on_analysis_progress=on_analysis_progress,
         )
         metadata = probe_media(output_path, ffprobe_path)
         if preview:
@@ -308,3 +328,243 @@ def editor_preview_path(
     if not preview.is_file():
         raise FileNotFoundError("La vista previa todavía no está disponible.")
     return preview
+
+
+def validate_clip_edit(
+    clip: dict[str, Any],
+    edit: ClipEditRequest,
+) -> None:
+    """Valida una edición sin renderizar (para fallar rápido al encolar).
+
+    Reutiliza _edit_document: comprueba que se conserven todas las frases
+    originales, que ninguna exceda la duración del clip y que los rangos
+    sean coherentes. Lanza ValueError con el motivo.
+    """
+    _edit_document(clip, edit)
+
+
+# ---------------------------------------------------------------------------
+# Renders del editor como trabajos asíncronos (Fase 2, B-P8)
+# ---------------------------------------------------------------------------
+
+# Trabajos que se conservan en memoria (los terminales más antiguos se
+# descartan al encolar uno nuevo). Los trabajos son solo en memoria: un
+# render del editor dura segundos o pocos minutos y no merece persistencia
+# en BD como la cola de procesamiento; al reiniciar, el usuario vuelve a
+# lanzar el render desde el editor.
+_MAX_EDITOR_JOBS = 50
+
+EditorRenderKind = str  # "preview" | "export" | "quality" | "improve"
+
+
+@dataclass
+class EditorRenderJob:
+    """Un render del editor encolado: estado, progreso y resultado."""
+
+    id: str
+    project_id: str
+    clip_id: str
+    kind: EditorRenderKind
+    status: str = "queued"  # queued | running | completed | failed | cancelled
+    progress: float = 0.0
+    message: str = "Render en cola…"
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    created_at: str = field(default_factory=database.utc_now)
+    updated_at: str = field(default_factory=database.utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "job_id": self.id,
+            "project_id": self.project_id,
+            "clip_id": self.clip_id,
+            "kind": self.kind,
+            "status": self.status,
+            "progress": round(self.progress, 1),
+            "message": self.message,
+            "result": self.result,
+            "error": self.error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+class EditorRenderJobManager:
+    """Cola en memoria de renders del editor, con progreso y cancelación.
+
+    Sigue el patrón de ProjectProcessingQueue: el render corre en un hilo
+    (asyncio.to_thread) para no bloquear la petición HTTP; el progreso se
+    publica en el trabajo y se expone por SSE; la cancelación es
+    cooperativa a través del callback de progreso, que lanza
+    EditorRenderCancelled y mata el ffmpeg hijo (ver la clase).
+    """
+
+    def __init__(self, settings: AppSettings) -> None:
+        self._settings = settings
+        self._jobs: dict[str, EditorRenderJob] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancelled: set[str] = set()
+        self._lock = threading.Lock()
+
+    def submit(
+        self,
+        project: dict[str, Any],
+        clip: dict[str, Any],
+        edit: ClipEditRequest,
+        kind: EditorRenderKind,
+        *,
+        output_resolution: int | None = None,
+        enhance_audio: bool | None = None,
+    ) -> EditorRenderJob:
+        """Encola un render. Valida la edición antes (ValueError si es mala).
+
+        Debe llamarse desde el bucle de eventos (los endpoints son async):
+        crea la tarea asyncio que ejecutará el render.
+        """
+        validate_clip_edit(clip, edit)
+        job = EditorRenderJob(
+            id=str(uuid.uuid4()),
+            project_id=str(project["id"]),
+            clip_id=str(clip["id"]),
+            kind=kind,
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+            self._prune_locked()
+        task = asyncio.create_task(
+            self._run_job(job, project, clip, edit, output_resolution, enhance_audio)
+        )
+        with self._lock:
+            self._tasks[job.id] = task
+        task.add_done_callback(lambda _: self._forget_task(job.id))
+        return job
+
+    def get(self, job_id: str) -> EditorRenderJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def cancel(self, job_id: str) -> bool:
+        """Pide cancelar un trabajo. False si no existe o ya terminó.
+
+        Cooperativa, a propósito: NO se cancela la tarea asyncio, porque
+        eso dejaría el hilo del render huérfano (el render seguiría y
+        sobrescribiría el clip). En su lugar se marca el trabajo y el
+        callback de progreso lanzará EditorRenderCancelled en el
+        siguiente tick, lo que mata el ffmpeg hijo y aborta el render
+        antes de escribir nada. Si el trabajo aún no empezó, _run_job lo
+        detecta al arrancar y termina como cancelado sin renderizar.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in {"completed", "failed", "cancelled"}:
+                return False
+            self._cancelled.add(job_id)
+        return True
+
+    def _forget_task(self, job_id: str) -> None:
+        with self._lock:
+            self._tasks.pop(job_id, None)
+
+    def _prune_locked(self) -> None:
+        """Descarta los trabajos terminales más antiguos (con el lock tomado)."""
+        if len(self._jobs) <= _MAX_EDITOR_JOBS:
+            return
+        terminal = [
+            job
+            for job in self._jobs.values()
+            if job.status in {"completed", "failed", "cancelled"}
+        ]
+        terminal.sort(key=lambda job: job.updated_at)
+        for job in terminal[: len(self._jobs) - _MAX_EDITOR_JOBS]:
+            self._jobs.pop(job.id, None)
+            self._cancelled.discard(job.id)
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._cancelled
+
+    def _update(self, job: EditorRenderJob, **values: Any) -> None:
+        with self._lock:
+            for key, value in values.items():
+                setattr(job, key, value)
+            job.updated_at = database.utc_now()
+
+    async def _run_job(
+        self,
+        job: EditorRenderJob,
+        project: dict[str, Any],
+        clip: dict[str, Any],
+        edit: ClipEditRequest,
+        output_resolution: int | None,
+        enhance_audio: bool | None,
+    ) -> None:
+        def check_cancelled() -> None:
+            if self._is_cancelled(job.id):
+                raise EditorRenderCancelled()
+
+        def on_progress(percent: float) -> None:
+            check_cancelled()
+            self._update(
+                job,
+                progress=min(100.0, max(0.0, float(percent))),
+                message=f"Renderizando… {percent:.0f}%",
+            )
+
+        def on_analysis_progress(percent: float) -> None:
+            check_cancelled()
+            self._update(
+                job,
+                message=f"Analizando reencuadre… {percent:.0f}%",
+            )
+
+        try:
+            if self._is_cancelled(job.id):
+                raise EditorRenderCancelled()
+            self._update(job, status="running", message="Renderizando…")
+            result = await asyncio.to_thread(
+                render_editor_version,
+                self._settings,
+                project,
+                clip,
+                edit,
+                job.kind == "preview",
+                output_resolution=output_resolution,
+                enhance_audio=enhance_audio,
+                on_progress=on_progress,
+                on_analysis_progress=on_analysis_progress,
+            )
+            self._update(
+                job,
+                status="completed",
+                progress=100.0,
+                message="Render terminado.",
+                result=result,
+            )
+        except EditorRenderCancelled:
+            self._update(
+                job,
+                status="cancelled",
+                message="Render cancelado.",
+                error="Render cancelado por el usuario.",
+            )
+        except asyncio.CancelledError:
+            self._update(
+                job,
+                status="cancelled",
+                message="Render cancelado.",
+                error="Render cancelado por el usuario.",
+            )
+            raise
+        except Exception as error:
+            logger.exception(
+                "Falló el render del editor (trabajo %s, clip %s).",
+                job.id,
+                job.clip_id,
+            )
+            self._update(
+                job,
+                status="failed",
+                message="El render falló.",
+                error=str(error).strip() or "No se pudo renderizar el clip.",
+            )

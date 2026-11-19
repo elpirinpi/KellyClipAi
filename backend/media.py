@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import html
 import json
+import logging
 import os
 import re
+import signal
 import subprocess
 import textwrap
 import threading
@@ -19,6 +21,8 @@ from .face_tracking import (
     analyze_face_crop_paths,
 )
 from .schemas import ClipProposal, ProjectConfig, TranscriptSegment, Word
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[float], None]
 _SILENCE_START = re.compile(r"silence_start:\s*(-?\d+(?:\.\d+)?)")
@@ -46,6 +50,207 @@ _FFMPEG_RENDER_TIMEOUT_SECONDS = 600
 _WHISPER_PIPELINE_LOCK = threading.Lock()
 _WHISPER_PIPELINE_CACHE: tuple[str, Any] | None = None
 
+# --- NVENC (Fase 2, B-R1) ---------------------------------------------------
+# Detección en runtime con fallback elegante: la app debe funcionar en
+# CUALQUIER PC (NVIDIA, AMD, Intel, integradas o sin GPU). El resultado se
+# cachea por proceso: la detección ejecuta ffmpeg dos veces y no tiene
+# sentido repetirla en cada clip. KELLYCLIP_NVENC=0 la desactiva (soporte).
+_NVENC_PROBE_TIMEOUT_SECONDS = 15
+_NVENC_CACHE: bool | None = None
+_NVENC_CACHE_LOCK = threading.Lock()
+
+# --- Renders en curso (Fase 2, B-P14) ---------------------------------------
+# Registro de los ffmpeg hijos de los renders activos, para que el apagado
+# elegante pueda matarlos. Cada ffmpeg arranca en su propio grupo de
+# procesos (start_new_session en POSIX, CREATE_NEW_PROCESS_GROUP en
+# Windows) para no tocar a ningún otro proceso de la app.
+_ACTIVE_RENDER_PROCESSES: set[subprocess.Popen[str]] = set()
+_ACTIVE_RENDER_PROCESSES_LOCK = threading.Lock()
+
+# --- Caché de análisis de silencios (Fase 2, B-R4) --------------------------
+# El análisis de silencios es un pase completo de ffmpeg sobre el clip;
+# el editor lo repetía en cada re-render del mismo clip. Clave: identidad
+# del archivo (ruta + tamaño + mtime) + rango + binario ffmpeg. Si el
+# archivo cambia, la clave cambia y la caché se invalida sola. Acotada
+# (LRU simple por orden de inserción) para no crecer sin límite.
+_SILENCE_CACHE: dict[tuple[Any, ...], list[tuple[float, float]]] = {}
+_SILENCE_CACHE_LOCK = threading.Lock()
+_SILENCE_CACHE_MAX_ENTRIES = 32
+
+
+def _file_identity(path: Path) -> tuple[str, int, int] | None:
+    """Identidad barata de un archivo para las cachés de análisis.
+
+    (ruta resuelta, tamaño, mtime en ns). None si no se puede leer: en
+    ese caso la caché se omite y se analiza de nuevo, sin fallar.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+def clear_analysis_caches() -> None:
+    """Vacía las cachés de análisis de este módulo (tests)."""
+    with _SILENCE_CACHE_LOCK:
+        _SILENCE_CACHE.clear()
+
+
+def is_nvenc_available(ffmpeg_path: str) -> bool:
+    """Indica si este ffmpeg puede codificar con NVENC en este equipo.
+
+    Dos comprobaciones: el codificador debe estar compilado en el ffmpeg
+    (`-encoders`) Y un encode de prueba corto debe terminar bien. La
+    segunda es imprescindible: un ffmpeg con NVENC compilado en un equipo
+    sin GPU NVIDIA (o sin driver) lista el codificador pero el encode
+    falla. El resultado se cachea por proceso.
+    """
+    if os.environ.get("KELLYCLIP_NVENC", "").strip() == "0":
+        return False
+    global _NVENC_CACHE
+    with _NVENC_CACHE_LOCK:
+        if _NVENC_CACHE is not None:
+            return _NVENC_CACHE
+        available = False
+        try:
+            encoders = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-encoders"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_NVENC_PROBE_TIMEOUT_SECONDS,
+                **_subprocess_options(),
+            )
+            if "h264_nvenc" in (encoders.stdout or ""):
+                # Encode de prueba con los mismos parámetros que el render
+                # real: si este pasa, el render con NVENC también puede.
+                probe = subprocess.run(
+                    [
+                        ffmpeg_path,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc=duration=0.2:size=128x128:rate=10",
+                        "-c:v",
+                        "h264_nvenc",
+                        "-preset",
+                        "p4",
+                        "-cq",
+                        "21",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=_NVENC_PROBE_TIMEOUT_SECONDS,
+                    **_subprocess_options(),
+                )
+                available = probe.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as error:
+            logger.debug("La detección de NVENC falló; se usará libx264: %s", error)
+            available = False
+        _NVENC_CACHE = available
+        return available
+
+
+def reset_nvenc_cache() -> None:
+    """Olvida el resultado cacheado de la detección de NVENC (tests)."""
+    global _NVENC_CACHE
+    with _NVENC_CACHE_LOCK:
+        _NVENC_CACHE = None
+
+
+def _video_encoder_args(ffmpeg_path: str) -> list[str]:
+    """Argumentos del codificador de video: NVENC si está disponible.
+
+    NVENC usa `-cq` (calidad constante, equivalente al CRF de x264) y
+    presets p1–p7 (p4 ≈ veryfast). Sin NVENC, libx264 exactamente como
+    antes. `-pix_fmt yuv420p` solo se añade con NVENC: el codificador
+    de NVIDIA lo exige y libx264 ya lo usa por defecto.
+    """
+    if is_nvenc_available(ffmpeg_path):
+        return [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-cq",
+            "21",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]
+
+
+def _register_render_process(process: subprocess.Popen[str]) -> None:
+    with _ACTIVE_RENDER_PROCESSES_LOCK:
+        _ACTIVE_RENDER_PROCESSES.add(process)
+
+
+def _unregister_render_process(process: subprocess.Popen[str]) -> None:
+    with _ACTIVE_RENDER_PROCESSES_LOCK:
+        _ACTIVE_RENDER_PROCESSES.discard(process)
+
+
+def _kill_render_process(process: subprocess.Popen[str]) -> None:
+    """Mata un ffmpeg de render junto con su grupo de procesos.
+
+    Multiplataforma y defensiva: en POSIX se mata el grupo completo
+    (el ffmpeg arranca con start_new_session); en Windows se mata el
+    proceso (ffmpeg no genera hijos y arranca en su propio grupo con
+    CREATE_NEW_PROCESS_GROUP). Nunca lanza: se llama desde el apagado.
+    """
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.kill()
+        else:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                process.terminate()
+    except Exception as error:  # noqa: BLE001 - el apagado no debe fallar
+        logger.debug("No se pudo terminar el render ffmpeg %s: %s", process.pid, error)
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001 - último intento, sin propagar
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except Exception:  # noqa: BLE001 - el apagado no debe fallar
+            pass
+
+
+def terminate_active_renders() -> int:
+    """Mata todos los ffmpeg de renders en curso. Devuelve cuántos había.
+
+    La usa el apagado elegante de la cola de procesamiento cuando el
+    drenado agota su timeout: sin esto, cancelar la tarea asyncio no
+    detiene el hilo del render y el ffmpeg quedaba huérfano (B9).
+    """
+    with _ACTIVE_RENDER_PROCESSES_LOCK:
+        processes = list(_ACTIVE_RENDER_PROCESSES)
+    for process in processes:
+        _kill_render_process(process)
+    return len(processes)
+
 
 class MediaProcessingError(RuntimeError):
     pass
@@ -55,6 +260,23 @@ def _subprocess_options() -> dict[str, int]:
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
     return {}
+
+
+def _render_subprocess_options() -> dict[str, object]:
+    """Opciones del ffmpeg de render: su propio grupo de procesos.
+
+    En POSIX, start_new_session=True crea un grupo nuevo; en Windows,
+    CREATE_NEW_PROCESS_GROUP hace lo mismo. Así el apagado elegante
+    puede matar el grupo sin tocar al resto de la app (B-P14).
+    """
+    if os.name == "nt":
+        create_new_process_group = int(
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+        )
+        return {
+            "creationflags": subprocess.CREATE_NO_WINDOW | create_new_process_group
+        }
+    return {"start_new_session": True}
 
 
 def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
@@ -81,7 +303,48 @@ def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]
     return result
 
 
-def probe_media(input_path: Path, ffprobe_path: str) -> dict[str, object]:
+def _probe_media_pyav(input_path: Path) -> dict[str, object]:
+    """Lee duración, dimensiones y audio con PyAV (sin ffprobe).
+
+    PyAV ya es dependencia de la app y trae sus propias DLL de FFmpeg,
+    así que este camino permite prescindir de ffprobe.exe (~85 MB del
+    instalador, B-R2/B37). Devuelve exactamente las mismas claves que
+    la sonda por ffprobe. Lanza MediaProcessingError ante cualquier
+    anomalía; el llamador decide si reintenta con ffprobe.
+    """
+    try:
+        import av
+    except ImportError as error:
+        raise MediaProcessingError("PyAV no está disponible.") from error
+    try:
+        with av.open(str(input_path)) as container:
+            video = next(iter(container.streams.video), None)
+            audio = next(iter(container.streams.audio), None)
+            if video is None or audio is None:
+                raise MediaProcessingError(
+                    "El archivo debe ser un video reproducible que incluya pista de audio."
+                )
+            duration: float | None = None
+            if container.duration is not None:
+                duration = container.duration / 1_000_000
+            elif video.duration is not None and video.time_base is not None:
+                duration = float(video.duration * video.time_base)
+            width, height = int(video.width or 0), int(video.height or 0)
+    except MediaProcessingError:
+        raise
+    except Exception as error:
+        raise MediaProcessingError(f"PyAV no pudo leer el archivo: {error}") from error
+    if duration is None or duration <= 0 or width <= 0 or height <= 0:
+        raise MediaProcessingError("PyAV devolvió una duración o resolución no válida.")
+    return {
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "has_audio": audio is not None,
+    }
+
+
+def _probe_media_ffprobe(input_path: Path, ffprobe_path: str) -> dict[str, object]:
     result = _run(
         [
             ffprobe_path,
@@ -114,6 +377,26 @@ def probe_media(input_path: Path, ffprobe_path: str) -> dict[str, object]:
         "height": height,
         "has_audio": audio is not None,
     }
+
+
+def probe_media(input_path: Path, ffprobe_path: str) -> dict[str, object]:
+    """Metadatos del video: PyAV primero, ffprobe como respaldo.
+
+    El camino PyAV es el preferido (ver _probe_media_pyav). Si PyAV no
+    está instalado o no puede leer el archivo, se reintenta con ffprobe
+    antes de fallar: un formato que PyAV no abre pero ffprobe sí no debe
+    tumbar el proyecto. `ffprobe_path` se conserva por eso y por
+    compatibilidad con los llamadores actuales.
+    """
+    try:
+        return _probe_media_pyav(input_path)
+    except MediaProcessingError as error:
+        logger.debug(
+            "La sonda PyAV falló para %s (%s); reintentando con ffprobe.",
+            input_path,
+            error,
+        )
+    return _probe_media_ffprobe(input_path, ffprobe_path)
 
 
 def create_thumbnail(
@@ -267,6 +550,32 @@ def _get_whisper_pipeline(
 
 
 def _silence_intervals(
+    input_path: Path,
+    start: float,
+    duration: float,
+    ffmpeg_path: str,
+) -> list[tuple[float, float]]:
+    identity = _file_identity(input_path)
+    cache_key = (
+        (identity, round(start, 3), round(duration, 3), ffmpeg_path)
+        if identity is not None
+        else None
+    )
+    if cache_key is not None:
+        with _SILENCE_CACHE_LOCK:
+            cached = _SILENCE_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+    intervals = _detect_silence_intervals(input_path, start, duration, ffmpeg_path)
+    if cache_key is not None:
+        with _SILENCE_CACHE_LOCK:
+            _SILENCE_CACHE[cache_key] = list(intervals)
+            while len(_SILENCE_CACHE) > _SILENCE_CACHE_MAX_ENTRIES:
+                _SILENCE_CACHE.pop(next(iter(_SILENCE_CACHE)))
+    return intervals
+
+
+def _detect_silence_intervals(
     input_path: Path,
     start: float,
     duration: float,
@@ -933,12 +1242,7 @@ def _render_clip(
         video_output,
         "-map",
         audio_output,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "21",
+        *_video_encoder_args(ffmpeg_path),
         "-c:a",
         "aac",
         "-b:a",
@@ -963,8 +1267,9 @@ def _render_clip(
             encoding="utf-8",
             errors="replace",
             cwd=subtitle_path.resolve().parent,
-            **_subprocess_options(),
+            **_render_subprocess_options(),
         )
+        _register_render_process(process)
         if process.stdout is None:
             raise MediaProcessingError("No se pudo leer el progreso de FFmpeg.")
 
@@ -1001,6 +1306,7 @@ def _render_clip(
         if timer is not None:
             timer.cancel()
         if process is not None:
+            _unregister_render_process(process)
             if process.poll() is None:
                 process.kill()
             process.wait()

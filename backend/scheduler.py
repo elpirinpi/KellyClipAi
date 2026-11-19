@@ -13,6 +13,14 @@ from .settings import AppSettings
 
 _logger = logging.getLogger(__name__)
 
+# Supervisor del programador (Fase 2, B-S7).
+_SCHEDULE_JOB_TIMEOUT_SECONDS = 1800.0  # 30 min por publicación: una subida
+# de un clip grande a una conexión lenta tarda minutos; 30 min deja margen
+# de sobra sin permitir que un job colgado bloquee la cola para siempre.
+_SUPERVISOR_INITIAL_BACKOFF_SECONDS = 2.0
+_SUPERVISOR_MAX_BACKOFF_SECONDS = 60.0
+_POLL_INTERVAL_SECONDS = 2.0
+
 
 def _export_clip(settings: AppSettings, job: dict[str, Any], clip: dict[str, Any]) -> Path:
     source = (
@@ -107,18 +115,95 @@ def process_schedule_job(settings: AppSettings, job: dict[str, Any]) -> None:
 
 
 async def schedule_worker(settings: AppSettings) -> None:
+    """Supervisor del programador de publicaciones (Fase 2, B-S7).
+
+    Antes, un error de BD en due_schedule_jobs o en el finish del handler
+    mataba el worker en silencio y las publicaciones programadas dejaban
+    de ejecutarse hasta reiniciar (B22). Ahora el ciclo completo está
+    dentro de un try: ante un error se registra, se espera con backoff
+    exponencial (2 s → 60 s) y se reintenta. El backoff se resetea en
+    cuanto un ciclo termina bien. La cancelación (apagado) se propaga.
+    """
+    backoff = _SUPERVISOR_INITIAL_BACKOFF_SECONDS
     while True:
-        for job in database.due_schedule_jobs(settings.database_path, database.utc_now()):
+        try:
+            await _process_due_jobs(settings)
+            backoff = _SUPERVISOR_INITIAL_BACKOFF_SECONDS
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception(
+                "El supervisor del programador falló; reintentando en %.0f s.",
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _SUPERVISOR_MAX_BACKOFF_SECONDS)
+
+
+def _finish_job_failed(settings: AppSettings, job: dict[str, Any], error: str) -> None:
+    """Marca un job como fallido sin lanzar nunca (B22).
+
+    Si la BD no responde, el error se registra y el job queda en
+    'processing': fail_interrupted_schedule_jobs lo marcará como fallido
+    en el próximo arranque.
+    """
+    try:
+        database.finish_schedule_job(
+            settings.database_path,
+            str(job["id"]),
+            "failed",
+            error=error,
+        )
+    except Exception:
+        _logger.exception(
+            "No se pudo marcar la tarea programada %s como fallida.", job["id"]
+        )
+
+
+async def _process_due_jobs(settings: AppSettings) -> None:
+    """Un ciclo del supervisor: procesa los jobs vencidos, uno a uno.
+
+    Cada job corre con timeout (B-S7): un job colgado (p. ej. una subida
+    atascada) no debe bloquear los demás. Al agotar el timeout el job se
+    marca como fallido; el hilo de to_thread puede seguir en segundo
+    plano, pero su finish posterior es un no-op porque finish_schedule_job
+    solo actualiza jobs en estado 'processing'.
+    """
+    jobs = database.due_schedule_jobs(settings.database_path, database.utc_now())
+    for job in jobs:
+        try:
             if not database.claim_schedule_job(settings.database_path, str(job["id"])):
                 continue
-            try:
-                await asyncio.to_thread(process_schedule_job, settings, job)
-            except Exception as error:
-                _logger.exception("No se pudo completar la tarea programada %s", job["id"])
-                database.finish_schedule_job(
-                    settings.database_path,
-                    str(job["id"]),
-                    "failed",
-                    error=f"No se pudo completar la tarea programada: {error}",
-                )
-        await asyncio.sleep(2)
+        except Exception:
+            _logger.exception(
+                "No se pudo reclamar la tarea programada %s; se reintentará "
+                "en el próximo ciclo.",
+                job["id"],
+            )
+            continue
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(process_schedule_job, settings, job),
+                timeout=_SCHEDULE_JOB_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            _logger.error(
+                "La tarea programada %s superó el tiempo máximo de %.0f s; "
+                "se marca como fallida.",
+                job["id"],
+                _SCHEDULE_JOB_TIMEOUT_SECONDS,
+            )
+            _finish_job_failed(
+                settings,
+                job,
+                "La publicación superó el tiempo máximo de "
+                f"{int(_SCHEDULE_JOB_TIMEOUT_SECONDS // 60)} minutos y se canceló.",
+            )
+        except Exception as error:
+            _logger.exception("No se pudo completar la tarea programada %s", job["id"])
+            _finish_job_failed(
+                settings,
+                job,
+                f"No se pudo completar la tarea programada: {error}",
+            )

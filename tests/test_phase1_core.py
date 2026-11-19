@@ -430,6 +430,7 @@ def test_llm_parse_error_in_one_window_does_not_abort_the_project(
         _window_duration: float,
         _llm: ResolvedLLM,
         validation_feedback: list[str] | None = None,
+        **_kwargs: object,
     ) -> list[ClipProposal]:
         calls.append(len(calls) + 1)
         if len(calls) == 1:

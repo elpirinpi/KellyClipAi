@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,8 +50,30 @@ class LLMJsonModeError(LLMResponseError):
 # Intentos por llamada LLM (reintentos de red, JSON inválido, truncado y
 # 400 json_validate_failed).
 _LLM_MAX_ATTEMPTS = 3
+# Tokens máximos de salida por llamada de propuestas (payload
+# OpenAI-compatible). El JSON de ≤10 clips cabe cómodamente en 2.000; el
+# reintento por truncado ya pide menos clips si llega a length. El valor
+# importa para el presupuesto TPM: el plan gratuito de Groq permite 8K
+# TPM por modelo y cada ventana consume ~1.500-2.000 tokens de entrada +
+# hasta este máximo de salida (incluido el razonamiento de Qwen3 antes
+# del JSON), así que con 4.000 dos ventanas seguidas ya superaban el
+# límite. pipeline.py lo importa para estimar los tokens por llamada.
+LLM_MAX_OUTPUT_TOKENS = 2000
+# Presupuesto SEPARADO para HTTP 429 (Fase 2): el límite del proveedor es
+# transitorio (en Groq, el límite TPM se resetea cada minuto) y merece
+# más paciencia que un error de red o un JSON inválido. Con 5 intentos
+# hay 4 esperas (1+2+4+8 = 15 s) antes de rendirse; el Retry-After del
+# proveedor (tope 120 s) cubre los resets de un minuto. El 429 NO consume
+# el presupuesto general: un 429 seguido de un 503 reintenta ambos con
+# su propio contador.
+_LLM_429_MAX_ATTEMPTS = 5
+_LLM_429_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 # Espera máxima que se respeta de la cabecera Retry-After del proveedor.
 _MAX_RETRY_AFTER_SECONDS = 60.0
+# Tope de Retry-After SOLO para 429: Groq indica con Retry-After cuándo
+# se resetea el límite TPM (~60 s); un tope de 60 s cortaría esa espera
+# y el siguiente intento volvería a dar 429. Para 5xx se mantiene 60 s.
+_MAX_429_RETRY_AFTER_SECONDS = 120.0
 # Clips pedidos cuando el modelo truncó la respuesta por max_tokens.
 _TRUNCATED_MAX_CLIPS = 3
 
@@ -210,7 +233,11 @@ def _extract_json(content: str) -> Any:
     return json.loads(text[start : end + 1])
 
 
-def _retry_after_seconds(response: httpx.Response) -> float | None:
+def _retry_after_seconds(
+    response: httpx.Response,
+    *,
+    cap: float = _MAX_RETRY_AFTER_SECONDS,
+) -> float | None:
     """Segundos de la cabecera Retry-After, si viene como número válido."""
     raw = response.headers.get("Retry-After")
     if raw is None:
@@ -221,28 +248,103 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         return None
     if seconds < 0:
         return None
-    return min(seconds, _MAX_RETRY_AFTER_SECONDS)
+    return min(seconds, cap)
+
+
+def _provider_error_message(response: httpx.Response) -> str:
+    """Mensaje de error completo del proveedor (payload estilo OpenAI)."""
+    try:
+        payload = response.json()
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return ""
+    message = payload["error"].get("message")
+    return message if isinstance(message, str) else ""
+
+
+def _rate_limit_scope(response: httpx.Response) -> str:
+    """Clasifica un 429 según qué límite se agotó: "daily" | "minute" | "unknown".
+
+    Groq indica el límite en el detalle del error: "... on tokens per day
+    (TPD) ..." o "... on requests per day (RPD) ..." → diario; "... on
+    tokens per minute (TPM) ..." o "... on requests per minute (RPM) ..."
+    → por minuto. Otros proveedores o formatos sin esa marca → "unknown".
+    """
+    message = _provider_error_message(response).lower()
+    if "per day" in message or "(tpd)" in message or "(rpd)" in message:
+        return "daily"
+    if "per minute" in message or "(tpm)" in message or "(rpm)" in message:
+        return "minute"
+    return "unknown"
+
+
+def _rate_limit_message(provider: str, scope: str = "unknown") -> str:
+    """Mensaje final tras agotar los reintentos por 429 (Fase 2).
+
+    El mensaje depende de qué límite se agotó: la cuota diaria se resetea
+    mañana y conviene cambiar de modelo (cada modelo tiene su propia
+    cuota); el límite por minuto se resuelve esperando unos minutos. Si
+    el detalle no permite distinguir, el mensaje genérico cubre ambos
+    casos. En Groq se indica dónde revisar el uso (console.groq.com).
+    """
+    if provider == "Groq" and scope == "daily":
+        return (
+            "Groq alcanzó su cuota diaria (HTTP 429): la cuota diaria está "
+            "agotada y se resetea mañana. Puedes cambiar de modelo en "
+            "Ajustes — cada modelo tiene su propia cuota — o revisar tu uso "
+            "en console.groq.com."
+        )
+    if provider == "Groq" and scope == "minute":
+        return (
+            "Groq alcanzó el límite de solicitudes por minuto (HTTP 429) "
+            "tras varios reintentos. Espera unos minutos y vuelve a "
+            "intentarlo. Puedes revisar tu uso en console.groq.com."
+        )
+    if provider == "Groq":
+        return (
+            "Groq alcanzó el límite de solicitudes (HTTP 429) tras varios "
+            "reintentos. Si es el límite por minuto, espera unos minutos y "
+            "vuelve a intentarlo; si es la cuota diaria, habrá que esperar "
+            "hasta mañana. Puedes revisar tu uso en console.groq.com."
+        )
+    return (
+        f"{provider} alcanzó el límite de solicitudes (HTTP 429) tras varios "
+        "reintentos. Espera unos minutos y vuelve a intentarlo."
+    )
 
 
 def _post_with_retry(
     client: httpx.Client,
     provider: str,
     url: str,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
     **kwargs: Any,
 ) -> httpx.Response:
-    for attempt in range(_LLM_MAX_ATTEMPTS):
+    """POST con reintentos. El 429 tiene presupuesto propio (ver constantes).
+
+    on_rate_limit(wait_seconds, attempt) se invoca antes de cada espera
+    por 429 para que el llamador avise al usuario de que la app está
+    esperando y no colgada (el pipeline lo conecta a los eventos de
+    progreso SSE). Es opcional y por defecto no hace nada.
+    """
+    general_attempts = 0  # errores de red, 5xx y json_validate_failed
+    rate_limit_attempts = 0  # 429, con presupuesto propio
+    while True:
         try:
             response = client.post(url, **kwargs)
         except httpx.RequestError as error:
             # Timeouts y conexiones reseteadas son transitorios: reintentar
             # con backoff exponencial + jitter en vez de tumbar el proyecto.
-            if attempt < _LLM_MAX_ATTEMPTS - 1:
-                delay = 0.5 * (2**attempt) + random.uniform(0, 0.5)
+            general_attempts += 1
+            if general_attempts < _LLM_MAX_ATTEMPTS:
+                delay = 0.5 * (2 ** (general_attempts - 1)) + random.uniform(0, 0.5)
                 logger.warning(
                     "Reintentando la llamada al proveedor LLM %s tras un error "
                     "de red (intento %d/%d, espera %.1fs): %s",
                     provider,
-                    attempt + 1,
+                    general_attempts,
                     _LLM_MAX_ATTEMPTS,
                     delay,
                     error,
@@ -253,52 +355,49 @@ def _post_with_retry(
             raise LLMConfigurationError(
                 "No se pudo conectar con el proveedor de IA. Revisa la conexión y la URL configurada."
             ) from error
-        if (
-            response.status_code == 429 or response.status_code >= 500
-        ) and attempt < _LLM_MAX_ATTEMPTS - 1:
-            # Sin Retry-After, el backoff es exactamente 0.5 * 2**intento
-            # (contrato cubierto por los tests existentes); si el proveedor
-            # pide esperar, se respeta su valor (con tope).
-            delay = _retry_after_seconds(response)
-            if delay is None:
-                delay = 0.5 * (2**attempt)
-            time.sleep(delay)
-            continue
-        if (
-            response.status_code == 400
-            and _error_code(response) == "json_validate_failed"
-            and attempt < _LLM_MAX_ATTEMPTS - 1
-        ):
-            # Groq no pudo generar JSON válido en modo json_object. Es
-            # transitorio: depende de la ventana y del muestreo del modelo
-            # de razonamiento, así que reintentar suele funcionar. Otros
-            # 400 (clave inválida, modelo inexistente) son errores de
-            # configuración y NO se reintentan: caen en la rama genérica.
-            delay = 0.5 * (2**attempt)
-            logger.warning(
-                "El proveedor %s no pudo generar JSON válido "
-                "(json_validate_failed); reintentando (intento %d/%d, "
-                "espera %.1fs).",
-                provider,
-                attempt + 1,
-                _LLM_MAX_ATTEMPTS,
-                delay,
-            )
-            time.sleep(delay)
-            continue
-        if response.status_code == 401:
-            raise LLMConfigurationError(
-                f"La clave API de {provider} no es válida. Revisa las credenciales guardadas."
-            )
-        if response.status_code == 402:
-            raise LLMConfigurationError(
-                f"{provider} necesita que revises el crédito o la facturación de la cuenta."
-            )
         if response.status_code == 429:
+            rate_limit_attempts += 1
+            if rate_limit_attempts < _LLM_429_MAX_ATTEMPTS:
+                # Sin Retry-After, el backoff es exactamente la secuencia
+                # 1s, 2s, 4s, 8s (contrato cubierto por los tests); si el
+                # proveedor pide esperar, se respeta su valor (tope 120 s
+                # solo para 429).
+                delay = _retry_after_seconds(
+                    response, cap=_MAX_429_RETRY_AFTER_SECONDS
+                )
+                if delay is None:
+                    delay = _LLM_429_BACKOFF_SECONDS[
+                        min(
+                            rate_limit_attempts - 1,
+                            len(_LLM_429_BACKOFF_SECONDS) - 1,
+                        )
+                    ]
+                logger.warning(
+                    "El proveedor %s devolvió 429 (límite de solicitudes); "
+                    "reintentando (intento %d/%d, espera %.1fs).",
+                    provider,
+                    rate_limit_attempts,
+                    _LLM_429_MAX_ATTEMPTS,
+                    delay,
+                )
+                if on_rate_limit is not None:
+                    on_rate_limit(delay, rate_limit_attempts)
+                time.sleep(delay)
+                continue
             raise LLMConfigurationError(
-                f"{provider} alcanzó el límite de solicitudes. Espera un momento o revisa tu plan."
+                _rate_limit_message(provider, _rate_limit_scope(response))
             )
         if response.status_code >= 500:
+            general_attempts += 1
+            if general_attempts < _LLM_MAX_ATTEMPTS:
+                # Sin Retry-After, el backoff es exactamente 0.5 * 2**intento
+                # (contrato cubierto por los tests existentes); si el proveedor
+                # pide esperar, se respeta su valor (con tope de 60 s).
+                delay = _retry_after_seconds(response)
+                if delay is None:
+                    delay = 0.5 * (2 ** (general_attempts - 1))
+                time.sleep(delay)
+                continue
             raise LLMConfigurationError(
                 f"{provider} no está disponible temporalmente (HTTP {response.status_code}). Inténtalo más tarde."
             )
@@ -306,6 +405,25 @@ def _post_with_retry(
             response.status_code == 400
             and _error_code(response) == "json_validate_failed"
         ):
+            general_attempts += 1
+            if general_attempts < _LLM_MAX_ATTEMPTS:
+                # Groq no pudo generar JSON válido en modo json_object. Es
+                # transitorio: depende de la ventana y del muestreo del modelo
+                # de razonamiento, así que reintentar suele funcionar. Otros
+                # 400 (clave inválida, modelo inexistente) son errores de
+                # configuración y NO se reintentan: caen en la rama genérica.
+                delay = 0.5 * (2 ** (general_attempts - 1))
+                logger.warning(
+                    "El proveedor %s no pudo generar JSON válido "
+                    "(json_validate_failed); reintentando (intento %d/%d, "
+                    "espera %.1fs).",
+                    provider,
+                    general_attempts,
+                    _LLM_MAX_ATTEMPTS,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
             # Se agotaron los reintentos en modo JSON. No es un error de
             # configuración: el llamador puede reintentar sin response_format
             # y el pipeline lo captura por ventana como LLMResponseError.
@@ -315,6 +433,14 @@ def _post_with_retry(
                 f"{provider} no pudo generar JSON válido en modo JSON "
                 f"(HTTP 400 json_validate_failed).{detail_suffix}"
             )
+        if response.status_code == 401:
+            raise LLMConfigurationError(
+                f"La clave API de {provider} no es válida. Revisa las credenciales guardadas."
+            )
+        if response.status_code == 402:
+            raise LLMConfigurationError(
+                f"{provider} necesita que revises el crédito o la facturación de la cuenta."
+            )
         if response.is_error:
             detail = _groq_error_detail(response) if provider == "Groq" else ""
             detail_suffix = f" Detalle: {detail}" if detail else ""
@@ -323,7 +449,6 @@ def _post_with_retry(
                 f"{detail_suffix}"
             )
         return response
-    raise AssertionError("El ciclo de reintento del proveedor LLM terminó inesperadamente.")
 
 
 def _request_clip_content(
@@ -331,6 +456,8 @@ def _request_clip_content(
     llm: ResolvedLLM,
     system: str,
     user: str,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
 ) -> tuple[str, str | None]:
     """Una llamada al LLM. Devuelve (contenido, finish_reason).
 
@@ -342,6 +469,7 @@ def _request_clip_content(
             client,
             llm.provider,
             f"{llm.base_url}/v1/messages",
+            on_rate_limit=on_rate_limit,
             headers={
                 "x-api-key": llm.api_key,
                 "anthropic-version": "2023-06-01",
@@ -364,7 +492,7 @@ def _request_clip_content(
     request_payload: dict[str, Any] = {
         "model": llm.model,
         "temperature": 0.2,
-        "max_tokens": 4000,
+        "max_tokens": LLM_MAX_OUTPUT_TOKENS,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system},
@@ -385,6 +513,7 @@ def _request_clip_content(
             client,
             llm.provider,
             f"{llm.base_url}/chat/completions",
+            on_rate_limit=on_rate_limit,
             headers=headers,
             json=request_payload,
         )
@@ -404,6 +533,7 @@ def _request_clip_content(
             client,
             llm.provider,
             f"{llm.base_url}/chat/completions",
+            on_rate_limit=on_rate_limit,
             headers=headers,
             json=request_payload,
         )
@@ -425,6 +555,8 @@ def propose_clips(
     duration: float,
     llm: ResolvedLLM,
     validation_feedback: list[str] | None = None,
+    *,
+    on_rate_limit: Callable[[float, int], None] | None = None,
 ) -> list[object]:
     system, user = _prompt(transcript, project, duration)
     if validation_feedback:
@@ -438,7 +570,7 @@ def propose_clips(
         attempt_user = user
         for attempt in range(_LLM_MAX_ATTEMPTS):
             content, finish_reason = _request_clip_content(
-                client, llm, system, attempt_user
+                client, llm, system, attempt_user, on_rate_limit=on_rate_limit
             )
             if finish_reason in {"length", "max_tokens"}:
                 # La respuesta se truncó por max_tokens: pedir menos clips
