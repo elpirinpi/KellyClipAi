@@ -292,7 +292,7 @@ def test_youtube_publishes_description_and_hashtags_not_viral_reason(
     assert payload["status"]["selfDeclaredMadeForKids"] is False
 
 
-def test_clip_keeps_generated_publication_metadata(
+def test_clip_keeps_generated_metadata_and_publishes_progress(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -312,10 +312,30 @@ def test_clip_keeps_generated_publication_metadata(
     monkeypatch.setattr(
         pipeline.database, "resolve_subtitle_template", lambda *_args: "Default"
     )
+    progress_events: list[tuple[str, str, int | None, str]] = []
+
+    def render_clip_with_progress(
+        _input_path,
+        _output_path,
+        _subtitle_path,
+        _proposal,
+        _config,
+        _transcript,
+        _ffmpeg_path,
+        on_progress,
+        **kwargs,
+    ):
+        kwargs["on_analysis_progress"](50)
+        on_progress(50)
+        return 10.0, []
+
+    monkeypatch.setattr(pipeline, "render_clip", render_clip_with_progress)
     monkeypatch.setattr(
         pipeline,
-        "render_clip",
-        lambda *_args, **_kwargs: (10.0, []),
+        "_publish",
+        lambda _settings, _project_id, status, step, progress, message: progress_events.append(
+            (status, step, progress, message)
+        ),
     )
     monkeypatch.setattr(
         pipeline,
@@ -348,6 +368,24 @@ def test_clip_keeps_generated_publication_metadata(
 
     assert clips[0]["description"] == "Un consejo práctico."
     assert clips[0]["hashtags"] == {"youtube": ["Consejos"]}
+    assert (
+        "processing",
+        "editing",
+        72,
+        "Preparando clip 1 de 1…",
+    ) in progress_events
+    assert (
+        "processing",
+        "editing",
+        72,
+        "Analizando reencuadre del clip 1 de 1… 50%",
+    ) in progress_events
+    assert (
+        "processing",
+        "editing",
+        85,
+        "Editando clip 1 de 1…",
+    ) in progress_events
 
 
 def test_social_captions_select_hashtags_for_the_target_platform() -> None:
@@ -406,7 +444,13 @@ def test_ffmpeg_timeout_kills_and_reaps_the_process(
             return -9 if self.killed else 0
 
     process = FakeProcess()
-    monkeypatch.setattr(media_module.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    launch_options: dict[str, object] = {}
+
+    def fake_popen(*_args, **kwargs):
+        launch_options.update(kwargs)
+        return process
+
+    monkeypatch.setattr(media_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(media_module, "_FFMPEG_RENDER_TIMEOUT_SECONDS", 0.01, raising=False)
     proposal = ClipProposal(
         inicio=0,
@@ -430,6 +474,32 @@ def test_ffmpeg_timeout_kills_and_reaps_the_process(
 
     assert process.killed
     assert process.wait_calls >= 1
+    if media_module.os.name == "nt":
+        assert launch_options["creationflags"] == media_module.subprocess.CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in launch_options
+
+
+def test_ffprobe_subprocess_hides_console_on_windows(monkeypatch) -> None:
+    launch_options: dict[str, object] = {}
+
+    def fake_run(arguments, **kwargs):
+        launch_options.update(kwargs)
+        return media_module.subprocess.CompletedProcess(
+            arguments,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(media_module.subprocess, "run", fake_run)
+
+    media_module._run(["ffprobe", "-version"], "leer los metadatos")
+
+    if media_module.os.name == "nt":
+        assert launch_options["creationflags"] == media_module.subprocess.CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in launch_options
 
 
 def test_each_database_connection_enforces_foreign_keys(tmp_path: Path) -> None:
@@ -504,7 +574,12 @@ def test_deferred_render_callbacks_keep_their_clip_index(
         callback(50)
 
     events = database.events_after(settings.database_path, project_id, 1)
-    assert [event["data"]["message"] for event in events] == [
+    messages = [event["data"]["message"] for event in events]
+    assert [message for message in messages if message.startswith("Preparando")] == [
+        "Preparando clip 1 de 2…",
+        "Preparando clip 2 de 2…",
+    ]
+    assert [message for message in messages if message.startswith("Editando")] == [
         "Editando clip 1 de 2…",
         "Editando clip 2 de 2…",
     ]

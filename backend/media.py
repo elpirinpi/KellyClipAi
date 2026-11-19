@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import subprocess
 import textwrap
@@ -49,6 +50,12 @@ class MediaProcessingError(RuntimeError):
     pass
 
 
+def _subprocess_options() -> dict[str, int]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -59,6 +66,7 @@ def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]
             encoding="utf-8",
             errors="replace",
             timeout=180,
+            **_subprocess_options(),
         )
     except FileNotFoundError as error:
         raise MediaProcessingError(
@@ -842,6 +850,7 @@ def _render_clip(
     output_resolution: int = 720,
     enhance_audio: bool = False,
     broll_path: Path | None = None,
+    on_analysis_progress: ProgressCallback | None = None,
 ) -> tuple[float, list[dict[str, object]]]:
     source_duration = proposal.fin - proposal.inicio
     intervals = _retained_intervals(input_path, proposal, config.options.silence, ffmpeg_path)
@@ -879,6 +888,7 @@ def _render_clip(
                 width,
                 height,
                 speech_intervals=speech_intervals,
+                on_progress=on_analysis_progress,
             )
         except FaceTrackingError as error:
             raise MediaProcessingError(str(error)) from error
@@ -947,6 +957,7 @@ def _render_clip(
             encoding="utf-8",
             errors="replace",
             cwd=subtitle_path.resolve().parent,
+            **_subprocess_options(),
         )
         if process.stdout is None:
             raise MediaProcessingError("No se pudo leer el progreso de FFmpeg.")
@@ -1009,6 +1020,7 @@ def render_clip(
     output_resolution: int = 720,
     enhance_audio: bool = False,
     broll_path: Path | None = None,
+    on_analysis_progress: ProgressCallback | None = None,
 ) -> tuple[float, list[dict[str, object]]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return _render_clip(
@@ -1025,4 +1037,5 @@ def render_clip(
         output_resolution,
         enhance_audio,
         broll_path,
+        on_analysis_progress,
     )

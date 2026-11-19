@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -346,6 +347,7 @@ def analyze_face_crop_paths(
     output_width: int,
     output_height: int,
     speech_intervals: list[tuple[float, float]] | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> list[list[FaceCropKeyframe] | None]:
     model_path = Path(__file__).with_name("models") / _MODEL_FILENAME
     if not model_path.is_file():
@@ -368,10 +370,14 @@ def analyze_face_crop_paths(
         source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if source_width < 1 or source_height < 1:
             raise FaceTrackingError("No se pudieron leer las dimensiones del video.")
+        frame_rate = float(capture.get(cv2.CAP_PROP_FPS))
+        sequential_sampling = math.isfinite(frame_rate) and frame_rate > 0
         scale, max_x, max_y = _crop_geometry(
             source_width, source_height, output_width, output_height
         )
         if max_x < 1 and max_y < 1:
+            if on_progress is not None:
+                on_progress(100.0)
             return [None for _ in intervals]
 
         detector = cv2.FaceDetectorYN.create(
@@ -384,9 +390,8 @@ def analyze_face_crop_paths(
             cv2.dnn.DNN_BACKEND_OPENCV,
             cv2.dnn.DNN_TARGET_CPU,
         )
-        media_pipe, landmarker = (
-            _get_lip_landmarker() if speech_intervals else (None, None)
-        )
+        media_pipe = None
+        landmarker = None
         tracker = _SubjectTracker(
             source_width,
             source_height,
@@ -396,16 +401,46 @@ def analyze_face_crop_paths(
         previous_thumbnail = None
         any_face_detected = False
         all_paths: list[list[FaceCropKeyframe] | None] = []
+        total_samples = sum(
+            max(1, math.ceil((interval_end - interval_start) * _SAMPLE_RATE))
+            for interval_start, interval_end in intervals
+        )
+        if total_samples == 0:
+            if on_progress is not None:
+                on_progress(100.0)
+            return []
+        completed_samples = 0
+        if on_progress is not None:
+            on_progress(0.0)
 
         for interval_start, interval_end in intervals:
             interval_duration = interval_end - interval_start
             sample_count = max(1, math.ceil(interval_duration * _SAMPLE_RATE))
+            if sequential_sampling:
+                sequential_sampling = capture.set(
+                    cv2.CAP_PROP_POS_MSEC,
+                    (clip_start + interval_start) * 1000,
+                )
             points: list[FaceCropKeyframe] = []
+            previous_local_time: float | None = None
             for sample_index in range(sample_count):
                 local_time = interval_start + interval_duration * sample_index / sample_count
                 absolute_time = clip_start + local_time
-                capture.set(cv2.CAP_PROP_POS_MSEC, absolute_time * 1000)
+                if sequential_sampling:
+                    if previous_local_time is not None:
+                        frame_step = max(
+                            1,
+                            round((local_time - previous_local_time) * frame_rate),
+                        )
+                        for _ in range(frame_step - 1):
+                            if not capture.grab():
+                                raise FaceTrackingError(
+                                    f"No se pudo leer el video en el segundo {absolute_time:.2f}."
+                                )
+                else:
+                    capture.set(cv2.CAP_PROP_POS_MSEC, absolute_time * 1000)
                 ok, frame = capture.read()
+                previous_local_time = local_time
                 if not ok or frame is None:
                     raise FaceTrackingError(
                         f"No se pudo leer el video en el segundo {absolute_time:.2f}."
@@ -462,10 +497,21 @@ def analyze_face_crop_paths(
                 )
                 any_face_detected |= bool(faces)
                 preferred_face = None
+                speech_active = any(
+                    start <= absolute_time <= end
+                    for start, end in speech_intervals or []
+                )
                 if scene_changed:
                     speaker_tracker.reset()
-                if landmarker is not None and media_pipe is not None:
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                measurements: list[tuple[_Face, float]] = []
+                if speech_active and faces and speech_intervals:
+                    if landmarker is None:
+                        media_pipe, landmarker = _get_lip_landmarker()
+                    if media_pipe is None:
+                        raise FaceTrackingError(
+                            "No se pudo inicializar el análisis del orador."
+                        )
+                    rgb_frame = cv2.cvtColor(detector_frame, cv2.COLOR_BGR2RGB)
                     image = media_pipe.Image(
                         image_format=media_pipe.ImageFormat.SRGB,
                         data=rgb_frame,
@@ -479,15 +525,11 @@ def analyze_face_crop_paths(
                         frame_width,
                         frame_height,
                     )
-                    speech_active = any(
-                        start <= absolute_time <= end
-                        for start, end in speech_intervals or []
-                    )
-                    preferred_face = speaker_tracker.update(
-                        measurements,
-                        absolute_time,
-                        speech_active,
-                    )
+                preferred_face = speaker_tracker.update(
+                    measurements,
+                    absolute_time,
+                    speech_active,
+                )
                 target = tracker.update(
                     faces,
                     absolute_time,
@@ -509,6 +551,9 @@ def analyze_face_crop_paths(
                     points.append(
                         FaceCropKeyframe(point_time, x, y)
                     )
+                completed_samples += 1
+                if on_progress is not None:
+                    on_progress(100 * completed_samples / total_samples)
 
             if points:
                 if points[0].time > 0:

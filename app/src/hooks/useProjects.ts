@@ -60,7 +60,7 @@ export function useProjects({
           void streamApiEvents(
             `${apiBase}/api/projects/${projectId}/events`,
             async (eventName, data) => {
-              const update = JSON.parse(data) as Partial<ProjectResult> & { message?: string };
+              const update = JSON.parse(data) as Partial<ProjectResult>;
               setProject((current) => current ? { ...current, ...update } : current);
               if (eventName === 'failed' || update.status === 'completed' || update.status === 'failed') {
                 eventController?.abort();

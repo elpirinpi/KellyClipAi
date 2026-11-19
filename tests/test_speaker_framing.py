@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from backend import face_tracking as face_tracking_module
 from backend.face_tracking import (
     _Face,
     _SpeakerActivityTracker,
@@ -53,9 +54,15 @@ def test_lip_motion_selects_a_face_during_voice_activity() -> None:
     assert active == right
 
 
-def test_mediapipe_landmarker_runs_on_video_frames_with_word_timestamps(
+def test_face_tracking_skips_lip_model_without_detected_faces(
     _video_with_audio: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        face_tracking_module,
+        "_get_lip_landmarker",
+        lambda: pytest.fail("No face was detected, so lip inference should be skipped."),
+    )
     tracks = analyze_face_crop_paths(
         _video_with_audio,
         0,
@@ -66,6 +73,46 @@ def test_mediapipe_landmarker_runs_on_video_frames_with_word_timestamps(
     )
 
     assert tracks == [None]
+
+
+def test_face_tracking_samples_sequentially_and_reports_progress(
+    _video_with_audio: Path,
+    monkeypatch,
+) -> None:
+    import cv2
+
+    original_video_capture = cv2.VideoCapture
+    captures = []
+
+    class CountingVideoCapture:
+        def __init__(self, path: str) -> None:
+            self.capture = original_video_capture(path)
+            self.set_calls = 0
+            captures.append(self)
+
+        def __getattr__(self, name: str):
+            return getattr(self.capture, name)
+
+        def set(self, property_id: int, value: float) -> bool:
+            self.set_calls += 1
+            return self.capture.set(property_id, value)
+
+    monkeypatch.setattr(cv2, "VideoCapture", CountingVideoCapture)
+    progress: list[float] = []
+
+    analyze_face_crop_paths(
+        _video_with_audio,
+        0,
+        [(0.0, 1.0), (1.0, 2.0)],
+        720,
+        1280,
+        on_progress=progress.append,
+    )
+
+    assert captures[0].set_calls == 2
+    assert progress[0] == 0
+    assert progress[-1] == 100
+    assert progress == sorted(progress)
 
 
 @pytest.mark.parametrize(

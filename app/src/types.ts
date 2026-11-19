@@ -92,6 +92,7 @@ export type ProjectResult = {
   status: string;
   step: string;
   progress: number | null;
+  message?: string;
   error: string | null;
   config: {
     ratio: string;

@@ -160,8 +160,13 @@ export function ProcessingPage({
             const complete = index < activeIndex || project?.status === 'completed';
             const current = index === activeIndex && project?.status !== 'completed' && project?.status !== 'failed';
             const failed = index === activeIndex && project?.status === 'failed';
+            const editingProgress = project?.progress == null || project.message?.includes('%')
+              ? ''
+              : ` ${project.progress}%`;
             const label = step.key === 'finding' && current
               ? `Buscando las mejores partes… ${project?.progress == null ? '' : `${project.progress}%`}`
+              : step.key === 'editing' && current
+                ? `${project?.message || 'Editando clips…'}${editingProgress}`
               : step.label;
             return (
               <li key={step.key} className={`${complete ? 'complete' : ''} ${current ? 'current' : ''} ${failed ? 'failed' : ''}`}>

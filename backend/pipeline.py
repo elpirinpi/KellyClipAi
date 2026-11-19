@@ -432,6 +432,15 @@ def _render_projects(
             "width": 0,
             "height": 0,
         }
+        clip_start_progress = 72 + round(index / count * 26)
+        _publish(
+            settings,
+            project_id,
+            "processing",
+            "editing",
+            clip_start_progress,
+            f"Preparando clip {index + 1} de {count}…",
+        )
 
         def on_encode_progress(percent: float, clip_index: int = index) -> None:
             overall = 72 + round(((clip_index + percent / 100) / count) * 26)
@@ -442,6 +451,21 @@ def _render_projects(
                 "editing",
                 min(overall, 98),
                 f"Editando clip {clip_index + 1} de {count}…",
+            )
+
+        def on_analysis_progress(
+            percent: float,
+            clip_index: int = index,
+            progress: int = clip_start_progress,
+        ) -> None:
+            _publish(
+                settings,
+                project_id,
+                "processing",
+                "editing",
+                progress,
+                f"Analizando reencuadre del clip {clip_index + 1} de {count}… "
+                f"{percent:.0f}%",
             )
 
         broll_path: Path | None = None
@@ -473,6 +497,7 @@ def _render_projects(
                 ffmpeg_path,
                 on_encode_progress,
                 broll_path=broll_path,
+                on_analysis_progress=on_analysis_progress,
             )
             metadata = probe_media(output_path, shutil.which("ffprobe") or "ffprobe")
             clip.update(
