@@ -618,7 +618,17 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
         project = response.json()
         project_id = project["id"]
         assert project["status"] == "ready"
-        assert project["config"] == config
+        assert project["config"] == {
+            **config,
+            "whisper_language": "auto",
+            "subtitle_style": {
+                "font_family": None,
+                "font_size": None,
+                "font_color": None,
+                "highlight_color": None,
+                "position": None,
+            },
+        }
         assert (settings.data_dir / "projects" / project_id / "source").is_file()
 
         blocked = client.post(
