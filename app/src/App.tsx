@@ -1,42 +1,31 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   AlertCircle, ArrowLeft, ArrowRight, AudioLines, CalendarDays, Check, ChevronDown,
   ChevronLeft, ChevronRight, Circle, CloudUpload, Download, FileText, FileVideo2, Link2, LoaderCircle,
   LockKeyhole, LogOut, MonitorUp, Pause, Plus, Scissors, Settings2, Share2, Sparkles, Trash2, Video, WandSparkles, X,
 } from 'lucide-react';
-import { accessToken, apiFetch, getSupabase, initializeSupabase, signOut, streamApiEvents, syncMediaCookie } from './auth';
-import type { Session } from '@supabase/supabase-js';
+import { useLocation, useMatch, useNavigate } from 'react-router-dom';
+import { apiFetch } from './auth';
+import { AuthPage, ProcessingPage, SharedClipPage } from './components/Pages';
+import { useAuth } from './hooks/useAuth';
+import { ACCEPT, pollStagedMedia, useImport } from './hooks/useImport';
+import { useProjects } from './hooks/useProjects';
+import {
+  DEFAULT_SUBTITLE_STYLE,
+  type ClipEditorState,
+  type ClipResult,
+  type EditablePhrase,
+  type IntegrationStatus,
+  type ProjectResult,
+  type ScheduleJob,
+  type StagedMedia,
+  type SubtitleStyleState,
+  type ZoomRecording,
+} from './types';
+import { formatDuration, responseError } from './utils';
 
 const API_BASE = __KELLYCLIP_API_BASE__;
 
-type UploadInfo = {
-  id: string;
-  name: string;
-  size: number;
-  duration: number;
-  width: number;
-  height: number;
-  kind: 'video' | 'audio';
-};
-
-type StagedMedia = {
-  id: string;
-  source_type: 'upload' | 'url';
-  status: 'receiving' | 'downloading' | 'ready' | 'failed' | 'finalizing' | 'completed';
-  filename: string;
-  title: string | null;
-  file_size: number;
-  duration: number;
-  width: number;
-  height: number;
-  kind: 'video' | 'audio';
-  bytes_received: number;
-  total_bytes: number | null;
-  speed: number | null;
-  eta: number | null;
-  error: string | null;
-  project_id: string | null;
-};
 type Template = { name: string; tone: string; sample: string; featured?: boolean; base_template?: string };
 type UpdateStatus = {
   enabled: boolean;
@@ -47,136 +36,6 @@ type UpdateStatus = {
   progress: number;
   error: string | null;
 };
-type ClipWord = { start: number; end: number; preview_start: number; preview_end: number; text: string };
-type EditablePhrase = {
-  id: string;
-  start: number;
-  end: number;
-  preview_start: number;
-  text: string;
-  removed: boolean;
-};
-type SubtitleStyleState = {
-  font_family: string | null;
-  font_size: number | null;
-  font_color: string | null;
-  highlight_color: string | null;
-  position: 'top' | 'center' | 'bottom' | null;
-};
-const DEFAULT_SUBTITLE_STYLE: SubtitleStyleState = {
-  font_family: null,
-  font_size: null,
-  font_color: null,
-  highlight_color: null,
-  position: null,
-};
-type ClipEditorState = {
-  ratio: string;
-  subtitle_template: string;
-  subtitle_style: SubtitleStyleState;
-  phrases: EditablePhrase[];
-};
-type ClipResult = {
-  id: string;
-  status?: 'ready' | 'failed';
-  error?: string;
-  title: string;
-  start: number;
-  end: number;
-  duration: number;
-  score: number;
-  viral_reason: string;
-  keywords: string[];
-  emojis: string[];
-  width: number;
-  height: number;
-  resolution?: 720 | 1080;
-  audio_enhanced?: boolean;
-  filename: string;
-  video_url: string | null;
-  download_url: string | null;
-  broll_provider?: string;
-  broll_creator?: string;
-  broll_attribution_url?: string;
-  transcript: ClipWord[];
-};
-type ProjectResult = {
-  id: string;
-  title: string;
-  status: string;
-  step: string;
-  progress: number | null;
-  error: string | null;
-  config: {
-    ratio: string;
-    duration: string;
-    framing?: 'speaker' | 'split' | 'blur' | 'center';
-    whisper_language?:
-      | 'auto'
-      | 'ar'
-      | 'de'
-      | 'en'
-      | 'es'
-      | 'fr'
-      | 'hi'
-      | 'it'
-      | 'ja'
-      | 'ko'
-      | 'nl'
-      | 'pl'
-      | 'pt'
-      | 'ru'
-      | 'tr'
-      | 'uk'
-      | 'zh';
-    subtitle_template: string;
-    subtitle_style?: SubtitleStyleState;
-    options: Record<string, boolean>;
-    moment: string;
-    schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
-  };
-  metadata: { duration: number; width: number; height: number; language?: string } | null;
-  transcript: Array<{ start: number; end: number; text: string; words: Array<{ start: number; end: number; text: string }> }> | null;
-  clips: ClipResult[];
-  thumbnail_url: string | null;
-  created_at: string;
-  updated_at: string;
-};
-type SharedClip = {
-  project_title: string;
-  clip_id: string;
-  title: string;
-  duration: number;
-  width: number;
-  height: number;
-  video_url: string;
-};
-type IntegrationStatus = {
-  configured: boolean;
-  missing: string[];
-  connected: boolean;
-  display_name: string | null;
-};
-type ZoomRecording = {
-  meeting_id: string;
-  topic: string;
-  start_time: string | null;
-  files: Array<{ file_id: string; file_type: string; file_size: number | null }>;
-};
-type ScheduleJob = {
-  id: string;
-  clip_id: string;
-  platform: string;
-  scheduled_at: string;
-  status: string;
-  confirmation_required: boolean;
-  visibility: string;
-  external_id?: string | null;
-  external_url: string | null;
-  error: string | null;
-  download_url: string | null;
-};
-
 declare global {
   interface Window {
     pywebview?: {
@@ -197,15 +56,6 @@ function defaultModelFor(provider: string): string {
   }[provider] ?? '';
 }
 
-async function responseError(response: Response): Promise<string> {
-  try {
-    const body = await response.json() as { detail?: string };
-    return body.detail ?? `El servidor respondió con error (${response.status}).`;
-  } catch {
-    return `El servidor respondió con error (${response.status}).`;
-  }
-}
-
 function triggerDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -223,8 +73,6 @@ async function downloadWithAuth(url: string, filename: string): Promise<void> {
   triggerDownload(await response.blob(), filename);
 }
 
-const ALLOWED_EXTENSIONS = new Set(['mp4', 'mov', '3gp', 'avi', 'mkv', 'webm', 'mp3', 'wav', 'm4a']);
-const ACCEPT = '.mp4,.mov,.3gp,.avi,.mkv,.webm,.mp3,.wav,.m4a,video/mp4,video/quicktime,video/3gpp,video/x-msvideo,video/webm,audio/mpeg,audio/wav,audio/mp4';
 const templates: Template[] = [
   { name: 'Default', tone: 'default', sample: 'Un gran momento' },
   { name: 'Modern', tone: 'modern', sample: 'Ideas que inspiran' },
@@ -249,29 +97,6 @@ const platforms = [
   { label: 'Vimeo', domain: 'vimeo.com', glyph: 'v', color: '#1ab7ea' },
 ];
 
-function formatDuration(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return '—';
-  const value = Math.floor(seconds);
-  const hours = Math.floor(value / 3600);
-  const minutes = Math.floor((value % 3600) / 60);
-  const secs = value % 60;
-  return hours > 0
-    ? `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
-    : `${minutes}:${secs.toString().padStart(2, '0')}`;
-}
-
-function stagedUploadInfo(staged: StagedMedia): UploadInfo {
-  return {
-    id: staged.id,
-    name: staged.filename,
-    size: staged.file_size,
-    duration: staged.duration,
-    width: staged.width,
-    height: staged.height,
-    kind: staged.kind,
-  };
-}
-
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -284,238 +109,10 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(unit > 0 && value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
-async function uploadStagedFile(
-  stagedId: string,
-  file: File,
-  onProgress: (progress: number) => void,
-  onRequest: (request: XMLHttpRequest | null) => void,
-): Promise<void> {
-  const token = await accessToken();
-  if (!token) throw new Error('Inicia sesión antes de cargar un video.');
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open('POST', `${API_BASE}/api/staged-media/${stagedId}/content`);
-    request.setRequestHeader('Content-Type', 'application/octet-stream');
-    request.setRequestHeader('Authorization', `Bearer ${token}`);
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
-      }
-    };
-    request.onload = () => {
-      onRequest(null);
-      if (request.status >= 200 && request.status < 300) {
-        resolve();
-        return;
-      }
-      try {
-        const body = JSON.parse(request.responseText) as { detail?: string };
-        reject(new Error(body.detail ?? `El servidor respondió con error (${request.status}).`));
-      } catch {
-        reject(new Error(`El servidor respondió con error (${request.status}).`));
-      }
-    };
-    request.onerror = () => {
-      onRequest(null);
-      reject(new Error('No se pudo conectar con el almacenamiento local.'));
-    };
-    request.onabort = () => {
-      onRequest(null);
-      reject(new Error('Importación cancelada.'));
-    };
-    onRequest(request);
-    request.send(file);
-  });
-}
-
-async function pollStagedMedia(
-  stagedId: string,
-  onUpdate: (staged: StagedMedia) => void,
-  active: () => boolean,
-): Promise<StagedMedia> {
-  while (active()) {
-    const response = await apiFetch(`${API_BASE}/api/staged-media/${stagedId}`);
-    if (!response.ok) throw new Error(await responseError(response));
-    const staged = await response.json() as StagedMedia;
-    onUpdate(staged);
-    if (staged.status === 'ready' || staged.status === 'completed') return staged;
-    if (staged.status === 'failed') {
-      throw new Error(staged.error ?? 'La importación falló. Vuelve a intentarlo.');
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 600));
-  }
-  throw new Error('La importación se interrumpió.');
-}
-
-function metadataFor(file: File): Promise<{ duration: number; width: number; height: number; thumbnail: string }> {
-  const url = URL.createObjectURL(file);
-  return new Promise((resolve) => {
-    const isAudio = file.type.startsWith('audio/') || ['mp3', 'wav', 'm4a'].includes(extensionOf(file.name));
-    const media = document.createElement(isAudio ? 'audio' : 'video');
-    let completed = false;
-    const finish = (thumbnail = '') => {
-      if (completed) return;
-      completed = true;
-      clearTimeout(timer);
-      const result = {
-        duration: Number.isFinite(media.duration) ? media.duration : 0,
-        width: media instanceof HTMLVideoElement ? media.videoWidth : 0,
-        height: media instanceof HTMLVideoElement ? media.videoHeight : 0,
-        thumbnail,
-      };
-      URL.revokeObjectURL(url);
-      media.removeAttribute('src');
-      media.load();
-      resolve(result);
-    };
-    const takeThumbnail = () => {
-      if (!(media instanceof HTMLVideoElement) || !media.videoWidth || !media.videoHeight) {
-        finish();
-        return;
-      }
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = media.videoWidth;
-        canvas.height = media.videoHeight;
-        canvas.getContext('2d')?.drawImage(media, 0, 0, canvas.width, canvas.height);
-        finish(canvas.toDataURL('image/jpeg', 0.78));
-      } catch {
-        finish();
-      }
-    };
-    const timer = window.setTimeout(() => finish(), 3500);
-    media.preload = 'metadata';
-    media.onloadedmetadata = () => {
-      if (media instanceof HTMLVideoElement && media.videoWidth && media.duration > 0) {
-        media.currentTime = Math.min(1, media.duration / 2);
-        media.onseeked = takeThumbnail;
-        media.onloadeddata = takeThumbnail;
-      } else {
-        finish();
-      }
-    };
-    media.onerror = () => finish();
-    media.src = url;
-  });
-}
-
-function extensionOf(name: string): string {
-  return name.split('.').pop()?.toLowerCase() ?? '';
-}
-
-function AuthPage({ configurationError }: { configurationError: string }) {
-  const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
-
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setBusy(true);
-    setError('');
-    setMessage('');
-    try {
-      if (mode === 'register') {
-        const { data, error: signUpError } = await getSupabase().auth.signUp({
-          email: email.trim(),
-          password,
-          options: { emailRedirectTo: window.location.origin },
-        });
-        if (signUpError) throw signUpError;
-        if (!data.session) {
-          setMessage('Cuenta creada. Verifica tu correo y después inicia sesión.');
-        }
-      } else {
-        const { error: signInError } = await getSupabase().auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        });
-        if (signInError) throw signInError;
-      }
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : 'No se pudo completar la solicitud.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <main className="auth-page">
-      <section className="auth-card" aria-labelledby="auth-title">
-        <div className="auth-brand" aria-label="kellyClipAi">
-          <span className="brand-mark" aria-hidden="true"><span /><span /><span /></span>
-          <span className="brand-name">kelly<span>Clip</span><b>Ai</b></span>
-        </div>
-        <h1 id="auth-title">{mode === 'login' ? 'Inicia sesión' : 'Crea tu cuenta'}</h1>
-        <p className="auth-intro">
-          {mode === 'login'
-            ? 'Accede a tus proyectos y continúa creando clips.'
-            : 'Regístrate con tu correo para usar kellyClipAi.'}
-        </p>
-        {configurationError && <p className="error-message" role="alert">{configurationError}</p>}
-        {!configurationError && (
-          <form className="auth-form" onSubmit={(event) => void submit(event)}>
-            <label className="config-field">
-              <span>Correo electrónico</span>
-              <input
-                className="text-input"
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-              />
-            </label>
-            <label className="config-field">
-              <span>Contraseña</span>
-              <input
-                className="text-input"
-                type="password"
-                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                minLength={8}
-                required
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-            </label>
-            {error && <p className="error-message" role="alert">{error}</p>}
-            {message && <p className="connection-message success" role="status">{message}</p>}
-            <button type="submit" className="auth-submit" disabled={busy}>
-              {busy ? 'Un momento…' : mode === 'login' ? 'Entrar' : 'Registrarme'}
-            </button>
-          </form>
-        )}
-        {!configurationError && (
-          <button
-            type="button"
-            className="auth-switch"
-            onClick={() => {
-              setMode((current) => current === 'login' ? 'register' : 'login');
-              setMessage('');
-              setError('');
-            }}
-          >
-            {mode === 'login' ? '¿No tienes cuenta? Regístrate' : '¿Ya tienes cuenta? Inicia sesión'}
-          </button>
-        )}
-      </section>
-      <footer className="developer-credit">Desarrollado por <strong>KELLY BENJAMIN DE LA CRUZ</strong></footer>
-    </main>
-  );
-}
-
 function App() {
-  const [route, setRoute] = useState(window.location.pathname);
-  const [authReady, setAuthReady] = useState(false);
-  const [authSession, setAuthSession] = useState<Session | null>(null);
-  const [authConfigurationError, setAuthConfigurationError] = useState('');
-  const [fileInfo, setFileInfo] = useState<UploadInfo | null>(null);
-  const [thumbnail, setThumbnail] = useState('');
-  const [progress, setProgress] = useState<number | null>(null);
-  const [uploadError, setUploadError] = useState('');
-  const [dragging, setDragging] = useState(false);
+  const location = useLocation();
+  const routerNavigate = useNavigate();
+  const route = location.pathname;
   const [link, setLink] = useState('');
   const [linkMessage, setLinkMessage] = useState('');
   const [downloadProgress, setDownloadProgress] = useState<StagedMedia | null>(null);
@@ -541,14 +138,18 @@ function App() {
   const [schedulePlatform, setSchedulePlatform] = useState('youtube');
   const [scheduleVisibility, setScheduleVisibility] = useState('private');
   const [notice, setNotice] = useState('');
+  const {
+    authReady,
+    authSession,
+    configurationError: authConfigurationError,
+    signOut: signOutCurrentUser,
+  } = useAuth(API_BASE, setNotice);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [settingsProvider, setSettingsProvider] = useState('Groq');
   const [whisperModel, setWhisperModel] = useState('small');
   const [whisperLanguage, setWhisperLanguage] = useState('auto');
   const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyleState>(DEFAULT_SUBTITLE_STYLE);
   const [linkProject, setLinkProject] = useState<ProjectResult | null>(null);
-  const [project, setProject] = useState<ProjectResult | null>(null);
-  const [projectError, setProjectError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [settingsReturnPath, setSettingsReturnPath] = useState('/');
   const [recordOpen, setRecordOpen] = useState(false);
@@ -561,60 +162,33 @@ function App() {
   const [zoomRecordings, setZoomRecordings] = useState<ZoomRecording[]>([]);
   const [zoomLoading, setZoomLoading] = useState(false);
   const [zoomError, setZoomError] = useState('');
-  const inputRef = useRef<HTMLInputElement>(null);
-  const cancelImportRef = useRef(false);
-  const importGenerationRef = useRef(0);
-  const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const recordChunksRef = useRef<Blob[]>([]);
   const currentUserId = authSession?.user.id;
-
-  useEffect(() => {
-    let active = true;
-    let unsubscribe: (() => void) | undefined;
-    const startAuth = async () => {
-      try {
-        const { client, session } = await initializeSupabase(API_BASE);
-        if (!active) return;
-        if (!client) {
-          setAuthConfigurationError(
-            'Falta configurar SUPABASE_URL y SUPABASE_ANON_KEY en el archivo .env local.',
-          );
-        } else {
-          setAuthSession(session);
-          if (session?.access_token) {
-            void syncMediaCookie(API_BASE, session.access_token).catch((error: unknown) => {
-              if (active) setNotice(error instanceof Error ? error.message : 'No se pudo preparar la sesión.');
-            });
-          }
-          const { data } = client.auth.onAuthStateChange((_event, nextSession) => {
-            if (!active) return;
-            setAuthSession(nextSession);
-            if (nextSession?.access_token) {
-              void syncMediaCookie(API_BASE, nextSession.access_token).catch((error: unknown) => {
-                if (active) setNotice(error instanceof Error ? error.message : 'No se pudo preparar la sesión.');
-              });
-            }
-          });
-          unsubscribe = () => data.subscription.unsubscribe();
-        }
-      } catch (error) {
-        if (active) {
-          setAuthConfigurationError(
-            error instanceof Error ? error.message : 'No se pudo iniciar la autenticación.',
-          );
-        }
-      } finally {
-        if (active) setAuthReady(true);
-      }
-    };
-    void startAuth();
-    return () => {
-      active = false;
-      unsubscribe?.();
-    };
-  }, []);
+  const clearLinkProject = useCallback(() => setLinkProject(null), []);
+  const {
+    fileInfo,
+    setFileInfo,
+    thumbnail,
+    progress,
+    setProgress,
+    uploadError,
+    setUploadError,
+    dragging,
+    setDragging,
+    inputRef,
+    importFile,
+    chooseFile,
+    onDrop,
+    cancelImport,
+  } = useImport({
+    apiBase: API_BASE,
+    authReady: authReady && Boolean(authSession),
+    userId: currentUserId,
+    onImportStart: clearLinkProject,
+    onNotice: setNotice,
+  });
 
   useEffect(() => {
     if (!authReady || !authSession) return;
@@ -684,67 +258,11 @@ function App() {
   }, [authSession, updateStatus?.state]);
 
   const navigate = useCallback((next: string) => {
-    window.history.pushState(null, '', next);
-    setRoute(next);
+    routerNavigate(next);
     setNotice('');
     if (next === '/') setLinkProject(null);
     window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
-
-  useEffect(() => {
-    const onPopState = () => setRoute(window.location.pathname);
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, []);
-
-  useEffect(() => {
-    if (!authReady || !authSession) return;
-    let active = true;
-    const restoreUpload = async () => {
-      try {
-        const response = await apiFetch(`${API_BASE}/api/staged-media/latest?source=upload`);
-        if (!response.ok) throw new Error(await responseError(response));
-        const latest = await response.json() as StagedMedia | null;
-        if (!active || !latest) return;
-        if (latest.status === 'failed') {
-          setUploadError(latest.error ?? 'La última carga no se completó. Vuelve a seleccionar el archivo.');
-          return;
-        }
-        setFileInfo(stagedUploadInfo(latest));
-        setThumbnail('');
-        setProgress(latest.status === 'ready'
-          ? 100
-          : latest.file_size > 0
-            ? Math.min(99, Math.floor((latest.bytes_received / latest.file_size) * 100))
-            : 0);
-        if (latest.status === 'receiving') {
-          await pollStagedMedia(
-            latest.id,
-            (staged) => {
-              if (!active) return;
-              setProgress(staged.status === 'ready'
-                ? 100
-                : staged.file_size > 0
-                  ? Math.min(99, Math.floor((staged.bytes_received / staged.file_size) * 100))
-                  : 0);
-              if (staged.status === 'failed') {
-                setUploadError(staged.error ?? 'La carga se interrumpió. Vuelve a seleccionar el archivo.');
-                setProgress(null);
-                setFileInfo(null);
-              }
-            },
-            () => active,
-          );
-        }
-      } catch (error) {
-        if (active) setUploadError(error instanceof Error ? error.message : 'No se pudo recuperar la carga local.');
-      }
-    };
-    void restoreUpload();
-    return () => {
-      active = false;
-    };
-  }, [authReady, currentUserId]);
+  }, [routerNavigate]);
 
   useEffect(() => {
     if (!authReady || !authSession) return;
@@ -775,100 +293,6 @@ function App() {
     const interval = window.setInterval(() => setRecordingTime((value) => value + 1), 1000);
     return () => window.clearInterval(interval);
   }, [recording]);
-
-  const importFile = useCallback(async (file: File, fromRecorder = false) => {
-    setUploadError('');
-    setNotice('');
-    const extension = extensionOf(file.name);
-    if (!fromRecorder && !ALLOWED_EXTENSIONS.has(extension)) {
-      setUploadError('Formato no compatible. Usa MP4, MOV, 3GP, AVI, MP3, WAV o M4A.');
-      return;
-    }
-    if (file.size === 0) {
-      setUploadError('El archivo está vacío. Elige otro archivo.');
-      return;
-    }
-
-    uploadRequestRef.current?.abort();
-    cancelImportRef.current = false;
-    const generation = ++importGenerationRef.current;
-    setLinkProject(null);
-    setFileInfo(null);
-    setThumbnail('');
-    setProgress(0);
-    const kind = file.type.startsWith('audio/') || ['mp3', 'wav', 'm4a'].includes(extension) ? 'audio' : 'video';
-    try {
-      const metadata = await metadataFor(file);
-      if (cancelImportRef.current || generation !== importGenerationRef.current) {
-        setProgress(null);
-        return;
-      }
-      const createResponse = await apiFetch(`${API_BASE}/api/staged-media/uploads`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filename: file.name,
-          file_size: file.size,
-          content_type: file.type || 'application/octet-stream',
-          duration: metadata.duration,
-          width: metadata.width,
-          height: metadata.height,
-          kind,
-        }),
-      });
-      if (!createResponse.ok) throw new Error(await responseError(createResponse));
-      const staged = await createResponse.json() as StagedMedia;
-      if (cancelImportRef.current || generation !== importGenerationRef.current) {
-        const deleteResponse = await apiFetch(`${API_BASE}/api/staged-media/${staged.id}`, { method: 'DELETE' });
-        if (!deleteResponse.ok) throw new Error(await responseError(deleteResponse));
-        setProgress(null);
-        return;
-      }
-      const info = stagedUploadInfo(staged);
-      setFileInfo(info);
-      setThumbnail(metadata.thumbnail);
-      await uploadStagedFile(
-        staged.id,
-        file,
-        (value) => {
-          if (generation === importGenerationRef.current) setProgress(value);
-        },
-        (request) => {
-          if (generation === importGenerationRef.current) uploadRequestRef.current = request;
-        },
-      );
-      if (generation === importGenerationRef.current) {
-        setProgress(100);
-        setUploadError('');
-      }
-    } catch (error) {
-      if (generation !== importGenerationRef.current) return;
-      if (uploadRequestRef.current) uploadRequestRef.current = null;
-      setProgress(null);
-      setFileInfo(null);
-      setUploadError(error instanceof Error ? error.message : 'No se pudo guardar el archivo en este dispositivo.');
-    }
-  }, []);
-
-  const chooseFile = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) void importFile(file);
-    event.target.value = '';
-  };
-
-  const onDrop = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragging(false);
-    const file = event.dataTransfer.files[0];
-    if (file) void importFile(file);
-  };
-
-  const cancelImport = () => {
-    cancelImportRef.current = true;
-    uploadRequestRef.current?.abort();
-    setProgress(null);
-    setUploadError('Importación cancelada.');
-  };
 
   const detectedPlatform = useMemo(() => {
     try {
@@ -904,6 +328,7 @@ function App() {
       const ready = started.status === 'ready'
         ? started
         : await pollStagedMedia(
+            API_BASE,
             started.id,
             setDownloadProgress,
             () => true,
@@ -1088,7 +513,7 @@ function App() {
         setLinkMessage('Reanudando la descarga local del enlace…');
         const ready = latest.status === 'ready'
           ? latest
-          : await pollStagedMedia(latest.id, (staged) => {
+          : await pollStagedMedia(API_BASE, latest.id, (staged) => {
               if (active) setDownloadProgress(staged);
             }, () => active);
         if (!active) return;
@@ -1119,95 +544,67 @@ function App() {
     };
   }, [authReady, currentUserId, navigate, route]);
 
-  const isSettings = route === '/settings';
-  const projectRoute = route.match(/^\/p\/([^/]+)(?:\/(configure|processing|edit\/([^/]+)))?$/);
-  const projectRouteId = projectRoute?.[1] ?? '';
-  const projectRouteMode = projectRoute?.[2]?.startsWith('edit/')
-    ? 'edit'
-    : projectRoute?.[2] ?? 'results';
-  const editClipId = projectRoute?.[3] ?? '';
+  const isSettings = Boolean(useMatch('/settings'));
+  const shareToken = useMatch('/share/:token')?.params.token ?? '';
+  const configureMatch = useMatch('/p/:projectId/configure');
+  const processingMatch = useMatch('/p/:projectId/processing');
+  const editMatch = useMatch('/p/:projectId/edit/:clipId');
+  const resultsMatch = useMatch('/p/:projectId');
+  const projectRouteId = configureMatch?.params.projectId
+    ?? processingMatch?.params.projectId
+    ?? editMatch?.params.projectId
+    ?? resultsMatch?.params.projectId
+    ?? '';
+  const projectRouteMode = configureMatch
+    ? 'configure'
+    : processingMatch
+      ? 'processing'
+      : editMatch
+        ? 'edit'
+        : 'results';
+  const editClipId = editMatch?.params.clipId ?? '';
 
-  useEffect(() => {
-    if (!authReady || !authSession) return;
-    if (!projectRouteId) {
-      setProject(null);
-      setProjectError('');
-      return;
+  const applyProjectConfiguration = useCallback((loaded: ProjectResult) => {
+    setLinkProject(loaded);
+    setRatio(loaded.config.ratio);
+    setDuration(loaded.config.duration);
+    setFraming(loaded.config.framing ?? 'speaker');
+    setWhisperLanguage(loaded.config.whisper_language ?? 'auto');
+    setActiveTemplate(loaded.config.subtitle_template);
+    setSubtitleStyle(loaded.config.subtitle_style ?? DEFAULT_SUBTITLE_STYLE);
+    setOptions({
+      emojis: true,
+      keywords: true,
+      broll: false,
+      silence: false,
+      censor: false,
+      face_tracking: true,
+      ...loaded.config.options,
+    });
+    setMoment(loaded.config.moment);
+    setSchedule(Boolean(loaded.config.schedule));
+    if (loaded.config.schedule) {
+      const localDate = new Date(loaded.config.schedule.scheduled_at);
+      setScheduleDate(new Date(localDate.getTime() - localDate.getTimezoneOffset() * 60000).toISOString().slice(0, 16));
+      setSchedulePlatform(loaded.config.schedule.platform);
+      setScheduleVisibility(loaded.config.schedule.visibility);
     }
-    let active = true;
-    let eventController: AbortController | null = null;
-    const loadProject = async () => {
-      setProjectError('');
-      try {
-        const response = await apiFetch(`${API_BASE}/api/projects/${projectRouteId}`);
-        if (!response.ok) throw new Error(await responseError(response));
-        const loaded = await response.json() as ProjectResult;
-        if (!active) return;
-        setProject(loaded);
-        if (projectRouteMode === 'configure') {
-          setLinkProject(loaded);
-          setRatio(loaded.config.ratio);
-          setDuration(loaded.config.duration);
-          setFraming(loaded.config.framing ?? 'speaker');
-          setWhisperLanguage(loaded.config.whisper_language ?? 'auto');
-          setActiveTemplate(loaded.config.subtitle_template);
-          setSubtitleStyle(loaded.config.subtitle_style ?? DEFAULT_SUBTITLE_STYLE);
-          setOptions({
-            emojis: true,
-            keywords: true,
-            broll: false,
-            silence: false,
-            censor: false,
-            face_tracking: true,
-            ...loaded.config.options,
-          });
-          setMoment(loaded.config.moment);
-          setSchedule(Boolean(loaded.config.schedule));
-          if (loaded.config.schedule) {
-            const localDate = new Date(loaded.config.schedule.scheduled_at);
-            setScheduleDate(new Date(localDate.getTime() - localDate.getTimezoneOffset() * 60000).toISOString().slice(0, 16));
-            setSchedulePlatform(loaded.config.schedule.platform);
-            setScheduleVisibility(loaded.config.schedule.visibility);
-          }
-        }
-        if (loaded.status === 'processing' || loaded.status === 'queued') {
-          if (projectRouteMode !== 'processing') navigate(`/p/${projectRouteId}/processing`);
-          eventController = new AbortController();
-          void streamApiEvents(
-            `${API_BASE}/api/projects/${projectRouteId}/events`,
-            async (eventName, data) => {
-              const update = JSON.parse(data) as Partial<ProjectResult> & { message?: string };
-              setProject((current) => current ? { ...current, ...update } : current);
-              if (eventName === 'failed' || update.status === 'completed' || update.status === 'failed') {
-                eventController?.abort();
-                const result = await apiFetch(`${API_BASE}/api/projects/${projectRouteId}`);
-                if (!result.ok) throw new Error(await responseError(result));
-                const finalProject = await result.json() as ProjectResult;
-                if (active) {
-                  setProject(finalProject);
-                  navigate(`/p/${projectRouteId}`);
-                }
-              }
-            },
-            eventController.signal,
-          ).catch((error: unknown) => {
-            if (active && !eventController?.signal.aborted) {
-              setProjectError(error instanceof Error ? error.message : 'Se perdió la conexión con el progreso del procesamiento.');
-            }
-          });
-        } else if (projectRouteMode === 'processing') {
-          navigate(`/p/${projectRouteId}`);
-        }
-      } catch (error) {
-        if (active) setProjectError(error instanceof Error ? error.message : 'No se pudo cargar el proyecto.');
-      }
-    };
-    void loadProject();
-    return () => {
-      active = false;
-      eventController?.abort();
-    };
-  }, [authReady, currentUserId, projectRouteId, projectRouteMode, navigate]);
+  }, []);
+  const {
+    project,
+    setProject,
+    projectError,
+    setProjectError,
+    refreshProject,
+  } = useProjects({
+    apiBase: API_BASE,
+    authReady: authReady && Boolean(authSession),
+    userId: currentUserId,
+    projectId: projectRouteId,
+    routeMode: projectRouteMode,
+    navigate,
+    onConfigureProject: applyProjectConfiguration,
+  });
 
   const retryProject = async () => {
     if (!project) return;
@@ -1217,12 +614,6 @@ function App() {
     } catch (error) {
       setProjectError(error instanceof Error ? error.message : 'No se pudo reintentar el procesamiento.');
     }
-  };
-
-  const refreshProject = async (projectId: string) => {
-    const response = await apiFetch(`${API_BASE}/api/projects/${projectId}`);
-    if (!response.ok) throw new Error(await responseError(response));
-    setProject(await response.json() as ProjectResult);
   };
 
   const openZoomImport = async () => {
@@ -1263,13 +654,9 @@ function App() {
     }
   };
 
-  const shareRoute = route.match(/^\/share\/([^/]+)$/);
-  const shareToken = shareRoute?.[1] ?? '';
-
   const handleSignOut = async () => {
     try {
-      await signOut(API_BASE);
-      setAuthSession(null);
+      await signOutCurrentUser();
       setFileInfo(null);
       setProject(null);
       setLinkProject(null);
@@ -1397,7 +784,7 @@ function App() {
       )}
 
       {shareToken ? (
-        <SharedClipPage token={shareToken} />
+        <SharedClipPage apiBase={API_BASE} token={shareToken} />
       ) : isSettings ? (
         <SettingsPage
           provider={settingsProvider}
@@ -1410,7 +797,7 @@ function App() {
         />
       ) : projectRouteId && projectRouteMode !== 'configure' ? (
         projectRouteMode === 'processing'
-          ? <ProcessingPage project={project} error={projectError} onRetry={() => void retryProject()} />
+          ? <ProcessingPage apiBase={API_BASE} project={project} error={projectError} onRetry={() => void retryProject()} />
           : projectRouteMode === 'edit'
             ? <ClipEditorPage
               projectId={projectRouteId}
@@ -1724,68 +1111,6 @@ function App() {
         Desarrollado por <strong>KELLY BENJAMIN DE LA CRUZ</strong>
       </footer>
     </div>
-  );
-}
-
-function ProcessingPage({ project, error, onRetry }: { project: ProjectResult | null; error: string; onRetry: () => void }) {
-  const steps = [
-    { key: 'upload', label: 'Subida' },
-    { key: 'project', label: 'Crear proyecto' },
-    { key: 'process_video', label: 'Procesar video' },
-    { key: 'finding', label: 'Buscando las mejores partes' },
-    { key: 'editing', label: 'Editar clips' },
-    { key: 'finalize', label: 'Finalizar' },
-  ];
-  const activeIndex = project?.status === 'queued'
-    ? 2
-    : Math.max(0, steps.findIndex((step) => step.key === project?.step));
-  const details = project?.metadata;
-
-  return (
-    <main className="processing-page">
-      <section className="processing-card">
-        <div className="processing-video-card">
-          {project?.thumbnail_url
-            ? <img src={`${API_BASE}${project.thumbnail_url}`} alt="Miniatura del video" />
-            : <span className="processing-placeholder"><FileVideo2 size={26} /></span>}
-          <div className="processing-video-copy">
-            <strong title={project?.title}>{project?.title ?? 'Cargando proyecto…'}</strong>
-            <div className="processing-badges">
-              {details && <span className="meta-pill">{Math.max(details.width, details.height) >= 1900 ? '1080p' : `${Math.max(details.width, details.height)}px`}</span>}
-              {details && <span className="meta-pill">{formatDuration(details.duration)}</span>}
-              {!details && <span className="meta-pill">Procesando</span>}
-            </div>
-          </div>
-        </div>
-        <div className="processing-heading">
-          <WandSparkles size={25} />
-          <div>
-            <h1>Analizando contenido y encontrando clips</h1>
-            <p>Permanece en la página mientras el video se procesa.</p>
-          </div>
-        </div>
-        {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}
-        <ol className="processing-steps">
-          {steps.map((step, index) => {
-            const complete = index < activeIndex || project?.status === 'completed';
-            const current = index === activeIndex && project?.status !== 'completed' && project?.status !== 'failed';
-            const failed = index === activeIndex && project?.status === 'failed';
-            const label = step.key === 'finding' && current
-              ? `Buscando las mejores partes… ${project?.progress == null ? '' : `${project.progress}%`}`
-              : step.label;
-            return (
-              <li key={step.key} className={`${complete ? 'complete' : ''} ${current ? 'current' : ''} ${failed ? 'failed' : ''}`}>
-                <span className="step-indicator">{complete ? <Check size={14} /> : current ? <LoaderCircle size={15} className="spin" /> : <Circle size={14} />}</span>
-                <span>{label}</span>
-              </li>
-            );
-          })}
-        </ol>
-        {(project?.status === 'failed' || error) && (
-          <button type="button" className="retry-button" onClick={onRetry}><WandSparkles size={16} /> Reintentar</button>
-        )}
-      </section>
-    </main>
   );
 }
 
@@ -2371,55 +1696,6 @@ function ResultsPage({
   );
 }
 
-function SharedClipPage({ token }: { token: string }) {
-  const [shared, setShared] = useState<SharedClip | null>(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    fetch(`${API_BASE}/api/shares/${encodeURIComponent(token)}`, { signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(await responseError(response));
-        return response.json() as Promise<SharedClip>;
-      })
-      .then(setShared)
-      .catch((loadError: unknown) => {
-        if (!controller.signal.aborted) {
-          setError(loadError instanceof Error ? loadError.message : 'No se pudo cargar el clip compartido.');
-        }
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, [token]);
-
-  return (
-    <main className="shared-page">
-      <a className="back-button" href="/">kellyClipAi</a>
-      {loading && <p className="results-loading"><LoaderCircle size={17} className="spin" /> Cargando clip compartido…</p>}
-      {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}
-      {shared && (
-        <article className="shared-card">
-          <span className="eyebrow">{shared.project_title}</span>
-          <h1>{shared.title}</h1>
-          <div className="shared-video-frame">
-            <video
-              src={`${API_BASE}${shared.video_url}`}
-              controls
-              playsInline
-              preload="metadata"
-              aria-label={`Clip compartido: ${shared.title}`}
-            />
-          </div>
-          <p>{formatDuration(shared.duration)} · {shared.width}×{shared.height}</p>
-        </article>
-      )}
-    </main>
-  );
-}
-
 function ClipEditorPage({
   projectId,
   clipId,
@@ -2781,6 +2057,8 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
   onNotice: (value: string) => void;
   notice: string;
 }) {
+  const settingsLocation = useLocation();
+  const settingsNavigate = useNavigate();
   const [saved, setSaved] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState(defaultModelFor(provider));
@@ -2827,7 +2105,7 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
   }, [setProvider, setWhisper]);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
+    const params = new URLSearchParams(settingsLocation.search);
     const integration = params.get('integration');
     if (!integration) return;
     const status = params.get('status');
@@ -2835,8 +2113,8 @@ function SettingsPage({ provider, setProvider, whisper, setWhisper, onBack, onNo
     onNotice(status === 'connected'
       ? `${integration} se conectó correctamente.`
       : message || `No se pudo conectar ${integration}.`);
-    window.history.replaceState(null, '', window.location.pathname);
-  }, [onNotice]);
+    settingsNavigate(settingsLocation.pathname, { replace: true });
+  }, [onNotice, settingsLocation.pathname, settingsLocation.search, settingsNavigate]);
 
   const connectIntegration = async (integration: string) => {
     setIntegrationBusy(integration);

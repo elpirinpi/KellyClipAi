@@ -1,0 +1,168 @@
+export type UploadInfo = {
+  id: string;
+  name: string;
+  size: number;
+  duration: number;
+  width: number;
+  height: number;
+  kind: 'video' | 'audio';
+};
+
+export type StagedMedia = {
+  id: string;
+  source_type: 'upload' | 'url';
+  status: 'receiving' | 'downloading' | 'ready' | 'failed' | 'finalizing' | 'completed';
+  filename: string;
+  title: string | null;
+  file_size: number;
+  duration: number;
+  width: number;
+  height: number;
+  kind: 'video' | 'audio';
+  bytes_received: number;
+  total_bytes: number | null;
+  speed: number | null;
+  eta: number | null;
+  error: string | null;
+  project_id: string | null;
+};
+
+export type ClipWord = { start: number; end: number; preview_start: number; preview_end: number; text: string };
+
+export type EditablePhrase = {
+  id: string;
+  start: number;
+  end: number;
+  preview_start: number;
+  text: string;
+  removed: boolean;
+};
+
+export type SubtitleStyleState = {
+  font_family: string | null;
+  font_size: number | null;
+  font_color: string | null;
+  highlight_color: string | null;
+  position: 'top' | 'center' | 'bottom' | null;
+};
+
+export const DEFAULT_SUBTITLE_STYLE: SubtitleStyleState = {
+  font_family: null,
+  font_size: null,
+  font_color: null,
+  highlight_color: null,
+  position: null,
+};
+
+export type ClipEditorState = {
+  ratio: string;
+  subtitle_template: string;
+  subtitle_style: SubtitleStyleState;
+  phrases: EditablePhrase[];
+};
+
+export type ClipResult = {
+  id: string;
+  status?: 'ready' | 'failed';
+  error?: string;
+  title: string;
+  start: number;
+  end: number;
+  duration: number;
+  score: number;
+  viral_reason: string;
+  keywords: string[];
+  emojis: string[];
+  width: number;
+  height: number;
+  resolution?: 720 | 1080;
+  audio_enhanced?: boolean;
+  filename: string;
+  video_url: string | null;
+  download_url: string | null;
+  broll_provider?: string;
+  broll_creator?: string;
+  broll_attribution_url?: string;
+  transcript: ClipWord[];
+};
+
+export type ProjectResult = {
+  id: string;
+  title: string;
+  status: string;
+  step: string;
+  progress: number | null;
+  error: string | null;
+  config: {
+    ratio: string;
+    duration: string;
+    framing?: 'speaker' | 'split' | 'blur' | 'center';
+    whisper_language?:
+      | 'auto'
+      | 'ar'
+      | 'de'
+      | 'en'
+      | 'es'
+      | 'fr'
+      | 'hi'
+      | 'it'
+      | 'ja'
+      | 'ko'
+      | 'nl'
+      | 'pl'
+      | 'pt'
+      | 'ru'
+      | 'tr'
+      | 'uk'
+      | 'zh';
+    subtitle_template: string;
+    subtitle_style?: SubtitleStyleState;
+    options: Record<string, boolean>;
+    moment: string;
+    schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
+  };
+  metadata: { duration: number; width: number; height: number; language?: string } | null;
+  transcript: Array<{ start: number; end: number; text: string; words: Array<{ start: number; end: number; text: string }> }> | null;
+  clips: ClipResult[];
+  thumbnail_url: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SharedClip = {
+  project_title: string;
+  clip_id: string;
+  title: string;
+  duration: number;
+  width: number;
+  height: number;
+  video_url: string;
+};
+
+export type IntegrationStatus = {
+  configured: boolean;
+  missing: string[];
+  connected: boolean;
+  display_name: string | null;
+};
+
+export type ZoomRecording = {
+  meeting_id: string;
+  topic: string;
+  start_time: string | null;
+  files: Array<{ file_id: string; file_type: string; file_size: number | null }>;
+};
+
+export type ScheduleJob = {
+  id: string;
+  clip_id: string;
+  platform: string;
+  scheduled_at: string;
+  status: string;
+  confirmation_required: boolean;
+  visibility: string;
+  external_id?: string | null;
+  external_url: string | null;
+  error: string | null;
+  download_url: string | null;
+};
