@@ -373,11 +373,24 @@ def process_project(
                 transcript=transcript_data,
             )
         _progress_for_llm(settings, project_id, llm.provider)
+
+        def on_llm_progress(current: int, total: int) -> None:
+            if total > 1:
+                _publish(
+                    settings,
+                    project_id,
+                    "processing",
+                    "finding",
+                    None,
+                    f"Analizando la transcripción con {llm.provider}… (fragmento {current} de {total})",
+                )
+
         proposals = propose_clips(
             transcript,
             project_config,
             float(metadata["duration"]),
             llm,
+            on_progress=on_llm_progress,
         )
         proposals = _complete_clip_ends(
             proposals,
