@@ -133,11 +133,12 @@ def _prompt(
         "prefiere un momento desarrollado y coherente en vez de un fragmento de pocas palabras. "
         "Para cada clip escribe descripcion, un texto público independiente de la razón interna, y hashtags "
         "pertinentes en listas separadas para youtube, tiktok e instagram. "
-        "Responde únicamente con un JSON válido que sea un array de objetos con las claves "
+        "Responde únicamente con un objeto JSON con una única clave \"clips\", cuyo valor sea un array "
+        "de objetos con las claves "
         "inicio, fin, titulo, puntuacion (0-10), razon_viral, descripcion, hashtags, palabras_clave (array) "
         "y emojis (array). "
         "Usa el idioma de la transcripción para títulos y razones. Si no hay momentos que cumplan los criterios, "
-        "devuelve []."
+        "devuelve {\"clips\":[]}."
     )
     user = (
         f"Duración del video: {duration:.3f} segundos. Ratio solicitado: {project.ratio}. "
@@ -257,7 +258,8 @@ def propose_clips(
                     {
                         "role": "user",
                         "content": user
-                        + '\nResponde con {"clips":[...]} o con un array JSON si tu API solo permite arrays.',
+                        + '\nResponde únicamente con un objeto JSON con la clave "clips" y un array de propuestas. '
+                        'Si no hay propuestas, devuelve {"clips":[]}.',
                     },
                 ],
             }

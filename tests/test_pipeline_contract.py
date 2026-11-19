@@ -100,6 +100,14 @@ def test_clip_prompt_prefers_complete_moments_instead_of_short_fragments() -> No
     assert "Evita clips menores de 12 segundos" in user
 
 
+def test_clip_prompt_matches_json_object_response_format() -> None:
+    system, _user = _prompt([], ProjectConfig(), 120)
+
+    assert 'objeto JSON con una única clave "clips"' in system
+    assert '{"clips":[]}' in system
+    assert "array de objetos" in system
+
+
 def test_vertical_subtitles_wrap_within_the_video_width(tmp_path: Path) -> None:
     proposal = ClipProposal(
         inicio=0,

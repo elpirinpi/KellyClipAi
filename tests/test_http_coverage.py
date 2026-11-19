@@ -552,6 +552,8 @@ def test_groq_gpt_oss_json_request_hides_reasoning(
     request_payload = json.loads(requests[0].content)
     assert request_payload["response_format"] == {"type": "json_object"}
     assert request_payload["reasoning_format"] == "hidden"
+    assert 'objeto JSON con una única clave "clips"' in request_payload["messages"][0]["content"]
+    assert "o con un array JSON" not in request_payload["messages"][1]["content"]
 
 
 @pytest.mark.parametrize(
