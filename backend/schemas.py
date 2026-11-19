@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -20,7 +20,7 @@ class ScheduledPublishing(BaseModel):
     def require_timezone_and_normalize(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("La fecha programada debe incluir zona horaria.")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
     @model_validator(mode="after")
     def validate_visibility(self) -> ScheduledPublishing:
@@ -40,12 +40,45 @@ class EditOptions(BaseModel):
     face_tracking: bool = True
 
 
+class SubtitleStyle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    font_family: (
+        Literal["Arial", "Arial Black", "Georgia", "Tahoma", "Verdana"] | None
+    ) = None
+    font_size: int | None = Field(default=None, ge=16, le=100)
+    font_color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    highlight_color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    position: Literal["top", "center", "bottom"] | None = None
+
+
 class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ratio: Ratio = "9:16"
     duration: DurationChoice = "Cualquiera"
+    framing: Literal["speaker", "split", "blur", "center"] = "speaker"
+    whisper_language: Literal[
+        "auto",
+        "ar",
+        "de",
+        "en",
+        "es",
+        "fr",
+        "hi",
+        "it",
+        "ja",
+        "ko",
+        "nl",
+        "pl",
+        "pt",
+        "ru",
+        "tr",
+        "uk",
+        "zh",
+    ] = "auto"
     subtitle_template: str = Field(default="Default", min_length=1, max_length=100)
+    subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
     options: EditOptions = Field(default_factory=EditOptions)
     moment: str = Field(default="", max_length=500)
     whisper_model: Literal["tiny", "small", "medium", "large-v3"] = "small"
@@ -127,6 +160,7 @@ class ClipEditRequest(BaseModel):
 
     ratio: Ratio
     subtitle_template: str = Field(min_length=1, max_length=100)
+    subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
     phrases: list[EditablePhrase] = Field(max_length=120)
 
     @model_validator(mode="after")
@@ -177,6 +211,10 @@ class PublishClipsRequest(ClipArchiveRequest):
         if self.platform == "tiktok" and self.visibility == "unlisted":
             raise ValueError("TikTok no admite la visibilidad no listada.")
         return self
+
+
+class OverdueScheduleResolution(BaseModel):
+    action: Literal["publish_now", "discard"]
 
 
 class ClipResolutionRequest(BaseModel):
@@ -245,6 +283,8 @@ class ClipProposal(BaseModel):
     titulo: str = Field(min_length=1, max_length=160)
     puntuacion: float = Field(ge=0, le=10)
     razon_viral: str = Field(min_length=1, max_length=1400)
+    descripcion: str = Field(default="", max_length=4000)
+    hashtags: dict[PublishingPlatform, list[str]] = Field(default_factory=dict)
     palabras_clave: list[str] = Field(default_factory=list, max_length=12)
     emojis: list[str] = Field(default_factory=list, max_length=8)
 

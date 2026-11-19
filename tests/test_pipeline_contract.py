@@ -23,16 +23,7 @@ from backend.face_tracking import (
     _crop_position,
     analyze_face_crop_paths,
 )
-from backend.llm import (
-    LLMConfigurationError,
-    ResolvedLLM,
-    _chunk_transcript,
-    _merge_proposals,
-    _prompt,
-    _request_with_retry,
-    propose_clips,
-    resolve_llm,
-)
+from backend.llm import LLMConfigurationError, _prompt, resolve_llm
 from backend.main import _validate_download_url, create_app as create_application
 from backend.media import (
     _caption_groups,
@@ -109,200 +100,12 @@ def test_clip_prompt_prefers_complete_moments_instead_of_short_fragments() -> No
     assert "Evita clips menores de 12 segundos" in user
 
 
-def _make_segment(start: float, end: float, text: str = "hola mundo") -> TranscriptSegment:
-    return TranscriptSegment(
-        start=start,
-        end=end,
-        text=text,
-        words=[Word(start=start, end=end, text=text)],
-    )
+def test_clip_prompt_matches_json_object_response_format() -> None:
+    system, _user = _prompt([], ProjectConfig(), 120)
 
-
-def test_chunk_transcript_keeps_short_transcripts_in_one_chunk() -> None:
-    transcript = [_make_segment(0.0, 60.0), _make_segment(60.0, 120.0)]
-
-    chunks = _chunk_transcript(transcript)
-
-    assert len(chunks) == 1
-    assert chunks[0] == transcript
-
-
-def test_chunk_transcript_splits_long_transcripts_at_segment_boundaries() -> None:
-    # 24 minutos en segmentos de 60 segundos: 6 fragmentos de 4 minutos.
-    transcript = [_make_segment(float(i * 60), float((i + 1) * 60)) for i in range(24)]
-
-    chunks = _chunk_transcript(transcript)
-
-    assert len(chunks) == 6
-    assert all(len(chunk) == 4 for chunk in chunks)
-    assert [segment for chunk in chunks for segment in chunk] == transcript
-
-
-def test_chunk_transcript_never_splits_a_segment() -> None:
-    transcript = [_make_segment(0.0, 300.0), _make_segment(300.0, 400.0)]
-
-    chunks = _chunk_transcript(transcript)
-
-    assert len(chunks) == 2
-    assert chunks[0][0].end == 300.0
-
-
-def test_merge_proposals_keeps_best_score_and_removes_overlaps() -> None:
-    proposals = [
-        ClipProposal(inicio=0.0, fin=30.0, titulo="bajo", puntuacion=5, razon_viral="x"),
-        ClipProposal(inicio=10.0, fin=40.0, titulo="alto", puntuacion=9, razon_viral="x"),
-        ClipProposal(inicio=100.0, fin=130.0, titulo="otro", puntuacion=7, razon_viral="x"),
-    ]
-
-    merged = _merge_proposals(proposals)
-
-    assert [clip.titulo for clip in merged] == ["alto", "otro"]
-
-
-def test_merge_proposals_limits_to_ten_clips_sorted_by_start() -> None:
-    proposals = [
-        ClipProposal(
-            inicio=float(i * 40),
-            fin=float(i * 40 + 30),
-            titulo=f"clip {i}",
-            puntuacion=10 - (i % 5),
-            razon_viral="x",
-        )
-        for i in range(15)
-    ]
-
-    merged = _merge_proposals(proposals)
-
-    assert len(merged) == 10
-    assert [clip.inicio for clip in merged] == sorted(clip.inicio for clip in merged)
-
-
-class _FakeResponse:
-    def __init__(self, status_code: int, payload: dict, headers: dict | None = None) -> None:
-        self.status_code = status_code
-        self._payload = payload
-        self.headers = headers or {}
-        self.text = json.dumps(payload)
-        self.request = None
-
-    def json(self) -> dict:
-        return self._payload
-
-    def raise_for_status(self) -> None:
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-
-class _FakeClient:
-    def __init__(self, responses: list[_FakeResponse]) -> None:
-        self._responses = responses
-        self.calls: list[dict] = []
-
-    def __enter__(self) -> "_FakeClient":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        return None
-
-    def post(self, url: str, headers: dict | None = None, json: dict | None = None) -> _FakeResponse:
-        self.calls.append({"url": url, "json": json})
-        if len(self.calls) <= len(self._responses):
-            return self._responses[len(self.calls) - 1]
-        return self._responses[-1]
-
-
-def _groq_response(clips: list[dict]) -> _FakeResponse:
-    return _FakeResponse(
-        200,
-        {"choices": [{"message": {"content": json.dumps({"clips": clips})}}]},
-    )
-
-
-def _clip_dict(inicio: float, fin: float, titulo: str, puntuacion: int = 8) -> dict:
-    return {
-        "inicio": inicio,
-        "fin": fin,
-        "titulo": titulo,
-        "puntuacion": puntuacion,
-        "razon_viral": "momento fuerte",
-        "palabras_clave": ["tema"],
-        "emojis": ["🔥"],
-    }
-
-
-def test_propose_clips_uses_one_call_for_short_transcripts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    transcript = [_make_segment(0.0, 120.0), _make_segment(120.0, 240.0)]
-    client = _FakeClient([_groq_response([_clip_dict(10.0, 40.0, "corto")])])
-    monkeypatch.setattr("backend.llm.httpx.Client", lambda timeout=None: client)
-    llm = ResolvedLLM("Groq", "key", "llama-3.3-70b-versatile", "https://api.groq.com/openai/v1")
-
-    proposals = propose_clips(transcript, ProjectConfig(), 240.0, llm)
-
-    assert len(client.calls) == 1
-    assert [clip.titulo for clip in proposals] == ["corto"]
-    # Sin nota de rango en el prompt de un solo fragmento.
-    assert "Analiza únicamente el fragmento" not in client.calls[0]["json"]["messages"][1]["content"]
-
-
-def test_propose_clips_chunks_long_transcripts_and_merges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # 24 minutos: 6 fragmentos de 4 minutos.
-    transcript = [_make_segment(float(i * 60), float((i + 1) * 60)) for i in range(24)]
-    responses = [
-        _groq_response([_clip_dict(float(i * 240 + 10), float(i * 240 + 40), f"clip {i}")])
-        for i in range(6)
-    ]
-    client = _FakeClient(responses)
-    monkeypatch.setattr("backend.llm.httpx.Client", lambda timeout=None: client)
-    llm = ResolvedLLM("Groq", "key", "llama-3.3-70b-versatile", "https://api.groq.com/openai/v1")
-    progress: list[tuple[int, int]] = []
-
-    proposals = propose_clips(
-        transcript,
-        ProjectConfig(),
-        1440.0,
-        llm,
-        on_progress=lambda current, total: progress.append((current, total)),
-    )
-
-    assert len(client.calls) == 6
-    assert progress == [(i + 1, 6) for i in range(6)]
-    assert len(proposals) == 6
-    assert [clip.titulo for clip in proposals] == [f"clip {i}" for i in range(6)]
-    # Cada llamada lleva su nota de rango.
-    assert "Analiza únicamente el fragmento" in client.calls[0]["json"]["messages"][1]["content"]
-
-
-def test_request_with_retry_retries_429_then_succeeds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = _FakeClient(
-        [
-            _FakeResponse(429, {"error": {"message": "Rate limit reached"}}),
-            _FakeResponse(200, {"ok": True}),
-        ]
-    )
-    monkeypatch.setattr("backend.llm.time.sleep", lambda seconds: None)
-
-    response = _request_with_retry(client, "https://x", {}, {})
-
-    assert response.status_code == 200
-    assert len(client.calls) == 2
-
-
-def test_request_with_retry_surfaces_provider_error_after_retries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = _FakeClient([_FakeResponse(429, {"error": {"message": "Rate limit reached"}})])
-    monkeypatch.setattr("backend.llm.time.sleep", lambda seconds: None)
-
-    with pytest.raises(Exception, match="429.*Rate limit reached"):
-        _request_with_retry(client, "https://x", {}, {})
-
-    assert len(client.calls) == 4  # intento inicial + 3 reintentos
+    assert 'objeto JSON con una única clave "clips"' in system
+    assert '{"clips":[]}' in system
+    assert "array de objetos" in system
 
 
 def test_vertical_subtitles_wrap_within_the_video_width(tmp_path: Path) -> None:
@@ -472,6 +275,112 @@ def _create_completed_project_with_clip(
         clips=[clip],
     )
     return project_id, clip_id, clip_path
+
+
+def test_clip_subtitle_endpoint_exports_srt_and_vtt_with_render_times(
+    video_with_audio: Path,
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        data_dir=tmp_path / "data",
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+    with TestClient(create_app(settings)) as client:
+        project_id, clip_id, _clip_path = _create_completed_project_with_clip(
+            client, settings, video_with_audio
+        )
+        project = database.get_project(settings.database_path, project_id)
+        assert project is not None
+        clip = project["clips"][0]
+        clip["transcript"] = [
+            {
+                "start": 1.0,
+                "end": 1.4,
+                "preview_start": 0.25,
+                "preview_end": 0.6,
+                "text": "Hola",
+            },
+            {
+                "start": 1.5,
+                "end": 1.9,
+                "preview_start": 0.65,
+                "preview_end": 1.0,
+                "text": "mundo",
+            },
+        ]
+        database.update_project(
+            settings.database_path, project_id, clips=[clip]
+        )
+
+        srt = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/subtitles/srt"
+        )
+        vtt = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/subtitles/vtt"
+        )
+        editor = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/edit"
+        )
+        editor_payload = editor.json()
+        editor_payload["subtitle_style"] = {
+            "font_family": "Georgia",
+            "font_size": 72,
+            "font_color": "#ff0000",
+            "highlight_color": "#00ff00",
+            "position": "top",
+        }
+        saved_style = client.put(
+            f"/api/projects/{project_id}/clips/{clip_id}/edit",
+            json=editor_payload,
+        )
+        restored_editor = client.get(
+            f"/api/projects/{project_id}/clips/{clip_id}/edit"
+        )
+
+    assert srt.status_code == vtt.status_code == 200
+    assert srt.text == "1\n00:00:00,250 --> 00:00:01,000\nHola mundo\n"
+    assert vtt.text == "WEBVTT\n\n00:00:00.250 --> 00:00:01.000\nHola mundo\n"
+    assert srt.headers["content-disposition"].endswith(f'"{clip_id}.srt"')
+    assert vtt.headers["content-disposition"].endswith(f'"{clip_id}.vtt"')
+    assert saved_style.status_code == 200
+    assert saved_style.json()["subtitle_style"]["font_size"] == 72
+    assert restored_editor.json()["subtitle_style"]["font_color"] == "#ff0000"
+
+
+def test_clip_render_succeeds_when_subtitle_directory_contains_apostrophe(
+    video_with_audio: Path,
+    tmp_path: Path,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg
+    output_dir = tmp_path / "O'Brien"
+    output_dir.mkdir()
+    proposal = ClipProposal(
+        inicio=0.1,
+        fin=1.8,
+        titulo="Prueba de ruta",
+        puntuacion=7,
+        razon_viral="Una frase de prueba.",
+    )
+
+    duration, _ = render_clip(
+        video_with_audio,
+        output_dir / "clip.mp4",
+        output_dir / "clip.ass",
+        proposal,
+        ProjectConfig(options={"face_tracking": False}),
+        [],
+        ffmpeg,
+        lambda _percent: None,
+    )
+
+    assert duration == pytest.approx(1.7)
+    assert (output_dir / "clip.mp4").is_file()
 
 
 def test_archive_and_public_share_serve_selected_real_clip(
@@ -692,6 +601,7 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
     config = {
         "ratio": "9:16",
         "duration": "Cualquiera",
+        "framing": "speaker",
         "subtitle_template": "Default",
         "options": {
             "emojis": True,
@@ -716,7 +626,17 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
         project = response.json()
         project_id = project["id"]
         assert project["status"] == "ready"
-        assert project["config"] == config
+        assert project["config"] == {
+            **config,
+            "whisper_language": "auto",
+            "subtitle_style": {
+                "font_family": None,
+                "font_size": None,
+                "font_color": None,
+                "highlight_color": None,
+                "position": None,
+            },
+        }
         assert (settings.data_dir / "projects" / project_id / "source").is_file()
 
         blocked = client.post(
@@ -938,6 +858,20 @@ def test_environment_key_is_not_reused_with_another_provider() -> None:
     assert resolve_llm(None, settings).provider == "OpenAI"
     with pytest.raises(LLMConfigurationError, match="Falta la clave"):
         resolve_llm(LLMConfig(provider="Anthropic"), settings)
+
+
+def test_groq_defaults_to_a_supported_model() -> None:
+    settings = AppSettings(
+        data_dir=Path("data"),
+        cors_origins=(),
+        llm_provider="Groq",
+        llm_api_key="test-key",
+        llm_model="",
+        llm_base_url="",
+        whisper_model="small",
+    )
+
+    assert resolve_llm(None, settings).model == "qwen/qwen3.8-27b"
 
 
 def test_health_endpoint_uses_real_app(tmp_path: Path) -> None:

@@ -37,6 +37,7 @@ class AppSettings:
     pexels_api_key: str = ""
     pixabay_api_key: str = ""
     broll_provider: str = "Pexels"
+    processing_concurrency: int = 1
 
     @property
     def database_path(self) -> Path:
@@ -82,4 +83,5 @@ def get_settings() -> AppSettings:
         pexels_api_key=os.getenv("PEXELS_API_KEY", ""),
         pixabay_api_key=os.getenv("PIXABAY_API_KEY", ""),
         broll_provider=os.getenv("BROLL_PROVIDER", "Pexels"),
+        processing_concurrency=int(os.getenv("PROCESSING_CONCURRENCY", "1")),
     )

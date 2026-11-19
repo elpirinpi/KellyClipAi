@@ -5,29 +5,38 @@ import ipaddress
 import json
 import logging
 import secrets
-import sqlite3
 import shutil
 import socket
+import sqlite3
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import yt_dlp
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import ValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 from starlette.types import Scope
 
 from . import database
@@ -55,12 +64,12 @@ from .integrations import (
     download_zoom_recording,
     integration_status,
     list_zoom_recordings,
-    publish_clip,
     provider_missing_credentials,
 )
 from .llm import LLMConfigurationError, resolve_llm
-from .media import MediaProcessingError
+from .media import MediaProcessingError, format_subtitles
 from .pipeline import process_project
+from .process_queue import ProjectProcessingQueue
 from .scheduler import schedule_worker
 from .schemas import (
     ClipArchiveRequest,
@@ -69,6 +78,7 @@ from .schemas import (
     CustomTemplateRequest,
     LLMConfig,
     LLMSettingsRequest,
+    OverdueScheduleResolution,
     ProcessRequest,
     ProjectConfig,
     PublishClipsRequest,
@@ -97,6 +107,7 @@ _VIDEO_SUFFIXES = {".3gp", ".avi", ".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav"}
 _STAGED_SUFFIXES = _VIDEO_SUFFIXES | _AUDIO_SUFFIXES
 _STAGED_WRITE_SIZE = 1024 * 1024
+_STAGING_MAX_AGE = timedelta(hours=24)
 logger = logging.getLogger(__name__)
 
 
@@ -122,8 +133,10 @@ def _parse_config(value: str) -> ProjectConfig:
         raise HTTPException(status_code=422, detail=f"Configuración de proyecto no válida: {error}") from error
 
 
-def _serialize_project(project: dict) -> dict:
+def _serialize_project(project: dict, *, include_transcript: bool = False) -> dict:
     project.pop("owner_id", None)
+    if not include_transcript:
+        project.pop("transcript", None)
     project_id = project["id"]
     project["thumbnail_url"] = (
         f"/api/projects/{project_id}/thumbnail" if project.get("metadata") else None
@@ -131,8 +144,16 @@ def _serialize_project(project: dict) -> dict:
     project["clips"] = [
         {
             **clip,
-            "video_url": f"/api/projects/{project_id}/clips/{clip['id']}/file",
-            "download_url": f"/api/projects/{project_id}/clips/{clip['id']}/download",
+            "video_url": (
+                f"/api/projects/{project_id}/clips/{clip['id']}/file"
+                if clip.get("status") != "failed"
+                else None
+            ),
+            "download_url": (
+                f"/api/projects/{project_id}/clips/{clip['id']}/download"
+                if clip.get("status") != "failed"
+                else None
+            ),
         }
         for clip in project.get("clips") or []
     ]
@@ -302,6 +323,84 @@ def _serialize_staged_media(staged: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _remove_staging_artifacts(settings: AppSettings, staged_ids: list[str]) -> None:
+    staging_root = (settings.data_dir / "staging").resolve()
+    for staged_id in staged_ids:
+        for candidate in (
+            staging_root / staged_id,
+            staging_root / f"{staged_id}.source",
+        ):
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            if candidate.is_symlink():
+                candidate.unlink()
+                continue
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(staging_root):
+                logger.warning("Se omitió una ruta de staging fuera de la carpeta local.")
+                continue
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink()
+
+
+def _cleanup_expired_staging(settings: AppSettings) -> None:
+    cutoff = datetime.now(UTC) - _STAGING_MAX_AGE
+    expired_ids = database.cleanup_expired_staged_media(
+        settings.database_path, cutoff.isoformat()
+    )
+    staging_root = settings.data_dir / "staging"
+    try:
+        _remove_staging_artifacts(settings, expired_ids)
+        if not staging_root.is_dir():
+            return
+        for entry in staging_root.iterdir():
+            try:
+                if entry.is_symlink():
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff.timestamp():
+                        entry.unlink()
+                    continue
+                if entry.is_dir():
+                    file_times = [
+                        path.stat().st_mtime
+                        for path in entry.rglob("*")
+                        if path.is_file() and not path.is_symlink()
+                    ]
+                    newest = max(file_times, default=entry.stat().st_mtime)
+                    if newest < cutoff.timestamp():
+                        shutil.rmtree(entry)
+                elif entry.is_file() and entry.stat().st_mtime < cutoff.timestamp():
+                    entry.unlink()
+            except OSError:
+                logger.exception("No se pudo limpiar el archivo de staging %s", entry)
+    except OSError:
+        logger.exception("No se pudo limpiar staging caducado")
+
+
+def _local_storage_bytes(settings: AppSettings) -> int:
+    total = 0
+    for root in (
+        settings.data_dir / "projects",
+        settings.data_dir / "staging",
+        settings.data_dir / "exports",
+    ):
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError as error:
+                logger.exception("No se pudo consultar el tamaño de %s", path)
+                raise HTTPException(
+                    status_code=500,
+                    detail="No se pudo calcular el almacenamiento local.",
+                ) from error
+    return total
+
+
 def create_app(
     settings: AppSettings | None = None,
     web_dir: Path | None = None,
@@ -323,15 +422,34 @@ def create_app(
         )
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
+    async def lifespan(application: FastAPI):
         app_settings.data_dir.mkdir(parents=True, exist_ok=True)
         database.initialize(app_settings.database_path)
+        database.fail_interrupted_projects(app_settings.database_path)
         database.fail_interrupted_staged_media(app_settings.database_path)
+        _cleanup_expired_staging(app_settings)
         database.fail_interrupted_schedule_jobs(app_settings.database_path)
+        database.hold_overdue_schedule_jobs(
+            app_settings.database_path,
+            database.utc_now(),
+        )
+        processing_queue = ProjectProcessingQueue(
+            app_settings.processing_concurrency,
+            lambda project_id, llm_config, retry_failed_only: asyncio.to_thread(
+                process_project,
+                project_id,
+                llm_config,
+                app_settings,
+                retry_failed_only=retry_failed_only,
+            ),
+        )
+        await processing_queue.start()
+        application.state.processing_queue = processing_queue
         scheduler_task = asyncio.create_task(schedule_worker(app_settings))
         try:
             yield
         finally:
+            await processing_queue.stop()
             scheduler_task.cancel()
             try:
                 await scheduler_task
@@ -413,9 +531,9 @@ def create_app(
         path_parts = path.strip("/").split("/")
         if len(path_parts) >= 3 and path_parts[1] == "projects":
             project_id = path_parts[2]
-            if project_id != "from-url" and database.get_project(
+            if project_id != "from-url" and not database.project_exists(
                 app_settings.database_path, project_id, user_id
-            ) is None:
+            ):
                 return JSONResponse(
                     {"detail": "No se encontró el proyecto."},
                     status_code=404,
@@ -433,14 +551,18 @@ def create_app(
                 {"detail": "No se encontró la importación."},
                 status_code=404,
             )
-        elif len(path_parts) >= 3 and path_parts[1] == "scheduled-jobs":
-            if database.get_schedule_job(
+        elif (
+            len(path_parts) >= 3
+            and path_parts[1] == "scheduled-jobs"
+            and database.get_schedule_job(
                 app_settings.database_path, path_parts[2], user_id
-            ) is None:
-                return JSONResponse(
-                    {"detail": "No se encontró la tarea programada."},
-                    status_code=404,
-                )
+            )
+            is None
+        ):
+            return JSONResponse(
+                {"detail": "No se encontró la tarea programada."},
+                status_code=404,
+            )
         return await call_next(request)
 
     def request_user_id(request: Request) -> str:
@@ -631,7 +753,7 @@ def create_app(
             app_settings.database_path,
             state,
             provider,
-            (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
             owner_id,
         )
         return {"authorization_url": target}
@@ -646,7 +768,7 @@ def create_app(
         saved_state = database.consume_oauth_state_record(
             app_settings.database_path,
             state,
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ) if state else None
         result = "error"
         detail = "La autorización no se pudo validar. Inicia de nuevo la conexión."
@@ -745,7 +867,7 @@ def create_app(
 
     @application.get("/api/projects/{project_id}/scheduled")
     def project_schedule(project_id: str, request: Request) -> list[dict]:
-        if database.get_project(app_settings.database_path, project_id) is None:
+        if not database.project_exists(app_settings.database_path, project_id):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         return [
             serialize_schedule_job(job)
@@ -765,6 +887,37 @@ def create_app(
                 owner_id=request_user_id(request),
             )
         ]
+
+    @application.post("/api/scheduled-jobs/{job_id}/resolve-overdue")
+    def resolve_overdue_schedule_job(
+        job_id: str,
+        resolution: OverdueScheduleResolution,
+        request: Request,
+    ) -> dict:
+        job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        if not job.get("confirmation_required") or not database.resolve_overdue_schedule_job(
+            app_settings.database_path,
+            job_id,
+            resolution.action,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="La publicación ya no está pendiente de confirmación.",
+            )
+        updated_job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if updated_job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        return serialize_schedule_job(updated_job)
 
     @application.get("/api/scheduled-jobs/{job_id}/download")
     def download_scheduled_export(job_id: str, request: Request) -> FileResponse:
@@ -816,6 +969,10 @@ def create_app(
                 request_user_id(request),
             )
         ]
+
+    @application.get("/api/storage")
+    def storage_usage() -> dict[str, int]:
+        return {"used_bytes": _local_storage_bytes(app_settings)}
 
     @application.get("/api/staged-media/latest")
     def latest_staged_media(
@@ -1078,7 +1235,7 @@ def create_app(
     @application.post("/api/projects", status_code=201)
     def create_uploaded_project(
         request: Request,
-        file: UploadFile = File(...),
+        file: Annotated[UploadFile, File(...)],
         config: str = Form(...),
     ) -> dict:
         project_config = _parse_config(config)
@@ -1145,12 +1302,69 @@ def create_app(
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
-        return _serialize_project(project)
+        return _serialize_project(project, include_transcript=True)
+
+    @application.delete("/api/projects/{project_id}")
+    def delete_project_route(project_id: str, request: Request) -> dict[str, bool]:
+        owner_id = request_user_id(request)
+        project = database.get_project(
+            app_settings.database_path, project_id, owner_id
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409,
+                detail="No se puede eliminar un proyecto mientras se procesa.",
+            )
+        jobs = database.list_schedule_jobs(
+            app_settings.database_path, project_id, owner_id
+        )
+        if any(job["status"] == "processing" for job in jobs):
+            raise HTTPException(
+                status_code=409,
+                detail="Espera a que termine la publicación antes de eliminar el proyecto.",
+            )
+        project_root = (app_settings.data_dir / "projects").resolve()
+        project_path = project_root / project_id
+        if not project_path.resolve().is_relative_to(project_root):
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        staged_ids = database.delete_project(
+            app_settings.database_path, project_id, owner_id
+        )
+        if staged_ids is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        try:
+            if project_path.is_symlink():
+                project_path.unlink()
+            elif project_path.is_dir():
+                shutil.rmtree(project_path)
+            export_root = (app_settings.data_dir / "exports").resolve()
+            for job in jobs:
+                if not job.get("output_path"):
+                    continue
+                export_path = Path(job["output_path"]).resolve()
+                if (
+                    export_path.is_relative_to(export_root)
+                    and export_path.is_file()
+                ):
+                    export_path.unlink()
+            _remove_staging_artifacts(app_settings, staged_ids)
+        except OSError as error:
+            logger.exception(
+                "No se pudieron eliminar todos los archivos del proyecto %s",
+                project_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="El proyecto se eliminó de la base de datos, pero no se pudieron limpiar todos sus archivos.",
+            ) from error
+        return {"deleted": True}
 
     @application.get("/api/projects/{project_id}/thumbnail")
     def get_thumbnail(project_id: str) -> FileResponse:
         project_dir = app_settings.data_dir / "projects" / project_id
-        if database.get_project(app_settings.database_path, project_id) is None:
+        if not database.project_exists(app_settings.database_path, project_id):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         thumbnail = project_dir / "thumbnail.jpg"
         if not thumbnail.is_file():
@@ -1158,10 +1372,9 @@ def create_app(
         return FileResponse(thumbnail, media_type="image/jpeg")
 
     @application.post("/api/projects/{project_id}/process", status_code=202)
-    def process(
+    async def process(
         project_id: str,
         request: ProcessRequest,
-        background_tasks: BackgroundTasks,
     ) -> dict[str, str]:
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
@@ -1211,7 +1424,7 @@ def create_app(
                 status_code=409,
                 detail="Este proyecto tiene publicaciones pendientes. Espera a que se resuelvan antes de reprocesarlo.",
             )
-        if stored_config.schedule and stored_config.schedule.scheduled_at <= datetime.now(timezone.utc):
+        if stored_config.schedule and stored_config.schedule.scheduled_at <= datetime.now(UTC):
             raise HTTPException(
                 status_code=422,
                 detail="La fecha programada ya pasó. Elige una fecha futura antes de procesar.",
@@ -1242,12 +1455,95 @@ def create_app(
             project["config"],
         ):
             raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
-        background_tasks.add_task(process_project, project_id, llm_config, app_settings)
+        processing_queue: ProjectProcessingQueue | None = getattr(
+            application.state, "processing_queue", None
+        )
+        if processing_queue is None:
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Reinicia la aplicación.",
+            )
+        try:
+            await processing_queue.submit(project_id, llm_config)
+        except RuntimeError as error:
+            database.update_project(
+                app_settings.database_path,
+                project_id,
+                status="failed",
+                step="failed",
+                error="La cola de procesamiento se cerró antes de aceptar el trabajo.",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Inténtalo de nuevo.",
+            ) from error
+        return {"project_id": project_id, "status": "queued"}
+
+    @application.post(
+        "/api/projects/{project_id}/retry-failed-clips", status_code=202
+    )
+    async def retry_failed_clips(project_id: str) -> dict[str, str]:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409, detail="Este proyecto ya se está procesando."
+            )
+        failed_ids = {
+            str(clip["id"])
+            for clip in project.get("clips") or []
+            if clip.get("status") == "failed"
+        }
+        proposals = (project.get("metadata") or {}).get("clip_proposals") or []
+        proposal_ids = {
+            str(proposal["id"])
+            for proposal in proposals
+            if isinstance(proposal, dict) and proposal.get("id")
+        }
+        if not failed_ids.intersection(proposal_ids):
+            raise HTTPException(
+                status_code=409,
+                detail="No hay clips fallidos con una propuesta guardada que se pueda reintentar.",
+            )
+        if not database.queue_project(
+            app_settings.database_path,
+            project_id,
+            project["config"],
+            preserve_clips=True,
+        ):
+            raise HTTPException(status_code=409, detail="Este proyecto ya se está procesando.")
+        processing_queue: ProjectProcessingQueue | None = getattr(
+            application.state, "processing_queue", None
+        )
+        if processing_queue is None:
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Reinicia la aplicación.",
+            )
+        try:
+            await processing_queue.submit(
+                project_id,
+                None,
+                retry_failed_only=True,
+            )
+        except RuntimeError as error:
+            database.update_project(
+                app_settings.database_path,
+                project_id,
+                status="failed",
+                step="failed",
+                error="La cola de procesamiento se cerró antes de aceptar el reintento.",
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="La cola de procesamiento no está disponible. Inténtalo de nuevo.",
+            ) from error
         return {"project_id": project_id, "status": "queued"}
 
     @application.get("/api/projects/{project_id}/events")
     async def project_events(project_id: str, request: Request) -> EventSourceResponse:
-        if database.get_project(app_settings.database_path, project_id) is None:
+        if not database.project_exists(app_settings.database_path, project_id):
             raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
         try:
             after_id = int(request.headers.get("last-event-id", "0"))
@@ -1266,8 +1562,10 @@ def create_app(
                         "event": event["event"],
                         "data": json.dumps(event["data"], ensure_ascii=False),
                     }
-                project = database.get_project(app_settings.database_path, project_id)
-                if project is None or project["status"] in {"completed", "failed"}:
+                status = database.get_project_status(
+                    app_settings.database_path, project_id
+                )
+                if status is None or status in {"completed", "failed"}:
                     break
                 if await request.is_disconnected():
                     break
@@ -1343,6 +1641,46 @@ def create_app(
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
+    @application.get(
+        "/api/projects/{project_id}/clips/{clip_id}/subtitles/{format_name}"
+    )
+    def download_clip_subtitles(
+        project_id: str,
+        clip_id: str,
+        format_name: Literal["srt", "vtt"],
+    ) -> Response:
+        _, clip = editable_project_clip(project_id, clip_id)
+        if clip.get("status") == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="No se pueden exportar subtítulos de un clip fallido.",
+            )
+        transcript = clip.get("transcript")
+        if not isinstance(transcript, list) or not transcript:
+            raise HTTPException(
+                status_code=409,
+                detail="El clip no tiene una transcripción con marcas de tiempo.",
+            )
+        try:
+            content = format_subtitles(transcript, format_name)
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail="La transcripción guardada no tiene tiempos válidos para exportar.",
+            ) from error
+        media_type = (
+            "text/vtt; charset=utf-8"
+            if format_name == "vtt"
+            else "application/x-subrip; charset=utf-8"
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{clip_id}.{format_name}"'
+            },
+        )
+
     def clip_file(project_id: str, clip_id: str) -> Path:
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
@@ -1380,29 +1718,31 @@ def create_app(
         clips_by_id = {clip["id"]: clip for clip in project.get("clips") or []}
         if any(clip_id not in clips_by_id for clip_id in request.clip_ids):
             raise HTTPException(status_code=404, detail="Uno o más clips seleccionados no existen.")
-        published: list[dict[str, str]] = []
-        failed: dict[str, str] | None = None
-        not_attempted: list[str] = []
-        for index, clip_id in enumerate(request.clip_ids):
-            clip = clips_by_id[clip_id]
-            try:
-                result = publish_clip(
-                    app_settings,
-                    request.platform,
-                    clip,
-                    clip_file(project_id, clip_id),
-                    request.visibility,
-                    project["owner_id"],
-                )
-            except IntegrationError as error:
-                failed = {"clip_id": clip_id, "error": str(error)}
-                not_attempted = request.clip_ids[index + 1 :]
-                break
-            published.append({"clip_id": clip_id, **result})
+        if any(clips_by_id[clip_id].get("status") == "failed" for clip_id in request.clip_ids):
+            raise HTTPException(
+                status_code=422,
+                detail="No se pueden publicar clips cuyo renderizado falló.",
+            )
+        for clip_id in request.clip_ids:
+            clip_file(project_id, clip_id)
+        scheduled_at = database.utc_now()
+        jobs = database.enqueue_schedule_jobs(
+            app_settings.database_path,
+            project_id,
+            request.clip_ids,
+            request.platform,
+            scheduled_at,
+            request.visibility,
+        )
         return {
-            "published": published,
-            "failed": failed,
-            "not_attempted": not_attempted,
+            "published": [],
+            "failed": None,
+            "not_attempted": [],
+            "jobs": [
+                serialize_schedule_job(job)
+                for job in jobs
+                if job["clip_id"] in request.clip_ids
+            ],
         }
 
     def stored_editor_request(project: dict, clip: dict) -> ClipEditRequest:
@@ -1579,7 +1919,9 @@ def create_app(
             ) from error
         return {"saved": saved}
 
-    @application.post("/api/projects/{project_id}/clips/{clip_id}/share", status_code=201)
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/share", status_code=201
+    )
     def create_clip_share(project_id: str, clip_id: str) -> dict[str, str]:
         clip_file(project_id, clip_id)
         token = database.create_or_get_clip_share(
@@ -1588,7 +1930,41 @@ def create_app(
             clip_id,
             secrets.token_urlsafe(24),
         )
-        return {"share_url": f"/share/{token}"}
+        share = database.get_clip_share(app_settings.database_path, token)
+        if share is None:
+            raise HTTPException(
+                status_code=500, detail="No se pudo crear el enlace compartido."
+            )
+        return {
+            "share_url": f"/share/{token}",
+            "expires_at": share["expires_at"],
+        }
+
+    @application.delete("/api/projects/{project_id}/clips/{clip_id}/share")
+    def revoke_clip_share_route(
+        project_id: str,
+        clip_id: str,
+        request: Request,
+    ) -> dict[str, bool]:
+        project = database.get_project(
+            app_settings.database_path,
+            project_id,
+            request_user_id(request),
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if not any(
+            str(clip.get("id")) == clip_id for clip in project.get("clips") or []
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        if not database.revoke_clip_share(
+            app_settings.database_path, project_id, clip_id
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="No hay un enlace compartido activo para este clip.",
+            )
+        return {"revoked": True}
 
     def shared_clip(token: str) -> tuple[dict, dict]:
         share = database.get_clip_share(app_settings.database_path, token)

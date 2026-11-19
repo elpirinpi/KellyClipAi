@@ -4,12 +4,20 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+
+from .credential_store import (
+    decrypt_oauth_token,
+    encrypt_oauth_token,
+    is_oauth_token_encrypted,
+)
 
 _lock = threading.RLock()
+_LATEST_SCHEMA_VERSION = 3
 _JSON_COLUMNS = {"config", "metadata", "transcript", "clips"}
 _PROJECT_COLUMNS = {
     "title",
@@ -26,7 +34,7 @@ _PROJECT_COLUMNS = {
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @contextmanager
@@ -34,6 +42,7 @@ def connection(database_path: Path) -> Iterator[sqlite3.Connection]:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(database_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
         conn.commit()
@@ -46,6 +55,12 @@ def connection(database_path: Path) -> Iterator[sqlite3.Connection]:
 
 def initialize(database_path: Path) -> None:
     with _lock, connection(database_path) as conn:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > _LATEST_SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(
+                f"Database has newer schema version {version}; "
+                f"this application supports up to {_LATEST_SCHEMA_VERSION}."
+            )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
@@ -109,6 +124,8 @@ def initialize(database_path: Path) -> None:
                 token TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 clip_id TEXT NOT NULL,
+                expires_at TEXT,
+                revoked_at TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(project_id, clip_id)
             );
@@ -157,69 +174,138 @@ def initialize(database_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS scheduled_jobs_due
                 ON scheduled_jobs(status, scheduled_at);
+            CREATE TABLE IF NOT EXISTS schedule_job_confirmations (
+                job_id TEXT PRIMARY KEY REFERENCES scheduled_jobs(id) ON DELETE CASCADE,
+                detected_at TEXT NOT NULL
+            );
             """
         )
-        schedule_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(scheduled_jobs)")
+        _run_migrations(conn)
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    migrations = {1: _migrate_schema_v1, 2: _migrate_schema_v2, 3: _migrate_schema_v3}
+    for next_version in range(version + 1, _LATEST_SCHEMA_VERSION + 1):
+        conn.execute("BEGIN IMMEDIATE")
+        migrations[next_version](conn)
+        conn.execute(f"PRAGMA user_version = {next_version}")
+        conn.commit()
+
+
+def _migrate_schema_v1(conn: sqlite3.Connection) -> None:
+    schedule_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(scheduled_jobs)")
+    }
+    if "visibility" not in schedule_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_jobs ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'"
+        )
+    if "external_url" not in schedule_columns:
+        conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
+    share_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(clip_shares)")
+    }
+    if "expires_at" not in share_columns:
+        conn.execute("ALTER TABLE clip_shares ADD COLUMN expires_at TEXT")
+    if "revoked_at" not in share_columns:
+        conn.execute("ALTER TABLE clip_shares ADD COLUMN revoked_at TEXT")
+    conn.execute(
+        """
+        UPDATE clip_shares
+        SET expires_at = datetime(created_at, '+30 days')
+        WHERE expires_at IS NULL
+        """
+    )
+    for table in ("staged_media", "projects", "oauth_states"):
+        columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
         }
-        if "visibility" not in schedule_columns:
-            conn.execute(
-                "ALTER TABLE scheduled_jobs ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'"
-            )
-        if "external_url" not in schedule_columns:
-            conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN external_url TEXT")
-        for table in ("staged_media", "projects", "oauth_states"):
-            columns = {
-                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
-            }
-            if "owner_id" not in columns:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
-        _migrate_owned_table(
-            conn,
-            "custom_templates",
-            """
-            CREATE TABLE custom_templates (
-                owner_id TEXT NOT NULL,
-                name TEXT NOT NULL COLLATE NOCASE,
-                base_template TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (owner_id, name)
-            )
-            """,
-            "INSERT INTO custom_templates (owner_id, name, base_template, created_at) "
-            "SELECT 'legacy', name, base_template, created_at FROM custom_templates_legacy",
+        if "owner_id" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+    _migrate_owned_table(
+        conn,
+        "custom_templates",
+        """
+        CREATE TABLE custom_templates (
+            owner_id TEXT NOT NULL,
+            name TEXT NOT NULL COLLATE NOCASE,
+            base_template TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (owner_id, name)
         )
-        _migrate_owned_table(
-            conn,
-            "connected_accounts",
-            """
-            CREATE TABLE connected_accounts (
-                owner_id TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                account_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                access_token TEXT NOT NULL,
-                refresh_token TEXT,
-                expires_at TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (owner_id, provider)
-            )
-            """,
-            "INSERT INTO connected_accounts (owner_id, provider, account_id, display_name, "
-            "access_token, refresh_token, expires_at, metadata_json, updated_at) "
-            "SELECT 'legacy', provider, account_id, display_name, access_token, refresh_token, "
-            "expires_at, metadata_json, updated_at FROM connected_accounts_legacy",
+        """,
+        "INSERT INTO custom_templates (owner_id, name, base_template, created_at) "
+        "SELECT 'legacy', name, base_template, created_at FROM custom_templates_legacy",
+    )
+    _migrate_owned_table(
+        conn,
+        "connected_accounts",
+        """
+        CREATE TABLE connected_accounts (
+            owner_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            expires_at TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (owner_id, provider)
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS projects_owner_created "
-            "ON projects(owner_id, created_at DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
-            "ON staged_media(owner_id, source_type, created_at DESC)"
-        )
-        conn.execute("PRAGMA foreign_keys=ON")
+        """,
+        "INSERT INTO connected_accounts (owner_id, provider, account_id, display_name, "
+        "access_token, refresh_token, expires_at, metadata_json, updated_at) "
+        "SELECT 'legacy', provider, account_id, display_name, access_token, refresh_token, "
+        "expires_at, metadata_json, updated_at FROM connected_accounts_legacy",
+    )
+    _migrate_oauth_tokens(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS projects_owner_created "
+        "ON projects(owner_id, created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS staged_media_owner_source_created "
+        "ON staged_media(owner_id, source_type, created_at DESC)"
+    )
+
+
+def _migrate_schema_v2(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE llm_credentials
+        SET model = ?, updated_at = ?
+        WHERE provider = ? AND model = ?
+        """,
+        (
+            "openai/gpt-oss-120b",
+            utc_now(),
+            "Groq",
+            "llama-3.3-70b-versatile",
+        ),
+    )
+
+
+def _migrate_schema_v3(conn: sqlite3.Connection) -> None:
+    # Modelo predeterminado de Groq: qwen/qwen3.8-27b (250K TPM, muy por
+    # encima de los límites de los modelos anteriores). Actualiza tanto a
+    # los usuarios que venían de gpt-oss-120b como a los que aún tenían
+    # llama-3.3-70b-versatile (si saltaron la migración v2).
+    conn.execute(
+        """
+        UPDATE llm_credentials
+        SET model = ?, updated_at = ?
+        WHERE provider = ? AND model IN (?, ?)
+        """,
+        (
+            "qwen/qwen3.8-27b",
+            utc_now(),
+            "Groq",
+            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+        ),
+    )
 
 
 def _migrate_owned_table(
@@ -238,6 +324,40 @@ def _migrate_owned_table(
     conn.execute(create_sql)
     conn.execute(copy_sql)
     conn.execute(f"DROP TABLE {legacy_name}")
+
+
+def _migrate_oauth_tokens(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT owner_id, provider, access_token, refresh_token, metadata_json
+        FROM connected_accounts
+        """
+    ).fetchall()
+    for row in rows:
+        access_token = row["access_token"]
+        refresh_token = row["refresh_token"]
+        metadata = json.loads(row["metadata_json"])
+        user_access_token = metadata.get("user_access_token")
+        if not is_oauth_token_encrypted(access_token):
+            access_token = encrypt_oauth_token(access_token)
+        if refresh_token and not is_oauth_token_encrypted(refresh_token):
+            refresh_token = encrypt_oauth_token(refresh_token)
+        if user_access_token and not is_oauth_token_encrypted(user_access_token):
+            metadata["user_access_token"] = encrypt_oauth_token(user_access_token)
+        conn.execute(
+            """
+            UPDATE connected_accounts
+            SET access_token = ?, refresh_token = ?, metadata_json = ?
+            WHERE owner_id = ? AND provider = ?
+            """,
+            (
+                access_token,
+                refresh_token,
+                json.dumps(metadata, ensure_ascii=False),
+                row["owner_id"],
+                row["provider"],
+            ),
+        )
 
 
 def claim_legacy_data(database_path: Path, owner_id: str) -> None:
@@ -267,6 +387,41 @@ def fail_interrupted_staged_media(database_path: Path) -> None:
             """,
             (utc_now(),),
         )
+
+
+def fail_interrupted_projects(database_path: Path) -> int:
+    error = (
+        "El procesamiento se interrumpió al cerrar o reiniciar la aplicación. "
+        "Puedes volver a intentarlo."
+    )
+    with _lock, connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT id, progress FROM projects WHERE status IN ('queued', 'processing')"
+        ).fetchall()
+        if not rows:
+            return 0
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE projects
+            SET status = 'failed', step = 'failed', error = ?, updated_at = ?
+            WHERE status IN ('queued', 'processing')
+            """,
+            (error, now),
+        )
+        for row in rows:
+            append_event(
+                conn,
+                row["id"],
+                "failed",
+                {
+                    "status": "failed",
+                    "step": "failed",
+                    "progress": row["progress"],
+                    "message": error,
+                },
+            )
+    return len(rows)
 
 
 def create_staged_media(
@@ -472,11 +627,36 @@ def get_project(
     return project_from_row(row) if row else None
 
 
+def project_exists(
+    database_path: Path,
+    project_id: str,
+    owner_id: str | None = None,
+) -> bool:
+    query = "SELECT 1 FROM projects WHERE id = ?"
+    parameters: tuple[Any, ...] = (project_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
+    with connection(database_path) as conn:
+        return conn.execute(query, parameters).fetchone() is not None
+
+
+def get_project_status(database_path: Path, project_id: str) -> str | None:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT status FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+    return str(row["status"]) if row else None
+
+
 def list_projects(
     database_path: Path,
     owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    query = "SELECT * FROM projects"
+    query = (
+        "SELECT id, owner_id, title, input_path, status, step, progress, error, "
+        "config_json, metadata_json, clips_json, created_at, updated_at FROM projects"
+    )
     parameters: tuple[Any, ...] = ()
     if owner_id is not None:
         query += " WHERE owner_id = ?"
@@ -484,13 +664,20 @@ def list_projects(
     query += " ORDER BY created_at DESC"
     with connection(database_path) as conn:
         rows = conn.execute(query, parameters).fetchall()
-    return [project_from_row(row) for row in rows]
+    return [project_from_row(row, include_transcript=False) for row in rows]
 
 
-def project_from_row(row: sqlite3.Row) -> dict[str, Any]:
+def project_from_row(
+    row: sqlite3.Row,
+    *,
+    include_transcript: bool = True,
+) -> dict[str, Any]:
     item = dict(row)
     for column in _JSON_COLUMNS:
         json_key = f"{column}_json"
+        if column == "transcript" and not include_transcript:
+            item.pop(json_key, None)
+            continue
         item[column] = json.loads(item.pop(json_key)) if item.get(json_key) is not None else None
     item.pop("input_path", None)
     return item
@@ -515,17 +702,65 @@ def update_project(database_path: Path, project_id: str, **values: Any) -> None:
         )
 
 
+def delete_project(
+    database_path: Path,
+    project_id: str,
+    owner_id: str | None = None,
+) -> list[str] | None:
+    with _lock, connection(database_path) as conn:
+        query = "SELECT id FROM projects WHERE id = ?"
+        parameters: tuple[Any, ...] = (project_id,)
+        if owner_id is not None:
+            query += " AND owner_id = ?"
+            parameters += (owner_id,)
+        if conn.execute(query, parameters).fetchone() is None:
+            return None
+        staged_ids = [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM staged_media WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        ]
+        conn.execute("DELETE FROM scheduled_jobs WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM clip_shares WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM staged_media WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return staged_ids
+
+
+def cleanup_expired_staged_media(
+    database_path: Path,
+    cutoff: str,
+) -> list[str]:
+    with _lock, connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM staged_media WHERE updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        staged_ids = [str(row["id"]) for row in rows]
+        if staged_ids:
+            conn.executemany(
+                "DELETE FROM staged_media WHERE id = ?",
+                [(staged_id,) for staged_id in staged_ids],
+            )
+    return staged_ids
+
+
 def queue_project(
     database_path: Path,
     project_id: str,
     config: dict[str, Any],
+    *,
+    preserve_clips: bool = False,
 ) -> bool:
+    clips_update = "clips_json = clips_json" if preserve_clips else "clips_json = '[]'"
     with _lock, connection(database_path) as conn:
         cursor = conn.execute(
-            """
+            f"""
             UPDATE projects
             SET config_json = ?, status = 'queued', step = 'upload', progress = 0,
-                error = NULL, clips_json = '[]', updated_at = ?
+                error = NULL, {clips_update}, updated_at = ?
             WHERE id = ? AND status NOT IN ('processing', 'queued')
             """,
             (json.dumps(config, ensure_ascii=False), utc_now(), project_id),
@@ -636,8 +871,13 @@ def resolve_subtitle_template(
 def get_clip_share(database_path: Path, token: str) -> dict[str, str] | None:
     with connection(database_path) as conn:
         row = conn.execute(
-            "SELECT token, project_id, clip_id FROM clip_shares WHERE token = ?",
-            (token,),
+            """
+            SELECT token, project_id, clip_id, expires_at
+            FROM clip_shares
+            WHERE token = ? AND revoked_at IS NULL
+              AND expires_at IS NOT NULL AND julianday(expires_at) > julianday(?)
+            """,
+            (token, utc_now()),
         ).fetchone()
     return dict(row) if row else None
 
@@ -648,23 +888,65 @@ def create_or_get_clip_share(
     clip_id: str,
     token: str,
 ) -> str:
+    now = datetime.now(UTC)
+    expires_at = (now + timedelta(days=30)).isoformat()
     with _lock, connection(database_path) as conn:
         row = conn.execute(
-            "SELECT token FROM clip_shares WHERE project_id = ? AND clip_id = ?",
+            """
+            SELECT token, expires_at, revoked_at
+            FROM clip_shares WHERE project_id = ? AND clip_id = ?
+            """,
             (project_id, clip_id),
         ).fetchone()
-        if row:
+        if (
+            row
+            and row["revoked_at"] is None
+            and row["expires_at"] is not None
+            and conn.execute(
+                "SELECT julianday(?) > julianday(?)",
+                (row["expires_at"], utc_now()),
+            ).fetchone()[0]
+        ):
             return str(row["token"])
-        conn.execute(
-            """
-            INSERT INTO clip_shares (token, project_id, clip_id, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (token, project_id, clip_id, utc_now()),
-        )
+        if row:
+            conn.execute(
+                """
+                UPDATE clip_shares
+                SET token = ?, expires_at = ?, revoked_at = NULL, created_at = ?
+                WHERE project_id = ? AND clip_id = ?
+                """,
+                (token, expires_at, now.isoformat(), project_id, clip_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO clip_shares (
+                    token, project_id, clip_id, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (token, project_id, clip_id, expires_at, now.isoformat()),
+            )
     return token
 
 
+def revoke_clip_share(
+    database_path: Path,
+    project_id: str,
+    clip_id: str,
+) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE clip_shares
+            SET revoked_at = ?
+            WHERE project_id = ? AND clip_id = ?
+              AND revoked_at IS NULL
+              AND expires_at IS NOT NULL
+              AND julianday(expires_at) > julianday(?)
+            """,
+            (utc_now(), project_id, clip_id, utc_now()),
+        )
+    return cursor.rowcount == 1
 def save_oauth_state(
     database_path: Path,
     state: str,
@@ -733,10 +1015,24 @@ def save_connected_account(
                 provider,
                 account_id,
                 display_name,
-                access_token,
-                refresh_token,
+                encrypt_oauth_token(access_token),
+                encrypt_oauth_token(refresh_token) if refresh_token else None,
                 expires_at,
-                json.dumps(metadata, ensure_ascii=False),
+                json.dumps(
+                    {
+                        **metadata,
+                        **(
+                            {
+                                "user_access_token": encrypt_oauth_token(
+                                    str(metadata["user_access_token"])
+                                )
+                            }
+                            if metadata.get("user_access_token")
+                            else {}
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
                 utc_now(),
             ),
         )
@@ -756,6 +1052,13 @@ def get_connected_account(
         return None
     result = dict(row)
     result["metadata"] = json.loads(result.pop("metadata_json"))
+    result["access_token"] = decrypt_oauth_token(result["access_token"])
+    result["refresh_token"] = decrypt_oauth_token(result["refresh_token"])
+    user_access_token = result["metadata"].get("user_access_token")
+    if user_access_token:
+        result["metadata"]["user_access_token"] = decrypt_oauth_token(
+            user_access_token
+        )
     return result
 
 
@@ -855,7 +1158,19 @@ def enqueue_schedule_jobs(
 
 
 def schedule_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row)
+    job = dict(row)
+    job["confirmation_required"] = bool(job.get("confirmation_required", False))
+    return job
+
+
+def _schedule_job_select() -> str:
+    return """
+        scheduled_jobs.*,
+        EXISTS(
+            SELECT 1 FROM schedule_job_confirmations
+            WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
+        ) AS confirmation_required
+    """
 
 
 def list_schedule_jobs(
@@ -866,8 +1181,8 @@ def list_schedule_jobs(
     with connection(database_path) as conn:
         if project_id and owner_id:
             rows = conn.execute(
-                """
-                SELECT scheduled_jobs.* FROM scheduled_jobs
+                f"""
+                SELECT {_schedule_job_select()} FROM scheduled_jobs
                 JOIN projects ON projects.id = scheduled_jobs.project_id
                 WHERE scheduled_jobs.project_id = ? AND projects.owner_id = ?
                 ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
@@ -876,13 +1191,13 @@ def list_schedule_jobs(
             ).fetchall()
         elif project_id:
             rows = conn.execute(
-                "SELECT * FROM scheduled_jobs WHERE project_id = ? ORDER BY scheduled_at, created_at",
+                f"SELECT {_schedule_job_select()} FROM scheduled_jobs WHERE project_id = ? ORDER BY scheduled_at, created_at",
                 (project_id,),
             ).fetchall()
         elif owner_id:
             rows = conn.execute(
-                """
-                SELECT scheduled_jobs.* FROM scheduled_jobs
+                f"""
+                SELECT {_schedule_job_select()} FROM scheduled_jobs
                 JOIN projects ON projects.id = scheduled_jobs.project_id
                 WHERE projects.owner_id = ?
                 ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
@@ -891,7 +1206,7 @@ def list_schedule_jobs(
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM scheduled_jobs ORDER BY scheduled_at, created_at"
+                f"SELECT {_schedule_job_select()} FROM scheduled_jobs ORDER BY scheduled_at, created_at"
             ).fetchall()
     return [schedule_job_from_row(row) for row in rows]
 
@@ -901,7 +1216,7 @@ def get_schedule_job(
     job_id: str,
     owner_id: str | None = None,
 ) -> dict[str, Any] | None:
-    query = "SELECT scheduled_jobs.* FROM scheduled_jobs"
+    query = f"SELECT {_schedule_job_select()} FROM scheduled_jobs"
     parameters: tuple[Any, ...] = (job_id,)
     if owner_id is not None:
         query += " JOIN projects ON projects.id = scheduled_jobs.project_id"
@@ -921,11 +1236,76 @@ def due_schedule_jobs(database_path: Path, now: str) -> list[dict[str, Any]]:
             SELECT scheduled_jobs.*, projects.owner_id FROM scheduled_jobs
             JOIN projects ON projects.id = scheduled_jobs.project_id
             WHERE scheduled_jobs.status = 'scheduled' AND scheduled_jobs.scheduled_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM schedule_job_confirmations
+                  WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
+              )
             ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
             """,
             (now,),
         ).fetchall()
     return [schedule_job_from_row(row) for row in rows]
+
+
+def hold_overdue_schedule_jobs(database_path: Path, now: str) -> int:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO schedule_job_confirmations (job_id, detected_at)
+            SELECT id, ?
+            FROM scheduled_jobs
+            WHERE status = 'scheduled' AND scheduled_at <= ?
+            """,
+            (now, now),
+        )
+    return cursor.rowcount
+
+
+def resolve_overdue_schedule_job(
+    database_path: Path,
+    job_id: str,
+    action: str,
+) -> bool:
+    if action not in {"publish_now", "discard"}:
+        raise ValueError(f"Acción de publicación vencida no válida: {action}")
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT scheduled_jobs.id FROM scheduled_jobs
+            JOIN schedule_job_confirmations
+              ON schedule_job_confirmations.job_id = scheduled_jobs.id
+            WHERE scheduled_jobs.id = ? AND scheduled_jobs.status = 'scheduled'
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if action == "publish_now":
+            conn.execute(
+                """
+                UPDATE scheduled_jobs
+                SET scheduled_at = ?, error = NULL, updated_at = ?
+                WHERE id = ? AND status = 'scheduled'
+                """,
+                (now, now, job_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE scheduled_jobs
+                SET status = 'failed',
+                    error = 'La publicación vencida se descartó al reabrir la aplicación.',
+                    updated_at = ?
+                WHERE id = ? AND status = 'scheduled'
+                """,
+                (now, job_id),
+            )
+        conn.execute(
+            "DELETE FROM schedule_job_confirmations WHERE job_id = ?",
+            (job_id,),
+        )
+    return True
 
 
 def fail_interrupted_schedule_jobs(database_path: Path) -> int:
@@ -950,6 +1330,10 @@ def claim_schedule_job(database_path: Path, job_id: str) -> bool:
             UPDATE scheduled_jobs
             SET status = 'processing', error = NULL, updated_at = ?
             WHERE id = ? AND status = 'scheduled'
+              AND NOT EXISTS (
+                  SELECT 1 FROM schedule_job_confirmations
+                  WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
+              )
             """,
             (utc_now(), job_id),
         )

@@ -1,23 +1,44 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import uuid
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from . import database
-from .integrations import IntegrationError, download_broll
+from .integrations import download_broll
 from .llm import (
+    LLMConfigurationError,
+    ResolvedLLM,
     propose_clips,
     resolve_llm,
 )
-from .media import MediaProcessingError, create_thumbnail, probe_media, render_clip, transcribe
-from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment
+from .media import (
+    MediaProcessingError,
+    create_thumbnail,
+    probe_media,
+    render_clip,
+    transcribe,
+)
+from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment, Word
 from .settings import AppSettings, get_settings
 
 
 class ProjectNotFoundError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
+
+# Ventanas de 5 minutos: cada llamada al LLM lleva una transcripción del
+# tamaño de un video de 5 minutos, que Groq procesa sin error. Las ventanas
+# de 15 minutos generaban peticiones de ~5.000 tokens que superaban los
+# límites de tokens/minuto del plan gratuito de Groq con videos largos.
+_LLM_WINDOW_SECONDS = 5 * 60
+_LLM_WINDOW_OVERLAP_SECONDS = 1 * 60
 
 
 def _publish(
@@ -61,27 +82,211 @@ def _duration_bounds(choice: str) -> tuple[float, float]:
 
 
 def _validate_proposals(
-    proposals: list[ClipProposal],
+    proposals: list[object],
     duration: float,
     choice: str,
-) -> None:
+) -> tuple[list[ClipProposal], list[str]]:
     minimum, maximum = _duration_bounds(choice)
     if choice != "Cualquiera" and duration + 0.05 < minimum:
         raise MediaProcessingError(
             f"El video dura {duration:.1f} segundos y no alcanza la duración mínima de {choice}."
         )
-    previous_end = -1.0
-    for proposal in sorted(proposals, key=lambda clip: clip.inicio):
-        clip_duration = proposal.fin - proposal.inicio
+    valid: list[ClipProposal] = []
+    errors: list[str] = []
+    for index, candidate in enumerate(proposals[:10], start=1):
+        label = (
+            str(candidate.get("titulo") or f"#{index}")
+            if isinstance(candidate, dict)
+            else f"#{index}"
+        )
+        try:
+            proposal = ClipProposal.model_validate(candidate)
+        except (ValidationError, TypeError) as error:
+            reason = f"clip {label}: estructura inválida ({str(error).splitlines()[0][:240]})"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
+
         if proposal.fin > duration + 0.05:
-            raise MediaProcessingError("El modelo propuso un clip fuera de la duración del video.")
-        if clip_duration < minimum - 0.05 or clip_duration > min(maximum, duration) + 0.05:
-            raise MediaProcessingError(
-                f"El modelo propuso un clip fuera del rango de duración {choice}."
-            )
+            reason = f"clip {label}: el fin supera la duración del video"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
+        if proposal.fin > duration:
+            proposal = proposal.model_copy(update={"fin": duration})
+
+        clip_duration = proposal.fin - proposal.inicio
+        if (
+            clip_duration < minimum - 0.05
+            or clip_duration > min(maximum, duration) + 0.05
+        ):
+            reason = f"clip {label}: duración fuera del rango solicitado ({choice})"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
+        valid.append(proposal)
+
+    previous_end = -1.0
+    non_overlapping: list[ClipProposal] = []
+    for proposal in sorted(valid, key=lambda clip: clip.inicio):
         if proposal.inicio < previous_end:
-            raise MediaProcessingError("El modelo propuso clips que se solapan.")
+            reason = f"clip {proposal.titulo}: se solapa con otro clip"
+            logger.warning("Se descarta la propuesta del LLM: %s", reason)
+            errors.append(reason)
+            continue
         previous_end = proposal.fin
+        non_overlapping.append(proposal)
+    return non_overlapping, errors
+
+
+def _validate_and_complete_proposals(
+    candidates: list[object],
+    transcript: list[TranscriptSegment],
+    duration: float,
+    choice: str,
+) -> tuple[list[ClipProposal], list[str]]:
+    proposals, errors = _validate_proposals(candidates, duration, choice)
+    if not proposals:
+        return [], errors
+    completed = _complete_clip_ends(proposals, transcript, duration, choice)
+    completed, completion_errors = _validate_proposals(completed, duration, choice)
+    return completed, errors + completion_errors
+
+
+def _propose_valid_clips(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    llm: ResolvedLLM,
+) -> list[ClipProposal]:
+    if duration <= _LLM_WINDOW_SECONDS:
+        return _propose_valid_window(transcript, project, duration, llm)
+
+    stride = _LLM_WINDOW_SECONDS - _LLM_WINDOW_OVERLAP_SECONDS
+    proposals: list[ClipProposal] = []
+    errors: list[str] = []
+    window_start = 0.0
+    window_index = 0
+    while window_start < duration:
+        window_end = min(duration, window_start + _LLM_WINDOW_SECONDS)
+        window_transcript = _slice_transcript(transcript, window_start, window_end)
+        window_duration = window_end - window_start
+        try:
+            window_proposals = _propose_valid_window(
+                window_transcript, project, window_duration, llm
+            )
+        except MediaProcessingError as error:
+            errors.append(f"ventana {window_index + 1}: {error}")
+            logger.warning("Se omite una ventana de transcripción: %s", errors[-1])
+            window_proposals = []
+
+        owned_duration = (
+            window_duration
+            if window_end >= duration
+            else min(float(stride), window_duration)
+        )
+        proposals.extend(
+            proposal.model_copy(
+                update={
+                    "inicio": proposal.inicio + window_start,
+                    "fin": proposal.fin + window_start,
+                }
+            )
+            for proposal in window_proposals
+            if proposal.inicio < owned_duration
+        )
+        if window_end >= duration:
+            break
+        window_start += stride
+        window_index += 1
+
+    selected: list[ClipProposal] = []
+    for proposal in sorted(
+        proposals, key=lambda clip: (-clip.puntuacion, clip.inicio)
+    ):
+        if any(
+            proposal.inicio < existing.fin and existing.inicio < proposal.fin
+            for existing in selected
+        ):
+            logger.warning(
+                "Se descarta el clip %s por solaparse con otra ventana.",
+                proposal.titulo,
+            )
+            continue
+        selected.append(proposal)
+        if len(selected) == 10:
+            break
+    if not selected and errors:
+        raise MediaProcessingError(
+            "No se encontraron propuestas válidas en las ventanas analizadas. "
+            + "; ".join(errors[:3])
+        )
+    return sorted(selected, key=lambda clip: clip.inicio)
+
+
+def _slice_transcript(
+    transcript: list[TranscriptSegment],
+    start: float,
+    end: float,
+) -> list[TranscriptSegment]:
+    sliced: list[TranscriptSegment] = []
+    for segment in transcript:
+        segment_start = max(start, segment.start)
+        segment_end = min(end, segment.end)
+        if segment_end <= segment_start:
+            continue
+        words = [
+            Word(
+                start=max(start, word.start) - start,
+                end=min(end, word.end) - start,
+                text=word.text,
+            )
+            for word in segment.words
+            if word.start < end and word.end > start
+        ]
+        sliced.append(
+            TranscriptSegment(
+                start=segment_start - start,
+                end=segment_end - start,
+                text=segment.text,
+                words=words,
+            )
+        )
+    return sliced
+
+
+def _propose_valid_window(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    llm: ResolvedLLM,
+) -> list[ClipProposal]:
+    candidates = propose_clips(transcript, project, duration, llm)
+    proposals, errors = _validate_and_complete_proposals(
+        candidates, transcript, duration, project.duration
+    )
+    if errors:
+        retry_candidates = propose_clips(
+            transcript,
+            project,
+            duration,
+            llm,
+            validation_feedback=errors,
+        )
+        retried, retry_errors = _validate_and_complete_proposals(
+            retry_candidates, transcript, duration, project.duration
+        )
+        proposals, merge_errors = _validate_proposals(
+            [*proposals, *retried], duration, project.duration
+        )
+        errors.extend(retry_errors)
+        errors.extend(merge_errors)
+    if not proposals and errors:
+        raise MediaProcessingError(
+            "El modelo no propuso clips válidos tras un reintento. "
+            + "; ".join(errors[:5])
+        )
+    return proposals
 
 
 def _ends_sentence(text: str) -> bool:
@@ -180,98 +385,165 @@ def _render_projects(
     project_id: str,
     input_path: Path,
     project_config: ProjectConfig,
-    proposals: list[ClipProposal],
+    proposal_records: list[dict[str, Any] | ClipProposal],
     transcript: list[TranscriptSegment],
     ffmpeg_path: str,
     owner_id: str,
+    existing_clips: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     project_dir = input_path.parent
     output_dir = project_dir / "clips"
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    rendered: list[dict[str, Any]] = []
-    count = len(proposals)
+    proposal_records = [
+        {
+            "id": str(uuid.uuid4()),
+            "proposal": record.model_dump(mode="json"),
+        }
+        if isinstance(record, ClipProposal)
+        else record
+        for record in proposal_records
+    ]
+    replacing_ids = {str(record["id"]) for record in proposal_records}
+    rendered = [
+        clip
+        for clip in existing_clips or []
+        if str(clip.get("id")) not in replacing_ids
+    ]
+    count = len(proposal_records)
     if not count:
         return rendered
 
-    for index, proposal in enumerate(proposals):
-        clip_id = str(uuid.uuid4())
+    for index, record in enumerate(proposal_records):
+        clip_id = str(record["id"])
+        proposal = ClipProposal.model_validate(record["proposal"])
         output_path = output_dir / f"{clip_id}.mp4"
         subtitle_path = output_dir / f"{clip_id}.ass"
+        clip = {
+            "id": clip_id,
+            "title": proposal.titulo,
+            "start": proposal.inicio,
+            "end": proposal.fin,
+            "duration": proposal.fin - proposal.inicio,
+            "score": proposal.puntuacion,
+            "viral_reason": proposal.razon_viral,
+            "description": proposal.descripcion,
+            "hashtags": proposal.hashtags,
+            "keywords": proposal.palabras_clave,
+            "emojis": proposal.emojis if project_config.options.emojis else [],
+            "resolution": 720,
+            "filename": output_path.name,
+            "transcript": [],
+            "width": 0,
+            "height": 0,
+        }
+        clip_start_progress = 72 + round(index / count * 26)
+        _publish(
+            settings,
+            project_id,
+            "processing",
+            "editing",
+            clip_start_progress,
+            f"Preparando clip {index + 1} de {count}…",
+        )
 
-        def on_encode_progress(percent: float) -> None:
-            overall = 72 + round(((index + percent / 100) / count) * 26)
+        def on_encode_progress(percent: float, clip_index: int = index) -> None:
+            overall = 72 + round(((clip_index + percent / 100) / count) * 26)
             _publish(
                 settings,
                 project_id,
                 "processing",
                 "editing",
                 min(overall, 98),
-                f"Editando clip {index + 1} de {count}…",
+                f"Editando clip {clip_index + 1} de {count}…",
             )
 
-        render_config = project_config.model_copy(
-            update={
-                "subtitle_template": database.resolve_subtitle_template(
-                    settings.database_path,
-                    project_config.subtitle_template,
-                    owner_id,
-                )
-            }
-        )
+        def on_analysis_progress(
+            percent: float,
+            clip_index: int = index,
+            progress: int = clip_start_progress,
+        ) -> None:
+            _publish(
+                settings,
+                project_id,
+                "processing",
+                "editing",
+                progress,
+                f"Analizando reencuadre del clip {clip_index + 1} de {count}… "
+                f"{percent:.0f}%",
+            )
+
         broll_path: Path | None = None
-        broll_metadata: dict[str, str] | None = None
-        if project_config.options.broll:
-            broll_path = project_dir / "broll" / f"{clip_id}.mp4"
-            try:
+        try:
+            render_config = project_config.model_copy(
+                update={
+                    "subtitle_template": database.resolve_subtitle_template(
+                        settings.database_path,
+                        project_config.subtitle_template,
+                        owner_id,
+                    )
+                }
+            )
+            broll_metadata: dict[str, str] | None = None
+            if project_config.options.broll:
+                broll_path = project_dir / "broll" / f"{clip_id}.mp4"
                 broll_metadata = download_broll(
                     settings,
                     " ".join(proposal.palabras_clave) or proposal.titulo,
                     broll_path,
                 )
-            except IntegrationError as error:
-                raise MediaProcessingError(str(error)) from error
-        clip_duration, clip_transcript = render_clip(
-            input_path,
-            output_path,
-            subtitle_path,
-            proposal,
-            render_config,
-            transcript,
-            ffmpeg_path,
-            on_encode_progress,
-            broll_path=broll_path,
-        )
-        metadata = probe_media(output_path, shutil.which("ffprobe") or "ffprobe")
-        rendered.append(
-            {
-                "id": clip_id,
-                "title": proposal.titulo,
-                "start": proposal.inicio,
-                "end": proposal.fin,
-                "duration": clip_duration,
-                "score": proposal.puntuacion,
-                "viral_reason": proposal.razon_viral,
-                "keywords": proposal.palabras_clave,
-                "emojis": proposal.emojis if project_config.options.emojis else [],
-                "width": metadata["width"],
-                "height": metadata["height"],
-                "resolution": 720,
-                "audio_enhanced": False,
-                "filename": output_path.name,
-                "transcript": clip_transcript,
-                **(
-                    {
-                        "broll_provider": broll_metadata["provider"],
-                        "broll_creator": broll_metadata["creator"],
-                        "broll_attribution_url": broll_metadata["attribution_url"],
-                    }
-                    if broll_metadata
-                    else {}
-                ),
-            }
-        )
+            clip_duration, clip_transcript = render_clip(
+                input_path,
+                output_path,
+                subtitle_path,
+                proposal,
+                render_config,
+                transcript,
+                ffmpeg_path,
+                on_encode_progress,
+                broll_path=broll_path,
+                on_analysis_progress=on_analysis_progress,
+            )
+            metadata = probe_media(output_path, shutil.which("ffprobe") or "ffprobe")
+            clip.update(
+                {
+                    "duration": clip_duration,
+                    "width": metadata["width"],
+                    "height": metadata["height"],
+                    "audio_enhanced": False,
+                    "transcript": clip_transcript,
+                    "status": "ready",
+                    **(
+                        {
+                            "broll_provider": broll_metadata["provider"],
+                            "broll_creator": broll_metadata["creator"],
+                            "broll_attribution_url": broll_metadata["attribution_url"],
+                        }
+                        if broll_metadata
+                        else {}
+                    ),
+                }
+            )
+        except Exception as error:
+            logger.exception("No se pudo renderizar el clip %s del proyecto %s", clip_id, project_id)
+            clip.update(
+                {
+                    "status": "failed",
+                    "error": str(error).strip() or "No se pudo renderizar este clip.",
+                }
+            )
+            for partial_path in (output_path, subtitle_path, broll_path):
+                if partial_path is None:
+                    continue
+                try:
+                    partial_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "No se pudo eliminar el archivo parcial %s", partial_path
+                    )
+        rendered = [item for item in rendered if str(item.get("id")) != clip_id]
+        rendered.append(clip)
+        rendered.sort(key=lambda item: float(item.get("start") or 0))
+        database.update_project(settings.database_path, project_id, clips=rendered)
     return rendered
 
 
@@ -279,6 +551,8 @@ def process_project(
     project_id: str,
     request_llm: LLMConfig | None,
     settings: AppSettings | None = None,
+    *,
+    retry_failed_only: bool = False,
 ) -> None:
     settings = settings or get_settings()
     project_dir = settings.data_dir / "projects" / project_id
@@ -289,7 +563,7 @@ def process_project(
         if stored is None or not input_path.is_file():
             raise ProjectNotFoundError("No se encontró el video guardado para este proyecto.")
         project_config = ProjectConfig.model_validate(stored["config"])
-        llm = resolve_llm(request_llm, settings)
+        llm = None if retry_failed_only else resolve_llm(request_llm, settings)
         ffmpeg_path = shutil.which("ffmpeg")
         ffprobe_path = shutil.which("ffprobe")
         if not ffmpeg_path or not ffprobe_path:
@@ -359,10 +633,23 @@ def process_project(
                     f"Transcribiendo el audio… {percent:.0f}%",
                 )
 
+            def on_whisper_download_progress(percent: float) -> None:
+                progress = min(100, max(0, round(percent)))
+                _publish(
+                    settings,
+                    project_id,
+                    "processing",
+                    "finding",
+                    progress,
+                    f"Descargando el modelo Whisper… {percent:.0f}%",
+                )
+
             transcript, language = transcribe(
                 input_path,
                 project_config.whisper_model or settings.whisper_model,
                 on_transcription_progress,
+                language=project_config.whisper_language,
+                on_model_download_progress=on_whisper_download_progress,
             )
             transcript_data = [segment.model_dump() for segment in transcript]
             metadata["language"] = language
@@ -372,80 +659,117 @@ def process_project(
                 metadata=metadata,
                 transcript=transcript_data,
             )
-        _progress_for_llm(settings, project_id, llm.provider)
-
-        def on_llm_progress(current: int, total: int) -> None:
-            if total > 1:
-                _publish(
-                    settings,
-                    project_id,
-                    "processing",
-                    "finding",
-                    None,
-                    f"Analizando la transcripción con {llm.provider}… (fragmento {current} de {total})",
+        existing_clips = stored.get("clips") or []
+        if retry_failed_only:
+            failed_ids = {
+                str(clip["id"])
+                for clip in existing_clips
+                if clip.get("status") == "failed"
+            }
+            stored_proposals = (
+                metadata.get("clip_proposals")
+                if isinstance(metadata, dict)
+                else None
+            )
+            proposal_records = [
+                proposal
+                for proposal in stored_proposals or []
+                if isinstance(proposal, dict)
+                and str(proposal.get("id")) in failed_ids
+                and isinstance(proposal.get("proposal"), dict)
+            ]
+            if not proposal_records:
+                raise MediaProcessingError(
+                    "No hay propuestas guardadas para reintentar los clips fallidos."
                 )
-
-        proposals = propose_clips(
-            transcript,
-            project_config,
-            float(metadata["duration"]),
-            llm,
-            on_progress=on_llm_progress,
-        )
-        proposals = _complete_clip_ends(
-            proposals,
-            transcript,
-            float(metadata["duration"]),
-            project_config.duration,
-        )
-        _validate_proposals(
-            proposals,
-            float(metadata["duration"]),
-            project_config.duration,
-        )
-        if not proposals:
-            database.update_project(settings.database_path, project_id, clips=[])
             _publish(
                 settings,
                 project_id,
-                "completed",
-                "finalize",
-                100,
-                "El análisis terminó. No se encontraron momentos que cumplan los criterios solicitados.",
+                "processing",
+                "editing",
+                72,
+                f"Reintentando {len(proposal_records)} clip(s) fallido(s) sin volver a llamar a la IA…",
             )
-            return
+        else:
+            if llm is None:
+                raise LLMConfigurationError("No se pudo configurar el proveedor de IA.")
+            _progress_for_llm(settings, project_id, llm.provider)
+            proposals = _propose_valid_clips(
+                transcript,
+                project_config,
+                float(metadata["duration"]),
+                llm,
+            )
+            proposal_records = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "proposal": proposal.model_dump(mode="json"),
+                }
+                for proposal in proposals
+            ]
+            metadata = dict(metadata or {})
+            metadata["clip_proposals"] = proposal_records
+            database.update_project(
+                settings.database_path, project_id, metadata=metadata
+            )
+            if not proposals:
+                database.update_project(settings.database_path, project_id, clips=[])
+                _publish(
+                    settings,
+                    project_id,
+                    "completed",
+                    "finalize",
+                    100,
+                    "El análisis terminó. No se encontraron momentos que cumplan los criterios solicitados.",
+                )
+                return
+            existing_clips = []
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
 
-        _publish(
-            settings,
-            project_id,
-            "processing",
-            "editing",
-            72,
-            f"Editando {len(proposals)} clips con FFmpeg…",
-        )
         clips = _render_projects(
             settings,
             project_id,
             input_path,
             project_config,
-            proposals,
+            proposal_records,
             transcript,
             ffmpeg_path,
             str(stored["owner_id"]),
+            existing_clips,
         )
         database.update_project(settings.database_path, project_id, clips=clips)
         scheduled_count = 0
-        if project_config.schedule is not None and clips:
+        scheduled_clips = [
+            clip for clip in clips if clip.get("status", "ready") != "failed"
+        ]
+        if project_config.schedule is not None and scheduled_clips:
             jobs = database.enqueue_schedule_jobs(
                 settings.database_path,
                 project_id,
-                [str(clip["id"]) for clip in clips],
+                [str(clip["id"]) for clip in scheduled_clips],
                 project_config.schedule.platform,
                 project_config.schedule.scheduled_at.isoformat(),
                 project_config.schedule.visibility,
             )
             scheduled_count = len(jobs)
-        completion_message = f"Procesamiento terminado: {len(clips)} clips reales listos."
+        ready_count = len(scheduled_clips)
+        failed_count = len(clips) - ready_count
+        if not ready_count and failed_count:
+            _publish(
+                settings,
+                project_id,
+                "failed",
+                "failed",
+                None,
+                f"No se pudo renderizar ninguno de los {failed_count} clips. Puedes reintentarlos.",
+            )
+            return
+        completion_message = f"Procesamiento terminado: {ready_count} clips reales listos."
+        if failed_count:
+            completion_message += (
+                f" {failed_count} clip(s) fallaron y pueden reintentarse."
+            )
         if scheduled_count:
             completion_message += f" {scheduled_count} publicaciones quedaron programadas."
         _publish(
@@ -457,8 +781,6 @@ def process_project(
             completion_message,
         )
     except Exception as error:
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
+        logger.exception("Fallo inesperado al procesar el proyecto %s", project_id)
         message = str(error).strip() or "Error inesperado durante el procesamiento."
-        database.update_project(settings.database_path, project_id, clips=[])
         _publish(settings, project_id, "failed", "failed", None, message)

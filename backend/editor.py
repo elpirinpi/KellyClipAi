@@ -8,7 +8,13 @@ from typing import Any
 
 from . import database
 from .media import MediaProcessingError, probe_media, render_clip
-from .schemas import ClipEditRequest, ClipProposal, ProjectConfig, TranscriptSegment
+from .schemas import (
+    ClipEditRequest,
+    ClipProposal,
+    ProjectConfig,
+    SubtitleStyle,
+    TranscriptSegment,
+)
 from .settings import AppSettings
 
 
@@ -71,17 +77,27 @@ def editor_phrases(clip: dict[str, Any]) -> list[dict[str, Any]]:
 
 def editor_state(project: dict[str, Any], clip: dict[str, Any]) -> dict[str, Any]:
     saved = clip.get("edit")
+    subtitle_style = (
+        saved.get("subtitle_style")
+        if isinstance(saved, dict)
+        else project["config"].get("subtitle_style")
+    )
+    serialized_style = SubtitleStyle.model_validate(
+        subtitle_style if isinstance(subtitle_style, dict) else {}
+    ).model_dump(mode="json")
     if isinstance(saved, dict) and isinstance(saved.get("phrases"), list):
         return {
             "ratio": saved.get("ratio", project["config"]["ratio"]),
             "subtitle_template": saved.get(
                 "subtitle_template", project["config"]["subtitle_template"]
             ),
+            "subtitle_style": serialized_style,
             "phrases": saved["phrases"],
         }
     return {
         "ratio": project["config"]["ratio"],
         "subtitle_template": project["config"]["subtitle_template"],
+        "subtitle_style": serialized_style,
         "phrases": editor_phrases(clip),
     }
 
@@ -144,6 +160,7 @@ def save_editor_draft(
     return {
         "ratio": document["ratio"],
         "subtitle_template": document["subtitle_template"],
+        "subtitle_style": document["subtitle_style"],
         "phrases": document["phrases"],
     }
 
@@ -193,6 +210,7 @@ def render_editor_version(
                     edit.subtitle_template,
                     str(project["owner_id"]),
                 ),
+                "subtitle_style": edit.subtitle_style,
             }
         )
         transcript = [

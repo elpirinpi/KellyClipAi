@@ -4,13 +4,20 @@ import ctypes
 import logging
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-import subprocess
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+_LOG_BACKUP_COUNT = 3
+_WINDOW_TITLE = "kellyClipAi"
+_SINGLE_INSTANCE_MUTEX = "Local\\kellyClipAi-desktop"
+_logger = logging.getLogger(__name__)
 
 
 def _resource_path(*parts: str) -> Path:
@@ -25,6 +32,110 @@ def _show_error(message: str) -> None:
         "kellyClipAi",
         0x10,
     )
+
+
+def _create_log_handler(log_path: Path) -> RotatingFileHandler:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    return RotatingFileHandler(
+        log_path,
+        maxBytes=_LOG_MAX_BYTES,
+        backupCount=_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+
+
+class _SingleInstance:
+    def __init__(self, mutex_name: str = _SINGLE_INSTANCE_MUTEX) -> None:
+        self._mutex_name = mutex_name
+        self._handle: int | None = None
+        self._kernel32: ctypes.WinDLL | None = None
+
+    def acquire(self) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+        create_mutex.restype = ctypes.c_void_p
+        ctypes.set_last_error(0)
+        handle = create_mutex(None, True, self._mutex_name)
+        error = ctypes.get_last_error()
+        if not handle:
+            raise ctypes.WinError(error)
+        if error == 183:
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle(handle)
+            return False
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        self._handle = handle
+        self._kernel32 = kernel32
+        return True
+
+    def close(self) -> None:
+        if self._handle is None or self._kernel32 is None:
+            return
+        if not self._kernel32.ReleaseMutex(self._handle):
+            _logger.error(
+                "No se pudo liberar el mutex de instancia única: %s",
+                ctypes.WinError(ctypes.get_last_error()),
+            )
+        if not self._kernel32.CloseHandle(self._handle):
+            _logger.error(
+                "No se pudo cerrar el mutex de instancia única: %s",
+                ctypes.WinError(ctypes.get_last_error()),
+            )
+        self._handle = None
+        self._kernel32 = None
+
+
+def _find_main_window(user32: ctypes.WinDLL) -> int | None:
+    matching_windows: list[int] = []
+    enum_windows_proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
+    user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
+    user32.IsWindowVisible.restype = ctypes.c_int
+    user32.GetWindowTextLengthW.argtypes = (ctypes.c_void_p,)
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
+    user32.GetWindowTextW.restype = ctypes.c_int
+
+    @enum_windows_proc
+    def visit_window(hwnd: int, _parameter: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title_length = user32.GetWindowTextLengthW(hwnd)
+        if title_length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(title_length + 1)
+        user32.GetWindowTextW(hwnd, title, len(title))
+        if title.value.casefold().startswith(_WINDOW_TITLE.casefold()):
+            matching_windows.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows.argtypes = (enum_windows_proc, ctypes.c_ssize_t)
+    user32.EnumWindows.restype = ctypes.c_int
+    user32.EnumWindows(visit_window, 0)
+    return matching_windows[0] if matching_windows else None
+
+
+def _focus_existing_window(timeout: float = 10) -> bool:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
+    user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
+    user32.SetForegroundWindow.restype = ctypes.c_int
+    user32.FlashWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        hwnd = _find_main_window(user32)
+        if hwnd is not None:
+            user32.ShowWindow(hwnd, 9)
+            user32.BringWindowToTop(hwnd)
+            if user32.SetForegroundWindow(hwnd):
+                return True
+            user32.FlashWindow(hwnd, True)
+            return False
+        time.sleep(0.2)
+    return False
 
 
 def _prepare_user_directory() -> Path:
@@ -83,14 +194,7 @@ class DesktopApi:
         return selected[0] if selected else None
 
 
-def main(smoke_test: bool = False) -> None:
-    user_dir = _prepare_user_directory()
-    logging.basicConfig(
-        filename=user_dir / "desktop.log",
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        encoding="utf-8",
-    )
+def _run_app(user_dir: Path, smoke_test: bool) -> None:
     web_dir = _resource_path("web")
     if not (web_dir / "index.html").is_file():
         raise FileNotFoundError("No se encontraron los archivos de la interfaz incluidos en el instalador.")
@@ -100,12 +204,13 @@ def main(smoke_test: bool = False) -> None:
 
     _ensure_port_available("127.0.0.1", 8000)
 
+    import uvicorn
+    import webview
+
     from backend.main import create_app
     from backend.settings import get_settings
     from backend.updater import UpdateManager
     from backend.version import APP_VERSION
-    import uvicorn
-    import webview
 
     updater = UpdateManager(
         APP_VERSION,
@@ -141,7 +246,7 @@ def main(smoke_test: bool = False) -> None:
                 )
             return
         webview.create_window(
-            "kellyClipAi",
+            _WINDOW_TITLE,
             "http://127.0.0.1:8000/",
             min_size=(360, 600),
             width=1440,
@@ -154,17 +259,40 @@ def main(smoke_test: bool = False) -> None:
         server_thread.join(timeout=10)
 
 
+def main(smoke_test: bool = False) -> None:
+    user_dir = _prepare_user_directory()
+    logging.basicConfig(
+        handlers=[_create_log_handler(user_dir / "desktop.log")],
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+    instance = _SingleInstance()
+    if not instance.acquire():
+        if not _focus_existing_window():
+            _logger.warning("No se pudo traer a primer plano la ventana de kellyClipAi.")
+            _show_error(
+                "kellyClipAi ya se está ejecutando. No se pudo traer su ventana al frente; "
+                "busca la aplicación abierta en la barra de tareas."
+            )
+        return
+    try:
+        _run_app(user_dir, smoke_test)
+    finally:
+        instance.close()
+
+
 if __name__ == "__main__":
     try:
         main(smoke_test=os.getenv("KELLYCLIP_SMOKE_TEST") == "1")
     except Exception as error:
-        logging.exception("No se pudo iniciar kellyClipAi")
+        _logger.exception("No se pudo iniciar kellyClipAi")
         try:
             _show_error(
                 f"No se pudo iniciar kellyClipAi.\n\n{error}\n\n"
                 "Si falta WebView2, conéctate a internet y vuelve a ejecutar el instalador. "
                 "Registro: %LOCALAPPDATA%\\kellyClipAi\\desktop.log"
             )
-        except Exception:
+        except (OSError, AttributeError, ctypes.ArgumentError):
             print(f"No se pudo iniciar kellyClipAi: {error}", file=sys.stderr)
         raise

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import html
 import json
+import os
 import re
 import subprocess
 import textwrap
+import threading
+from collections.abc import Callable
+from itertools import pairwise
 from pathlib import Path
-from typing import Callable
+from typing import Any
 
 from .face_tracking import (
     FaceCropKeyframe,
@@ -36,10 +41,19 @@ _CENSORED_WORDS = {
     "shit",
     "verga",
 }
+_FFMPEG_RENDER_TIMEOUT_SECONDS = 600
+_WHISPER_PIPELINE_LOCK = threading.Lock()
+_WHISPER_PIPELINE_CACHE: tuple[str, Any] | None = None
 
 
 class MediaProcessingError(RuntimeError):
     pass
+
+
+def _subprocess_options() -> dict[str, int]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
 
 
 def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
@@ -52,6 +66,7 @@ def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]
             encoding="utf-8",
             errors="replace",
             timeout=180,
+            **_subprocess_options(),
         )
     except FileNotFoundError as error:
         raise MediaProcessingError(
@@ -134,16 +149,21 @@ def transcribe(
     input_path: Path,
     model_name: str,
     on_progress: ProgressCallback,
+    language: str = "auto",
+    on_model_download_progress: ProgressCallback | None = None,
 ) -> tuple[list[TranscriptSegment], str]:
     try:
-        from faster_whisper import WhisperModel
-
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(
+        pipeline = _get_whisper_pipeline(
+            model_name, on_model_download_progress
+        )
+        segments, info = pipeline.transcribe(
             str(input_path),
+            language=None if language == "auto" else language,
             word_timestamps=True,
+            without_timestamps=False,
             vad_filter=True,
             beam_size=5,
+            batch_size=4,
         )
         transcript: list[TranscriptSegment] = []
         last_percent = -1
@@ -180,6 +200,69 @@ def transcribe(
         raise
     except Exception as error:
         raise MediaProcessingError(f"Falló la transcripción con faster-whisper: {error}") from error
+
+
+def _download_whisper_model(
+    model_name: str,
+    on_progress: ProgressCallback | None,
+) -> str:
+    from huggingface_hub import snapshot_download
+    from tqdm import tqdm
+
+    if on_progress is not None:
+        on_progress(0)
+
+    class ModelDownloadProgress(tqdm):
+        def update(self, n: int = 1) -> bool:
+            updated = super().update(n)
+            if self.total and on_progress is not None:
+                percent = min(95.0, self.n / self.total * 95)
+                on_progress(percent)
+            return updated
+
+    return str(
+        snapshot_download(
+            repo_id=f"Systran/faster-whisper-{model_name}",
+            allow_patterns=[
+                "config.json",
+                "preprocessor_config.json",
+                "model.bin",
+                "tokenizer.json",
+                "vocabulary.*",
+            ],
+            max_workers=1,
+            tqdm_class=ModelDownloadProgress,
+        )
+    )
+
+
+def _get_whisper_pipeline(
+    model_name: str,
+    on_download_progress: ProgressCallback | None,
+) -> Any:
+    global _WHISPER_PIPELINE_CACHE
+    with _WHISPER_PIPELINE_LOCK:
+        if (
+            _WHISPER_PIPELINE_CACHE is not None
+            and _WHISPER_PIPELINE_CACHE[0] == model_name
+        ):
+            return _WHISPER_PIPELINE_CACHE[1]
+
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
+
+        _WHISPER_PIPELINE_CACHE = None
+        model_path = _download_whisper_model(model_name, on_download_progress)
+        model = WhisperModel(
+            model_path,
+            device="cpu",
+            compute_type="int8",
+            num_workers=2,
+        )
+        pipeline = BatchedInferencePipeline(model=model)
+        _WHISPER_PIPELINE_CACHE = (model_name, pipeline)
+        if on_download_progress is not None:
+            on_download_progress(100)
+        return pipeline
 
 
 def _silence_intervals(
@@ -413,8 +496,53 @@ def _caption_groups(
     return groups
 
 
+def _subtitle_timestamp(seconds: float, separator: str) -> str:
+    milliseconds = max(0, round(seconds * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return (
+        f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}"
+        f"{separator}{milliseconds:03d}"
+    )
+
+
+def format_subtitles(
+    words: list[dict[str, object]],
+    format_name: str,
+) -> str:
+    if format_name not in {"srt", "vtt"}:
+        raise ValueError("El formato debe ser SRT o WebVTT.")
+    separator = "," if format_name == "srt" else "."
+    entries: list[str] = []
+    for index, group in enumerate(_caption_groups(words), start=1):
+        start = float(group[0]["preview_start"])
+        end = max(start + 0.08, float(group[-1]["preview_end"]))
+        text = " ".join(str(word["text"]).strip() for word in group)
+        if format_name == "vtt":
+            text = html.escape(text, quote=False)
+        timing = (
+            f"{_subtitle_timestamp(start, separator)} --> "
+            f"{_subtitle_timestamp(end, separator)}"
+        )
+        entries.append(
+            f"{index}\n{timing}\n{text}"
+            if format_name == "srt"
+            else f"{timing}\n{text}"
+        )
+    prefix = "WEBVTT\n\n" if format_name == "vtt" else ""
+    return prefix + "\n\n".join(entries) + ("\n" if entries else "")
+
+
 def _caption_max_chars(width: int, font_size: int, margin: int = 48) -> int:
     return max(12, int((width - 2 * margin) / (font_size * 0.68)))
+
+
+def _ass_color(color: str | None) -> str | None:
+    if color is None:
+        return None
+    red, green, blue = color[1:3], color[3:5], color[5:7]
+    return f"&H00{blue}{green}{red}".upper()
 
 
 def _write_ass(
@@ -439,6 +567,16 @@ def _write_ass(
         "Neón": ("Arial Black", 60, "&H00FFFF66", "&H00FFFFFF", 4, 1, 2),
     }.get(config.subtitle_template, ("Arial", 58, "&H00FFFFFF", "&H0000FFFF", 3, 1, 2))
     font, size, primary, secondary, outline, shadow, alignment = style
+    overrides = config.subtitle_style
+    font = overrides.font_family or font
+    size = overrides.font_size or size
+    primary = _ass_color(overrides.font_color) or primary
+    secondary = _ass_color(overrides.highlight_color) or secondary
+    alignment = {
+        "top": 8,
+        "center": 5,
+        "bottom": 2,
+    }.get(overrides.position, alignment)
     size = round(size * scale)
     caption_max_chars = _caption_max_chars(width, size)
     header = f"""[Script Info]
@@ -466,8 +604,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for index, group in enumerate(groups):
         begin = float(group[0]["preview_start"])
         end = max(float(group[-1]["preview_end"]), begin + 0.08)
-        if end > clip_duration:
-            end = clip_duration
+        end = min(end, clip_duration)
         parts: list[str] = []
         for word in group:
             text = _ass_escape(str(word["text"]))
@@ -489,7 +626,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for keyword in proposal.palabras_clave
                 if keyword
             ):
-                parts.append(r"{\c&H0000FFFF&}" + text + r"{\c&H00FFFFFF&}")
+                parts.append(
+                    "{\\c"
+                    + secondary
+                    + "&}"
+                    + text
+                    + "{\\c"
+                    + primary
+                    + "&}"
+                )
             else:
                 parts.append(f"{{\\kf{word_duration}}}{text}")
         caption = " ".join(parts)
@@ -507,13 +652,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return censor_ranges
 
 
-def _filter_path(path: Path) -> str:
-    value = path.resolve().as_posix().replace(":", r"\:")
-    return value.replace("'", r"\'")
-
-
 def _filter_time(value: float) -> str:
     return f"{max(0.0, value):.3f}"
+
+
+def _broll_cut_ranges(duration: float) -> list[tuple[float, float]]:
+    if duration <= 0:
+        return []
+    cut_duration = min(4.0, max(1.0, duration * 0.2))
+    if duration <= 8:
+        start = (duration - cut_duration) / 2
+        return [(start, start + cut_duration)]
+    ranges: list[tuple[float, float]] = []
+    start = 4.0
+    while start + cut_duration <= duration:
+        ranges.append((start, start + cut_duration))
+        start += 12.0
+    if not ranges:
+        start = (duration - cut_duration) / 2
+        ranges.append((start, start + cut_duration))
+    return ranges
 
 
 def _crop_coordinate_expression(
@@ -526,7 +684,7 @@ def _crop_coordinate_expression(
         raise ValueError(f"Coordenada de recorte no válida: {coordinate}.")
 
     expression = f"{getattr(points[-1], coordinate):.3f}"
-    for current, following in reversed(list(zip(points, points[1:], strict=False))):
+    for current, following in reversed(list(pairwise(points))):
         duration = following.time - current.time
         if duration <= 0:
             continue
@@ -552,25 +710,69 @@ def _build_filter(
     enhance_audio: bool = False,
     include_broll: bool = False,
     crop_paths: list[list[FaceCropKeyframe] | None] | None = None,
+    framing: str = "speaker",
 ) -> tuple[str, str, str]:
     parts: list[str] = []
     video_labels: list[str] = []
     audio_labels: list[str] = []
     for index, (start, end) in enumerate(intervals):
         video_label, audio_label = f"v{index}", f"a{index}"
-        crop_path = crop_paths[index] if crop_paths else None
-        crop_filter = (
-            f"crop={width}:{height}:"
-            f"x='{_crop_coordinate_expression(crop_path, 'x')}':"
-            f"y='{_crop_coordinate_expression(crop_path, 'y')}'"
-            if crop_path
-            else f"crop={width}:{height}"
-        )
-        parts.append(
-            f"[0:v]trim=start={_filter_time(start)}:end={_filter_time(end)},"
-            f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"{crop_filter},setsar=1[{video_label}]"
-        )
+        if framing == "split":
+            top_source, bottom_source = f"split_top_src{index}", f"split_bottom_src{index}"
+            top_label, bottom_label = f"split_top{index}", f"split_bottom{index}"
+            pane_height = height // 2
+            parts.append(f"[0:v]split=2[{top_source}][{bottom_source}]")
+            for source, label, horizontal_crop in (
+                (top_source, top_label, "0"),
+                (bottom_source, bottom_label, "iw-ow"),
+            ):
+                parts.append(
+                    f"[{source}]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                    f"setpts=PTS-STARTPTS,scale={width}:{pane_height}:"
+                    "force_original_aspect_ratio=increase,"
+                    f"crop={width}:{pane_height}:x='{horizontal_crop}':y='(ih-oh)/2'"
+                    f"[{label}]"
+                )
+            parts.append(
+                f"[{top_label}][{bottom_label}]vstack=inputs=2[{video_label}]"
+            )
+        elif framing == "blur":
+            background_source, foreground_source = (
+                f"blur_bg_src{index}",
+                f"blur_fg_src{index}",
+            )
+            background_label, foreground_label = f"blur_bg{index}", f"blur_fg{index}"
+            parts.append(f"[0:v]split=2[{background_source}][{foreground_source}]")
+            parts.append(
+                f"[{background_source}]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                f"setpts=PTS-STARTPTS,scale={width}:{height}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},boxblur=20:10[{background_label}]"
+            )
+            parts.append(
+                f"[{foreground_source}]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                f"setpts=PTS-STARTPTS,scale={round(width * 0.8)}:{round(height * 0.8)}:"
+                "force_original_aspect_ratio=decrease,format=rgba,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+                f"setsar=1[{foreground_label}]"
+            )
+            parts.append(
+                f"[{background_label}][{foreground_label}]overlay=shortest=1[{video_label}]"
+            )
+        else:
+            crop_path = crop_paths[index] if crop_paths else None
+            crop_filter = (
+                f"crop={width}:{height}:"
+                f"x='{_crop_coordinate_expression(crop_path, 'x')}':"
+                f"y='{_crop_coordinate_expression(crop_path, 'y')}'"
+                if crop_path and framing == "speaker"
+                else f"crop={width}:{height}"
+            )
+            parts.append(
+                f"[0:v]trim=start={_filter_time(start)}:end={_filter_time(end)},"
+                f"setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"{crop_filter},setsar=1[{video_label}]"
+            )
         parts.append(
             f"[0:a]atrim=start={_filter_time(start)}:end={_filter_time(end)},"
             f"asetpts=PTS-STARTPTS[{audio_label}]"
@@ -589,20 +791,27 @@ def _build_filter(
             + f"concat=n={len(intervals)}:v=1:a=1[vcat][acat]"
         )
         video_input, audio_input = "[vcat]", "[acat]"
-    parts.append(f"{video_input}subtitles=filename='{_filter_path(subtitle_path)}'[vout]")
-    video_output = "[vout]"
     if include_broll:
-        broll_width = max(160, width // 3)
-        broll_height = max(90, (round(broll_width * 9 / 16) // 2) * 2)
-        parts.append(
-            f"[1:v]scale={broll_width}:{broll_height}:force_original_aspect_ratio=decrease,"
-            f"pad={broll_width}:{broll_height}:(ow-iw)/2:(oh-ih)/2,"
-            f"trim=duration={_filter_time(clip_duration)},setpts=PTS-STARTPTS,setsar=1[broll]"
-        )
-        parts.append(
-            f"[vout][broll]overlay=x=W-w-24:y=24:eof_action=repeat:shortest=0[vbroll]"
-        )
-        video_output = "[vbroll]"
+        cut_ranges = _broll_cut_ranges(clip_duration)
+        if cut_ranges:
+            enable = "+".join(
+                f"between(t,{_filter_time(start)},{_filter_time(end)})"
+                for start, end in cut_ranges
+            )
+            parts.append(
+                f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},trim=duration={_filter_time(clip_duration)},"
+                "setpts=PTS-STARTPTS,setsar=1[broll]"
+            )
+            parts.append(
+                f"{video_input}[broll]overlay=shortest=0:eof_action=repeat:"
+                f"enable='{enable}'[brollbase]"
+            )
+            video_input = "[brollbase]"
+    parts.append(
+        f"{video_input}subtitles=filename='{subtitle_path.name}'[vout]"
+    )
+    video_output = "[vout]"
     if censor_ranges:
         enable = "+".join(
             f"between(t,{_filter_time(start)},{_filter_time(end)})"
@@ -641,6 +850,7 @@ def _render_clip(
     output_resolution: int = 720,
     enhance_audio: bool = False,
     broll_path: Path | None = None,
+    on_analysis_progress: ProgressCallback | None = None,
 ) -> tuple[float, list[dict[str, object]]]:
     source_duration = proposal.fin - proposal.inicio
     intervals = _retained_intervals(input_path, proposal, config.options.silence, ffmpeg_path)
@@ -663,14 +873,22 @@ def _render_clip(
     )
     width, height = _ratio_size(config.ratio, output_resolution)
     crop_paths = None
-    if config.options.face_tracking:
+    if config.options.face_tracking and config.framing == "speaker":
         try:
+            speech_intervals = [
+                (word.start, word.end)
+                for segment in transcript
+                for word in segment.words
+                if word.start < proposal.fin and word.end > proposal.inicio
+            ]
             crop_paths = analyze_face_crop_paths(
                 input_path,
                 proposal.inicio,
                 intervals,
                 width,
                 height,
+                speech_intervals=speech_intervals,
+                on_progress=on_analysis_progress,
             )
         except FaceTrackingError as error:
             raise MediaProcessingError(str(error)) from error
@@ -684,6 +902,7 @@ def _render_clip(
         enhance_audio,
         broll_path is not None,
         crop_paths,
+        config.framing,
     )
     arguments = [
         ffmpeg_path,
@@ -693,12 +912,12 @@ def _render_clip(
         "-ss",
         f"{proposal.inicio:.3f}",
         "-i",
-        str(input_path),
+        str(input_path.resolve()),
     ]
     if broll_path is not None:
         if not broll_path.is_file():
             raise MediaProcessingError("No se encontró el archivo de B-roll descargado.")
-        arguments.extend(["-stream_loop", "-1", "-i", str(broll_path)])
+        arguments.extend(["-stream_loop", "-1", "-i", str(broll_path.resolve())])
     arguments.extend([
         "-t",
         f"{source_duration:.3f}",
@@ -724,8 +943,11 @@ def _render_clip(
         "pipe:1",
         "-nostats",
         "-y",
-        str(output_path),
+        str(output_path.resolve()),
     ])
+    process: subprocess.Popen[str] | None = None
+    timer: threading.Timer | None = None
+    timed_out = threading.Event()
     try:
         process = subprocess.Popen(
             arguments,
@@ -734,10 +956,23 @@ def _render_clip(
             text=True,
             encoding="utf-8",
             errors="replace",
+            cwd=subtitle_path.resolve().parent,
+            **_subprocess_options(),
         )
-        last_lines: list[str] = []
         if process.stdout is None:
             raise MediaProcessingError("No se pudo leer el progreso de FFmpeg.")
+
+        def terminate_on_timeout() -> None:
+            if process is not None and process.poll() is None:
+                timed_out.set()
+                process.kill()
+
+        timer = threading.Timer(
+            _FFMPEG_RENDER_TIMEOUT_SECONDS, terminate_on_timeout
+        )
+        timer.daemon = True
+        timer.start()
+        last_lines: list[str] = []
         for line in process.stdout:
             stripped = line.strip()
             if stripped:
@@ -749,9 +984,22 @@ def _render_clip(
                     on_progress(min(100.0, max(0.0, processed_seconds / render_duration * 100)))
                 except ValueError:
                     continue
-        return_code = process.wait(timeout=600)
+        return_code = process.wait()
+        if timed_out.is_set():
+            raise MediaProcessingError(
+                "FFmpeg superó el tiempo máximo de renderizado de 600 segundos."
+            )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise MediaProcessingError(f"FFmpeg no pudo exportar el clip: {error}") from error
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
     if return_code:
         raise MediaProcessingError(f"FFmpeg no pudo exportar el clip: {' '.join(last_lines[-6:])}")
     clip_transcript = words
@@ -772,6 +1020,7 @@ def render_clip(
     output_resolution: int = 720,
     enhance_audio: bool = False,
     broll_path: Path | None = None,
+    on_analysis_progress: ProgressCallback | None = None,
 ) -> tuple[float, list[dict[str, object]]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return _render_clip(
@@ -788,4 +1037,5 @@ def render_clip(
         output_resolution,
         enhance_audio,
         broll_path,
+        on_analysis_progress,
     )

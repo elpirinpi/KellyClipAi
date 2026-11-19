@@ -193,6 +193,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .option-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .option-title { display: block; color: #3c4659; font-size: 12px; line-height: 16px; font-weight: 500; }
 .option-description { color: #838b9c; font-size: 10px; line-height: 14px; }
+.subtitle-style-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 15px; }
+.subtitle-style-grid .text-input { margin-top: 0; }
+.editor-settings .subtitle-style-grid { grid-template-columns: 1fr; margin-top: 0; }
+.subtitle-color-control { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; color: #3c4659; font-size: 13px; font-weight: 500; }
+.subtitle-color-control label { grid-column: 1 / -1; }
+.subtitle-color-control input[type="color"] { width: 44px; height: 36px; padding: 3px; border: 1px solid #e5e7ee; border-radius: 8px; background: #fff; cursor: pointer; }
+.subtitle-color-control button { border: 0; background: transparent; color: #6546d0; font-size: 11px; cursor: pointer; }
 .moment-card .text-input, .text-input { width: 100%; min-height: 44px; margin-top: 14px; padding: 0 12px; border: 1px solid #e5e7ee; border-radius: 8px; color: #3c4659; outline: none; background: #fff; font-size: 13px; }
 .text-input::placeholder { color: #a0a6b3; }
 .optional-chip { flex: 0 0 auto; margin-top: 1px; padding: 5px 9px; border-radius: 20px; color: #7c8493; background: #f3f4f7; font-size: 10px; }
@@ -262,6 +269,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .scheduled-job strong { overflow: hidden; color: #3c4659; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 500; text-transform: capitalize; }
 .scheduled-job small, .scheduled-job p { margin: 0; color: #838b9c; font-size: 10px; }
 .scheduled-job p { grid-column: 1 / -1; line-height: 1.5; }
+.overdue-job-actions { grid-column: 1 / -1; display: flex !important; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.overdue-job-actions p { flex-basis: 100%; }
 .job-status { color: #6e788e; font-size: 10px; }
 .job-status.published { color: #188345; }
 .job-status.failed { color: #a23c31; }
@@ -389,11 +398,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .results-toolbar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .results-toolbar-actions button, .clip-action { min-height: 35px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 0 11px; border: 1px solid #e5e7ee; border-radius: 8px; background: #fff; color: #4a5365; text-decoration: none; font-size: 11px; white-space: nowrap; cursor: pointer; }
 .results-toolbar-actions button:first-of-type, .clip-action.primary { border-color: #e7e1fb; background: #e7e1fb; color: #6844e9; }
+.results-toolbar-actions .delete-project-button { border-color: #fecaca; color: #b42318; }
 .publish-select select { height: 35px; padding: 0 8px; border: 1px solid #e5e7ee; border-radius: 8px; background: #fff; color: #4a5365; font-size: 10px; }
 .clips-heading { min-height: 52px; display: flex; align-items: center; gap: 12px; }
 .clips-heading > div { display: flex; align-items: center; gap: 8px; color: #3c4659; font-size: 12px; }
 .clips-version { padding: 3px 5px; border: 1px solid #dfe1e8; border-radius: 5px; color: #6e788e; font-size: 9px; }
 .clips-count { margin-left: auto; color: #6e788e; font-size: 12px; }
+.storage-usage { color: #7b8496; font-size: 10px; white-space: nowrap; }
 .sort-control { display: inline-flex; align-items: center; gap: 6px; color: #7b8496; font-size: 11px; }
 .sort-control select { max-width: 150px; height: 32px; border: 0; background: transparent; color: #3c4659; font-size: 11px; }
 .clip-list { display: flex; flex-direction: column; gap: 14px; }
@@ -401,6 +412,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .clip-select { display: inline-flex; align-items: flex-start; padding-top: 8px; }
 .clip-preview { position: relative; width: 100%; aspect-ratio: 9 / 16; overflow: hidden; border-radius: 10px; background: #171b25; }
 .clip-preview video { display: block; width: 100%; height: 100%; object-fit: contain; }
+.clip-render-failed { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #fca5a5; font-size: 12px; }
 .clip-quality, .clip-duration { position: absolute; z-index: 1; border: 0; border-radius: 6px; background: #151923d9; color: #fff; font-size: 11px; }
 .clip-quality { top: 8px; left: 8px; padding: 4px 7px; }
 .clip-duration { right: 8px; bottom: 38px; padding: 4px 7px; pointer-events: none; }
@@ -502,6 +514,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
   .template-save-controls input { width: 100%; }
   .clips-heading { flex-wrap: wrap; gap: 8px; padding: 10px 0; }
   .clips-count { margin-left: auto; }
+  .storage-usage { order: 4; width: 100%; }
   .sort-control { width: 100%; justify-content: flex-end; }
   .clip-card { grid-template-columns: 20px minmax(0, 1fr); }
   .clip-preview { grid-column: 2; width: min(240px, 100%); justify-self: center; }

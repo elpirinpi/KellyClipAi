@@ -33,8 +33,19 @@ Desde la carpeta del proyecto:
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.lock
 Copy-Item .env.example .env
+```
+
+`requirements.txt` contiene dependencias de ejecución; `requirements-dev.txt`
+añade pruebas y herramientas. Los archivos `requirements.lock`,
+`requirements-dev.lock` y `requirements-desktop.lock` fijan dependencias
+transitivas con hashes SHA-256. Para actualizarlos, activa `.venv` y ejecuta:
+
+```powershell
+.\.venv\Scripts\pip-compile.exe --generate-hashes --allow-unsafe --output-file=requirements.lock requirements.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --allow-unsafe --output-file=requirements-dev.lock requirements-dev.txt
+.\.venv\Scripts\pip-compile.exe --generate-hashes --allow-unsafe --output-file=requirements-desktop.lock requirements-desktop.txt
 ```
 
 El `.env.example` incluido ya configura el proyecto Supabase de kellyClipAi
@@ -55,6 +66,9 @@ no se guarda en Supabase ni se devuelve al navegador. No se puede descifrar al
 mover la base de datos a otro equipo o a otra cuenta de Windows.
 Al actualizar una instalación con datos anteriores, esos proyectos locales se
 asignan al primer usuario que inicie sesión en esa instalación.
+Los cambios de esquema de SQLite se aplican mediante migraciones numeradas en
+`PRAGMA user_version`; las bases creadas por versiones anteriores se actualizan
+al iniciar la aplicación.
 
 Instala el frontend con las versiones fijadas en `app/package-lock.json`:
 
@@ -76,11 +90,11 @@ videos ni se dejan servidores ejecutándose en segundo plano.
 
 ## Instalador de Windows
 
-Descarga `KellyClipAi-Setup-1.0.5.exe` desde **Assets** del release en GitHub e
+Descarga `KellyClipAi-Setup-1.0.9.exe` desde **Assets** del release en GitHub e
 inicia el instalador. Incluye la aplicación, FFmpeg/ffprobe y el bootstrapper
 oficial de Microsoft WebView2. El instalador requiere internet para instalar
-WebView2 si hace falta; el modelo Whisper `small` se descarga la primera vez
-que procesas un video. No incluye credenciales LLM ni de redes sociales:
+WebView2 si hace falta; el modelo Whisper seleccionado se descarga la primera
+vez que procesas un video. No incluye credenciales LLM ni de redes sociales:
 configúralas en Ajustes o en `%LOCALAPPDATA%\kellyClipAi\.env`.
 
 Los proyectos, archivos y base SQLite de la versión instalada se guardan en
@@ -89,9 +103,21 @@ la aplicación con progreso real y quedan recuperables al reiniciar. Las
 descargas por URL también muestran bytes, velocidad y ETA informados por
 yt-dlp. La desinstalación no borra esos archivos.
 Al generar clips, el recorte puede seguir el rostro principal con YuNet en
-CPU; desactívalo en **Opciones de edición** para volver al encuadre centrado.
-El modelo se incluye localmente en la aplicación y el análisis no sube
-fotogramas ni detecciones a servicios externos.
+CPU. El encuadre **Seguir al orador** estima el movimiento labial con MediaPipe
+durante los segmentos de voz detectados; si no hay una señal fiable, vuelve al
+rostro dominante. También puedes elegir pantalla dividida, fondo desenfocado o
+encuadre centrado. Los modelos se incluyen localmente y ningún fotograma,
+detección ni cálculo de labios se envía a servicios externos.
+Las transcripciones de más de 15 minutos se analizan en ventanas de 15 minutos
+con 3 minutos de solape; los tiempos de cada clip se restauran a la línea
+temporal original y las propuestas duplicadas o solapadas se descartan.
+Whisper reutiliza en memoria el último modelo seleccionado y procesa con
+inferencia por lotes en CPU, conservando timestamps por palabra. El idioma se
+detecta automáticamente o se fija por proyecto; la primera descarga muestra
+progreso real y se almacena en la caché local de Hugging Face.
+Los B-rolls se insertan como cortes a pantalla completa con el audio original.
+En resultados puedes descargar subtítulos SRT o WebVTT; la fuente, tamaño,
+colores y posición se pueden ajustar en la configuración y en el editor.
 FFmpeg 9.0.2 Essentials es un ejecutable separado con licencia GPLv3; el
 instalador incluye `licenses\GPL-3.0.txt` y `THIRD_PARTY_NOTICES.md`.
 

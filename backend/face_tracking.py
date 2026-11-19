@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class FaceTrackingError(RuntimeError):
@@ -33,11 +36,137 @@ class _Face:
         return self.width * self.height
 
 
-_SAMPLE_RATE = 2.0
+@dataclass
+class _LipTrack:
+    face: _Face
+    aperture: float
+    score: float
+    timestamp: float
+
+
+class _SpeakerActivityTracker:
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.tracks: list[_LipTrack] = []
+
+    def reset(self) -> None:
+        self.tracks.clear()
+
+    def update(
+        self,
+        measurements: list[tuple[_Face, float]],
+        timestamp: float,
+        speech_active: bool,
+    ) -> _Face | None:
+        current: list[_LipTrack] = []
+        for face, aperture in measurements:
+            previous = min(
+                (
+                    track
+                    for track in self.tracks
+                    if timestamp - track.timestamp <= 1.0
+                ),
+                key=lambda track: math.hypot(
+                    (track.face.center[0] - face.center[0]) / self.width,
+                    (track.face.center[1] - face.center[1]) / self.height,
+                ),
+                default=None,
+            )
+            if previous is not None:
+                distance = math.hypot(
+                    (previous.face.center[0] - face.center[0]) / self.width,
+                    (previous.face.center[1] - face.center[1]) / self.height,
+                )
+            else:
+                distance = float("inf")
+            elapsed = timestamp - previous.timestamp if previous else 0.0
+            score = (
+                previous.score * math.exp(-max(elapsed, 0.0) / 0.75)
+                if previous
+                else 0.0
+            )
+            if previous is not None and distance <= 0.2 and speech_active:
+                score += abs(aperture - previous.aperture)
+            current.append(_LipTrack(face, aperture, score, timestamp))
+        self.tracks = current
+        speaker = max(current, key=lambda track: track.score, default=None)
+        return speaker.face if speaker is not None and speaker.score >= 0.02 else None
+
+
+def _get_lip_landmarker() -> tuple[Any, Any]:
+    global _LIP_LANDMARKER
+    if _LIP_LANDMARKER is not None:
+        return _LIP_LANDMARKER
+    model_path = Path(__file__).with_name("models") / _LIP_MODEL_FILENAME
+    if not model_path.is_file():
+        raise FaceTrackingError(
+            "Falta el modelo de lectura labial incluido con la aplicación."
+        )
+    try:
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+    except ImportError as error:
+        raise FaceTrackingError(
+            "Falta MediaPipe para estimar al orador activo. Reinstala la aplicación."
+        ) from error
+    with _LIP_LANDMARKER_LOCK:
+        if _LIP_LANDMARKER is None:
+            options = vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+                running_mode=vision.RunningMode.IMAGE,
+                num_faces=5,
+            )
+            _LIP_LANDMARKER = (
+                mp,
+                vision.FaceLandmarker.create_from_options(options),
+            )
+        return _LIP_LANDMARKER
+
+
+def _lip_measurements(
+    landmarks_by_face: list[list[Any]],
+    faces: list[_Face],
+    width: int,
+    height: int,
+) -> list[tuple[_Face, float]]:
+    measurements: list[tuple[_Face, float]] = []
+    for landmarks in landmarks_by_face:
+        if len(landmarks) <= 291:
+            continue
+        xs = [float(landmark.x) * width for landmark in landmarks]
+        ys = [float(landmark.y) * height for landmark in landmarks]
+        landmark_face = _Face(
+            min(xs),
+            min(ys),
+            max(xs) - min(xs),
+            max(ys) - min(ys),
+            1.0,
+        )
+        matched_face = max(
+            faces,
+            key=lambda face: _intersection_over_union(face, landmark_face),
+            default=None,
+        )
+        if matched_face is None or _intersection_over_union(
+            matched_face, landmark_face
+        ) == 0:
+            continue
+        mouth_width = abs(xs[291] - xs[61])
+        aperture = abs(ys[14] - ys[13]) / max(mouth_width, 1.0)
+        measurements.append((matched_face, aperture))
+    return measurements
+
+
+_SAMPLE_RATE = 4.0
 _MAX_DETECTOR_DIMENSION = 1280
 _DROPOUT_HOLD_SECONDS = 1.5
 _MAX_KEYFRAMES = 48
 _MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+_LIP_MODEL_FILENAME = "face_landmarker.task"
+_LIP_LANDMARKER_LOCK = threading.Lock()
+_LIP_LANDMARKER: tuple[Any, Any] | None = None
 
 
 def _crop_geometry(
@@ -155,11 +284,12 @@ class _SubjectTracker:
         faces: list[_Face],
         timestamp: float,
         scene_changed: bool,
+        preferred_face: _Face | None = None,
     ) -> tuple[float, float] | None:
         if scene_changed:
             self.reset()
 
-        selected = self._select(faces, timestamp) if faces else None
+        selected = preferred_face or (self._select(faces, timestamp) if faces else None)
         if selected is not None:
             self.face = selected
             self.last_seen = timestamp
@@ -216,6 +346,8 @@ def analyze_face_crop_paths(
     intervals: list[tuple[float, float]],
     output_width: int,
     output_height: int,
+    speech_intervals: list[tuple[float, float]] | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> list[list[FaceCropKeyframe] | None]:
     model_path = Path(__file__).with_name("models") / _MODEL_FILENAME
     if not model_path.is_file():
@@ -238,10 +370,14 @@ def analyze_face_crop_paths(
         source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if source_width < 1 or source_height < 1:
             raise FaceTrackingError("No se pudieron leer las dimensiones del video.")
+        frame_rate = float(capture.get(cv2.CAP_PROP_FPS))
+        sequential_sampling = math.isfinite(frame_rate) and frame_rate > 0
         scale, max_x, max_y = _crop_geometry(
             source_width, source_height, output_width, output_height
         )
         if max_x < 1 and max_y < 1:
+            if on_progress is not None:
+                on_progress(100.0)
             return [None for _ in intervals]
 
         detector = cv2.FaceDetectorYN.create(
@@ -254,24 +390,57 @@ def analyze_face_crop_paths(
             cv2.dnn.DNN_BACKEND_OPENCV,
             cv2.dnn.DNN_TARGET_CPU,
         )
+        media_pipe = None
+        landmarker = None
         tracker = _SubjectTracker(
             source_width,
             source_height,
             output_width / scale,
         )
+        speaker_tracker = _SpeakerActivityTracker(source_width, source_height)
         previous_thumbnail = None
         any_face_detected = False
         all_paths: list[list[FaceCropKeyframe] | None] = []
+        total_samples = sum(
+            max(1, math.ceil((interval_end - interval_start) * _SAMPLE_RATE))
+            for interval_start, interval_end in intervals
+        )
+        if total_samples == 0:
+            if on_progress is not None:
+                on_progress(100.0)
+            return []
+        completed_samples = 0
+        if on_progress is not None:
+            on_progress(0.0)
 
         for interval_start, interval_end in intervals:
             interval_duration = interval_end - interval_start
             sample_count = max(1, math.ceil(interval_duration * _SAMPLE_RATE))
+            if sequential_sampling:
+                sequential_sampling = capture.set(
+                    cv2.CAP_PROP_POS_MSEC,
+                    (clip_start + interval_start) * 1000,
+                )
             points: list[FaceCropKeyframe] = []
+            previous_local_time: float | None = None
             for sample_index in range(sample_count):
                 local_time = interval_start + interval_duration * sample_index / sample_count
                 absolute_time = clip_start + local_time
-                capture.set(cv2.CAP_PROP_POS_MSEC, absolute_time * 1000)
+                if sequential_sampling:
+                    if previous_local_time is not None:
+                        frame_step = max(
+                            1,
+                            round((local_time - previous_local_time) * frame_rate),
+                        )
+                        for _ in range(frame_step - 1):
+                            if not capture.grab():
+                                raise FaceTrackingError(
+                                    f"No se pudo leer el video en el segundo {absolute_time:.2f}."
+                                )
+                else:
+                    capture.set(cv2.CAP_PROP_POS_MSEC, absolute_time * 1000)
                 ok, frame = capture.read()
+                previous_local_time = local_time
                 if not ok or frame is None:
                     raise FaceTrackingError(
                         f"No se pudo leer el video en el segundo {absolute_time:.2f}."
@@ -327,7 +496,46 @@ def analyze_face_crop_paths(
                     else []
                 )
                 any_face_detected |= bool(faces)
-                target = tracker.update(faces, absolute_time, scene_changed)
+                preferred_face = None
+                speech_active = any(
+                    start <= absolute_time <= end
+                    for start, end in speech_intervals or []
+                )
+                if scene_changed:
+                    speaker_tracker.reset()
+                measurements: list[tuple[_Face, float]] = []
+                if speech_active and faces and speech_intervals:
+                    if landmarker is None:
+                        media_pipe, landmarker = _get_lip_landmarker()
+                    if media_pipe is None:
+                        raise FaceTrackingError(
+                            "No se pudo inicializar el análisis del orador."
+                        )
+                    rgb_frame = cv2.cvtColor(detector_frame, cv2.COLOR_BGR2RGB)
+                    image = media_pipe.Image(
+                        image_format=media_pipe.ImageFormat.SRGB,
+                        data=rgb_frame,
+                    )
+                    with _LIP_LANDMARKER_LOCK:
+                        result = landmarker.detect(image)
+                    landmarks_by_face = result.face_landmarks or []
+                    measurements = _lip_measurements(
+                        landmarks_by_face,
+                        faces,
+                        frame_width,
+                        frame_height,
+                    )
+                preferred_face = speaker_tracker.update(
+                    measurements,
+                    absolute_time,
+                    speech_active,
+                )
+                target = tracker.update(
+                    faces,
+                    absolute_time,
+                    scene_changed,
+                    preferred_face=preferred_face,
+                )
                 if target is not None:
                     x, y = _crop_position(
                         target, source_width, source_height, output_width, output_height
@@ -343,6 +551,9 @@ def analyze_face_crop_paths(
                     points.append(
                         FaceCropKeyframe(point_time, x, y)
                     )
+                completed_samples += 1
+                if on_progress is not None:
+                    on_progress(100 * completed_samples / total_samples)
 
             if points:
                 if points[0].time > 0:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import backend.updater as updater_module
 from backend.updater import UpdateError, UpdateManager, _version_tuple
 from backend.main import create_app
 from backend.settings import AppSettings
+from backend.version import APP_VERSION
 
 
 def _release(version: str) -> dict:
@@ -124,6 +126,13 @@ def test_update_download_verifies_github_sha256_before_marking_ready(
 def test_version_parser_rejects_non_release_versions() -> None:
     with pytest.raises(UpdateError, match="versión no válida"):
         _version_tuple("main")
+
+
+def test_runtime_version_matches_frontend_release_version() -> None:
+    package_json = Path(__file__).resolve().parents[1] / "app" / "package.json"
+    package_version = json.loads(package_json.read_text(encoding="utf-8"))["version"]
+
+    assert APP_VERSION == package_version
 
 
 def test_updates_are_reported_unavailable_outside_the_installed_app(

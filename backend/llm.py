@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
-from .schemas import ClipProposal, LLMConfig, ProjectConfig, TranscriptSegment
+from .schemas import LLMConfig, ProjectConfig, TranscriptSegment
 from .settings import AppSettings
 
 _DEFAULT_MODELS = {
-    "Groq": "llama-3.3-70b-versatile",
+    "Groq": "qwen/qwen3.8-27b",
     "OpenAI": "gpt-4o-mini",
     "Anthropic": "claude-3-7-sonnet-latest",
     "OpenRouter": "openai/gpt-4o-mini",
@@ -25,21 +26,14 @@ _BASE_URLS = {
     "OpenRouter": "https://openrouter.ai/api/v1",
 }
 
-# Duración máxima (segundos) de cada fragmento de transcripción enviado al LLM.
-# Un video de 5 minutos funciona bien en una sola llamada; fragmentar en bloques
-# de 4 minutos mantiene cada petición muy por debajo de los límites de Groq
-# (tokens por minuto y tamaño de la petición), que es lo que fallaba con
-# videos largos (p. ej. 24 minutos) al enviar la transcripción completa.
-_CHUNK_MAX_SECONDS = 240.0
-# Reintentos ante errores transitorios del proveedor (429 por límite de
-# tokens/minuto y errores 5xx).
-_MAX_RETRIES = 3
-# Tokens máximos de respuesta para acotar el JSON de clips.
-_MAX_RESPONSE_TOKENS = 4000
-
 
 class LLMConfigurationError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
+_GROQ_KEY_PATTERN = re.compile(r"\bgsk_[A-Za-z0-9_-]+\b", re.IGNORECASE)
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+\S+")
 
 
 @dataclass(frozen=True)
@@ -48,6 +42,33 @@ class ResolvedLLM:
     api_key: str
     model: str
     base_url: str
+
+
+def _groq_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return ""
+
+    error = payload["error"]
+    details: list[str] = []
+    code = error.get("code")
+    if isinstance(code, (str, int)) and not isinstance(code, bool):
+        safe_code = re.sub(r"[\x00-\x1f\x7f]+", " ", str(code)).strip()
+        safe_code = _GROQ_KEY_PATTERN.sub("gsk_[redacted]", safe_code)
+        safe_code = _BEARER_PATTERN.sub("Bearer [redacted]", safe_code)
+        if safe_code:
+            details.append(safe_code[:80])
+    message = error.get("message")
+    if isinstance(message, str):
+        safe_message = re.sub(r"[\x00-\x1f\x7f]+", " ", message).strip()
+        safe_message = _GROQ_KEY_PATTERN.sub("gsk_[redacted]", safe_message)
+        safe_message = _BEARER_PATTERN.sub("Bearer [redacted]", safe_message)
+        if safe_message:
+            details.append(safe_message[:240])
+    return " — ".join(details)[:320]
 
 
 def resolve_llm(request: LLMConfig | None, settings: AppSettings) -> ResolvedLLM:
@@ -77,39 +98,10 @@ def resolve_llm(request: LLMConfig | None, settings: AppSettings) -> ResolvedLLM
     return ResolvedLLM(provider, api_key.strip(), model.strip(), base_url)
 
 
-def _chunk_transcript(
-    transcript: list[TranscriptSegment],
-    max_seconds: float = _CHUNK_MAX_SECONDS,
-) -> list[list[TranscriptSegment]]:
-    """Divide la transcripción en fragmentos de hasta `max_seconds` segundos.
-
-    Los cortes se hacen entre segmentos, nunca a mitad de uno, para que cada
-    fragmento conserve oraciones completas. Una transcripción corta produce
-    un solo fragmento (comportamiento idéntico al anterior).
-    """
-    if not transcript:
-        return []
-    chunks: list[list[TranscriptSegment]] = []
-    current: list[TranscriptSegment] = []
-    chunk_start = transcript[0].start
-    for segment in transcript:
-        if current and segment.end - chunk_start > max_seconds:
-            chunks.append(current)
-            current = [segment]
-            chunk_start = segment.start
-        else:
-            current.append(segment)
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 def _prompt(
     transcript: list[TranscriptSegment],
     project: ProjectConfig,
     duration: float,
-    chunk_start: float | None = None,
-    chunk_end: float | None = None,
 ) -> tuple[str, str]:
     timed_segments = [
         f"[{segment.start:.1f}] {segment.text}"
@@ -139,24 +131,21 @@ def _prompt(
         "Cada clip debe conservar una idea completa: no cortes una oración, una respuesta ni una explicación a la mitad. "
         "Incluye el final de la última frase hablada y un breve margen de audio. Evita clips artificialmente cortos; "
         "prefiere un momento desarrollado y coherente en vez de un fragmento de pocas palabras. "
-        "Responde únicamente con un JSON válido que sea un array de objetos con las claves "
-        "inicio, fin, titulo, puntuacion (0-10), razon_viral, palabras_clave (array) y emojis (array). "
+        "Para cada clip escribe descripcion, un texto público independiente de la razón interna, y hashtags "
+        "pertinentes en listas separadas para youtube, tiktok e instagram. "
+        "Responde únicamente con un objeto JSON con una única clave \"clips\", cuyo valor sea un array "
+        "de objetos con las claves "
+        "inicio, fin, titulo, puntuacion (0-10), razon_viral, descripcion, hashtags, palabras_clave (array) "
+        "y emojis (array). "
         "Usa el idioma de la transcripción para títulos y razones. Si no hay momentos que cumplan los criterios, "
-        "devuelve []."
+        "devuelve {\"clips\":[]}."
     )
-    chunk_note = ""
-    if chunk_start is not None and chunk_end is not None:
-        chunk_note = (
-            f"Analiza únicamente el fragmento entre {chunk_start:.1f} y {chunk_end:.1f} segundos "
-            "de la transcripción. Todos los inicios y fines deben estar dentro de ese rango. "
-        )
     user = (
         f"Duración del video: {duration:.3f} segundos. Ratio solicitado: {project.ratio}. "
         f"{range_instruction} Plantilla de subtítulos: {project.subtitle_template}. "
         f"Opciones: emojis={project.options.emojis}, resaltar_palabras={project.options.keywords}, "
         f"eliminar_silencios={project.options.silence}, auto_censura={project.options.censor}. "
         f"Momento solicitado por el usuario: {project.moment.strip() or 'ninguno'}. "
-        f"{chunk_note}"
         "Puntúa la fuerza del gancho, claridad, emoción y posibilidad de compartir usando únicamente lo que dice "
         "la transcripción.\n"
         f"Transcripción por segmento (tiempos de inicio en segundos):\n{transcript_text}"
@@ -175,148 +164,50 @@ def _extract_json(content: str) -> Any:
     return json.loads(text[start : end + 1])
 
 
-def _request_with_retry(
+def _post_with_retry(
     client: httpx.Client,
+    provider: str,
     url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
+    **kwargs: Any,
 ) -> httpx.Response:
-    """POST con reintentos ante 429 (límite de tokens/minuto) y errores 5xx.
-
-    Respeta el encabezado Retry-After cuando el proveedor lo envía; en caso
-    contrario usa retroceso exponencial (2s, 4s, 8s). Los errores finales
-    incluyen el mensaje del proveedor para facilitar el diagnóstico.
-    """
-    for attempt in range(_MAX_RETRIES + 1):
-        response = client.post(url, headers=headers, json=payload)
-        if response.status_code < 400:
-            return response
-        if response.status_code == 429 or response.status_code >= 500:
-            if attempt < _MAX_RETRIES:
-                retry_after = response.headers.get("retry-after")
-                try:
-                    delay = float(retry_after) if retry_after else 2.0 * (2 ** attempt)
-                except ValueError:
-                    delay = 2.0 * (2 ** attempt)
-                time.sleep(min(delay, 60.0))
-                continue
-        detail = ""
+    for attempt in range(3):
         try:
-            body = response.json()
-            error = body.get("error", {})
-            detail = error.get("message", "") if isinstance(error, dict) else str(error)
-        except ValueError:
-            detail = response.text[:500]
-        raise httpx.HTTPStatusError(
-            f"El proveedor LLM devolvió {response.status_code}: {detail or response.text[:200]}",
-            request=response.request,
-            response=response,
-        )
-    raise RuntimeError("No se pudo completar la petición al proveedor LLM.")
-
-
-def _propose_for_chunk(
-    transcript: list[TranscriptSegment],
-    project: ProjectConfig,
-    duration: float,
-    llm: ResolvedLLM,
-    client: httpx.Client,
-    single_chunk: bool = False,
-) -> list[ClipProposal]:
-    """Una llamada al LLM para un fragmento de transcripción.
-
-    Con `single_chunk=True` el prompt es idéntico al de antes (sin nota de
-    rango), para que los videos cortos se comporten exactamente igual.
-    """
-    if single_chunk:
-        system, user = _prompt(transcript, project, duration)
-    else:
-        chunk_start = transcript[0].start if transcript else None
-        chunk_end = transcript[-1].end if transcript else None
-        system, user = _prompt(transcript, project, duration, chunk_start, chunk_end)
-    if llm.provider == "Anthropic":
-        response = _request_with_retry(
-            client,
-            f"{llm.base_url}/v1/messages",
-            headers={
-                "x-api-key": llm.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            payload={
-                "model": llm.model,
-                "max_tokens": 6000,
-                "system": system,
-                "messages": [{"role": "user", "content": user}],
-            },
-        )
-        blocks = response.json().get("content", [])
-        content = "\n".join(
-            block.get("text", "") for block in blocks if block.get("type") == "text"
-        )
-    else:
-        headers = {"Authorization": f"Bearer {llm.api_key}"}
-        response = _request_with_retry(
-            client,
-            f"{llm.base_url}/chat/completions",
-            headers=headers,
-            payload={
-                "model": llm.model,
-                "temperature": 0.2,
-                "max_tokens": _MAX_RESPONSE_TOKENS,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": user
-                        + '\nResponde con {"clips":[...]} o con un array JSON si tu API solo permite arrays.',
-                    },
-                ],
-            },
-        )
-        choices = response.json().get("choices", [])
-        if not choices:
-            raise ValueError("El proveedor LLM devolvió una respuesta vacía.")
-        content = choices[0].get("message", {}).get("content", "")
-        if isinstance(content, list):
-            content = "\n".join(
-                part.get("text", "") for part in content if isinstance(part, dict)
+            response = client.post(url, **kwargs)
+        except httpx.RequestError as error:
+            logger.exception("No se pudo contactar al proveedor LLM %s", provider)
+            raise LLMConfigurationError(
+                "No se pudo conectar con el proveedor de IA. Revisa la conexión y la URL configurada."
+            ) from error
+        if (
+            response.status_code == 429 or response.status_code >= 500
+        ) and attempt < 2:
+            time.sleep(0.5 * (2**attempt))
+            continue
+        if response.status_code == 401:
+            raise LLMConfigurationError(
+                f"La clave API de {provider} no es válida. Revisa las credenciales guardadas."
             )
-    parsed = _extract_json(content)
-    if isinstance(parsed, dict):
-        parsed = parsed.get("clips")
-    if not isinstance(parsed, list):
-        raise ValueError("La respuesta LLM no contiene una lista de clips.")
-    return [ClipProposal.model_validate(item) for item in parsed]
-
-
-def _merge_proposals(
-    proposals: list[ClipProposal],
-    limit: int = 10,
-) -> list[ClipProposal]:
-    """Une propuestas de varios fragmentos: mejor puntuación primero, sin solapes.
-
-    Si dos clips se solapan más del 50% del más corto, conserva el de mayor
-    puntuación. Devuelve hasta `limit` clips ordenados por inicio.
-    """
-    ranked = sorted(proposals, key=lambda clip: clip.puntuacion, reverse=True)
-    selected: list[ClipProposal] = []
-    for proposal in ranked:
-        overlaps = False
-        for kept in selected:
-            overlap_start = max(proposal.inicio, kept.inicio)
-            overlap_end = min(proposal.fin, kept.fin)
-            overlap = max(0.0, overlap_end - overlap_start)
-            shorter = min(proposal.fin - proposal.inicio, kept.fin - kept.inicio)
-            if shorter > 0 and overlap / shorter > 0.5:
-                overlaps = True
-                break
-        if not overlaps:
-            selected.append(proposal)
-        if len(selected) >= limit:
-            break
-    return sorted(selected, key=lambda clip: clip.inicio)
+        if response.status_code == 402:
+            raise LLMConfigurationError(
+                f"{provider} necesita que revises el crédito o la facturación de la cuenta."
+            )
+        if response.status_code == 429:
+            raise LLMConfigurationError(
+                f"{provider} alcanzó el límite de solicitudes. Espera un momento o revisa tu plan."
+            )
+        if response.status_code >= 500:
+            raise LLMConfigurationError(
+                f"{provider} no está disponible temporalmente (HTTP {response.status_code}). Inténtalo más tarde."
+            )
+        if response.is_error:
+            detail = _groq_error_detail(response) if provider == "Groq" else ""
+            detail_suffix = f" Detalle: {detail}" if detail else ""
+            raise LLMConfigurationError(
+                f"{provider} rechazó la solicitud (HTTP {response.status_code})."
+                f"{detail_suffix}"
+            )
+        return response
+    raise AssertionError("El ciclo de reintento del proveedor LLM terminó inesperadamente.")
 
 
 def propose_clips(
@@ -324,27 +215,77 @@ def propose_clips(
     project: ProjectConfig,
     duration: float,
     llm: ResolvedLLM,
-    on_progress: Callable[[int, int], None] | None = None,
-) -> list[ClipProposal]:
-    """Selecciona clips con el LLM, fragmentando transcripciones largas.
-
-    Las transcripciones de más de 4 minutos se dividen en fragmentos y cada
-    uno se analiza con una llamada independiente; las propuestas se unen por
-    puntuación, sin solapes, hasta un máximo de 10 clips. Las transcripciones
-    cortas usan una sola llamada, como antes. `on_progress` recibe
-    (fragmento_actual, total_fragmentos) antes de cada llamada.
-    """
-    chunks = _chunk_transcript(transcript)
+    validation_feedback: list[str] | None = None,
+) -> list[object]:
+    system, user = _prompt(transcript, project, duration)
+    if validation_feedback:
+        user += (
+            "\nLa respuesta anterior contenía propuestas inválidas. Corrige estos errores "
+            "y devuelve una lista revisada de clips:\n"
+            + "\n".join(f"- {error}" for error in validation_feedback)
+        )
     timeout = httpx.Timeout(150, connect=15)
-    all_proposals: list[ClipProposal] = []
-    single = len(chunks) <= 1
     with httpx.Client(timeout=timeout) as client:
-        for index, chunk in enumerate(chunks):
-            if on_progress is not None:
-                on_progress(index + 1, len(chunks))
-            all_proposals.extend(
-                _propose_for_chunk(chunk, project, duration, llm, client, single)
+        if llm.provider == "Anthropic":
+            response = _post_with_retry(
+                client,
+                llm.provider,
+                f"{llm.base_url}/v1/messages",
+                headers={
+                    "x-api-key": llm.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": llm.model,
+                    "max_tokens": 6000,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}],
+                },
             )
-    if single:
-        return all_proposals[:10]
-    return _merge_proposals(all_proposals)
+            blocks = response.json().get("content", [])
+            content = "\n".join(
+                block.get("text", "") for block in blocks if block.get("type") == "text"
+            )
+        else:
+            headers = {"Authorization": f"Bearer {llm.api_key}"}
+            request_payload: dict[str, Any] = {
+                "model": llm.model,
+                "temperature": 0.2,
+                "max_tokens": 4000,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {
+                        "role": "user",
+                        "content": user
+                        + '\nResponde únicamente con un objeto JSON con la clave "clips" y un array de propuestas. '
+                        'Si no hay propuestas, devuelve {"clips":[]}.',
+                    },
+                ],
+            }
+            if llm.provider == "Groq" and llm.model.casefold().startswith(
+                "openai/gpt-oss-"
+            ):
+                request_payload["reasoning_format"] = "hidden"
+            response = _post_with_retry(
+                client,
+                llm.provider,
+                f"{llm.base_url}/chat/completions",
+                headers=headers,
+                json=request_payload,
+            )
+            choices = response.json().get("choices", [])
+            if not choices:
+                raise ValueError("El proveedor LLM devolvió una respuesta vacía.")
+            content = choices[0].get("message", {}).get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+    parsed = _extract_json(content)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("clips")
+    if not isinstance(parsed, list):
+        raise TypeError("La respuesta LLM no contiene una lista de clips.")
+    return parsed[:10]

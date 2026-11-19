@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
@@ -34,6 +34,37 @@ _PROVIDER_SETTINGS = {
 
 class IntegrationError(RuntimeError):
     pass
+
+
+def _publication_caption(
+    clip: dict[str, Any],
+    platform: str,
+    *,
+    add_shorts: bool = False,
+    max_length: int,
+) -> str:
+    description = str(clip.get("description") or clip.get("title") or "").strip()
+    platform_hashtags = clip.get("hashtags")
+    values = (
+        platform_hashtags.get(platform, [])
+        if isinstance(platform_hashtags, dict)
+        else []
+    )
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    if isinstance(values, list):
+        for value in values:
+            tag = str(value).strip().lstrip("#")
+            if not tag or not all(character.isalnum() or character == "_" for character in tag):
+                continue
+            normalized = tag.casefold()
+            if normalized not in seen:
+                hashtags.append(f"#{tag}")
+                seen.add(normalized)
+    if add_shorts and "shorts" not in seen:
+        hashtags.append("#Shorts")
+    parts = [part for part in (description, " ".join(hashtags)) if part]
+    return "\n\n".join(parts)[:max_length]
 
 
 def _missing_credentials(provider: str, settings: AppSettings) -> list[str]:
@@ -84,11 +115,15 @@ def authorization_url(settings: AppSettings, provider: str, state: str) -> str:
     redirect_uri = _redirect_uri(settings, provider)
     values: dict[str, str]
     if provider == "youtube":
+        # channels.list?mine=true requires youtube.readonly; verify OAuth with a real account.
         values = {
             "client_id": settings.youtube_client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": "openid email https://www.googleapis.com/auth/youtube.upload",
+            "scope": (
+                "openid email https://www.googleapis.com/auth/youtube.upload "
+                "https://www.googleapis.com/auth/youtube.readonly"
+            ),
             "access_type": "offline",
             "prompt": "consent",
             "state": state,
@@ -160,7 +195,7 @@ def _expires_at(expires_in: object) -> str | None:
         return None
     if seconds <= 0:
         return None
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
 
 
 def complete_oauth(
@@ -543,7 +578,7 @@ def _access_token(
             expiry = datetime.fromisoformat(expires_at)
         except ValueError as error:
             raise IntegrationError(f"La fecha de sesión de {provider} no es válida; vuelve a conectar.") from error
-        if expiry <= datetime.now(timezone.utc) + timedelta(minutes=2):
+        if expiry <= datetime.now(UTC) + timedelta(minutes=2):
             account = _refresh_account(settings, provider, account, owner_id)
     return account["access_token"], account
 
@@ -592,11 +627,16 @@ def _publish_youtube(
                 json={
                     "snippet": {
                         "title": str(clip["title"])[:100],
-                        "description": str(clip.get("viral_reason") or "")[:4000],
+                        "description": _publication_caption(
+                            clip, "youtube", add_shorts=True, max_length=4000
+                        ),
                         "tags": [str(item)[:40] for item in clip.get("keywords") or []][:15],
                         "categoryId": "22",
                     },
-                    "status": {"privacyStatus": visibility},
+                    "status": {
+                        "privacyStatus": visibility,
+                        "selfDeclaredMadeForKids": False,
+                    },
                 },
             )
         except httpx.RequestError as error:
@@ -660,7 +700,9 @@ def _publish_tiktok(
             },
             json={
                 "post_info": {
-                    "title": str(clip["title"])[:2200],
+                    "title": _publication_caption(
+                        clip, "tiktok", max_length=2200
+                    ),
                     "privacy_level": privacy_level,
                     "disable_duet": False,
                     "disable_comment": False,
@@ -745,7 +787,9 @@ def _publish_instagram(
             data={
                 "media_type": "REELS",
                 "upload_type": "resumable",
-                "caption": str(clip["title"])[:2200],
+                "caption": _publication_caption(
+                    clip, "instagram", max_length=2200
+                ),
             },
         )
         container_id = _required_token(container, "id", "Instagram")
@@ -806,7 +850,7 @@ def list_zoom_recordings(
     owner_id: str = "legacy",
 ) -> list[dict[str, Any]]:
     token, _ = _access_token(settings, "zoom", owner_id)
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     start = today - timedelta(days=30)
     with httpx.Client(timeout=30, follow_redirects=True) as client:
         payload = _request_json(
@@ -995,16 +1039,20 @@ def download_broll(
     target_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
     try:
-        with httpx.Client(timeout=httpx.Timeout(30, read=300), follow_redirects=True) as client:
-            with client.stream("GET", download_url) as response:
-                if response.is_error:
-                    raise IntegrationError(f"{provider.title()} no pudo descargar el B-roll (HTTP {response.status_code}).")
-                with target_path.open("wb") as target:
-                    for chunk in response.iter_bytes(1024 * 1024):
-                        written += len(chunk)
-                        if written > 250 * 1024 * 1024:
-                            raise IntegrationError("El B-roll supera el límite local de 250 MB.")
-                        target.write(chunk)
+        with (
+            httpx.Client(
+                timeout=httpx.Timeout(30, read=300), follow_redirects=True
+            ) as client,
+            client.stream("GET", download_url) as response,
+        ):
+            if response.is_error:
+                raise IntegrationError(f"{provider.title()} no pudo descargar el B-roll (HTTP {response.status_code}).")
+            with target_path.open("wb") as target:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    written += len(chunk)
+                    if written > 250 * 1024 * 1024:
+                        raise IntegrationError("El B-roll supera el límite local de 250 MB.")
+                    target.write(chunk)
     except httpx.RequestError as error:
         target_path.unlink(missing_ok=True)
         raise IntegrationError(f"No se pudo descargar el B-roll desde {provider.title()}.") from error
