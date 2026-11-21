@@ -512,6 +512,9 @@ def _propose_valid_clips(
     input_path: Path | None = None,
     ffmpeg_path: str | None = None,
     on_event_download_progress: Callable[[float], None] | None = None,
+    on_profile: Callable[[str], None] | None = None,
+    on_semantic_download_progress: Callable[[float], None] | None = None,
+    on_diarization_download_progress: Callable[[float], None] | None = None,
 ) -> list[ClipProposal]:
     """Punto de entrada de propuestas: despacha según project.moment_engine.
 
@@ -529,6 +532,9 @@ def _propose_valid_clips(
             ffmpeg_path,
             should_cancel,
             on_event_download_progress=on_event_download_progress,
+            on_profile=on_profile,
+            on_semantic_download_progress=on_semantic_download_progress,
+            on_diarization_download_progress=on_diarization_download_progress,
         )
     if llm is None:
         raise LLMConfigurationError(
@@ -554,8 +560,11 @@ def _propose_valid_signals(
     should_cancel: Callable[[], bool] | None = None,
     *,
     on_event_download_progress: Callable[[float], None] | None = None,
+    on_profile: Callable[[str], None] | None = None,
+    on_semantic_download_progress: Callable[[float], None] | None = None,
+    on_diarization_download_progress: Callable[[float], None] | None = None,
 ) -> list[ClipProposal]:
-    """Propuestas del motor de señales (Fase A + Tier 1, v1.1.0).
+    """Propuestas del motor de señales (Fases A–D, v1.2.0).
 
     Importación perezosa de backend.moments: numpy solo se necesita aquí
     (en producción siempre está, vía mediapipe/opencv/faster-whisper); si
@@ -566,7 +575,11 @@ def _propose_valid_signals(
     Tier 1 (Fase B) es opcional y jamás rompe un proyecto: si el módulo
     de eventos no se puede importar, o si get_event_timeline devuelve
     None (sin runtime, sin modelo, sin red, sin audio), el motor sigue
-    con Tier 0. Solo la cancelación del usuario se propaga.
+    con Tier 0. Solo la cancelación del usuario se propaga. Lo mismo
+    vale para las señales visuales (Fase C, 0 MB, ffmpeg + YuNet), la
+    diarización (Fase C, ~33 MB bajo demanda) y la capa semántica
+    MiniLM (Fase D, ~23 MB bajo demanda): cualquier fallo deja el canal
+    apagado y el motor sigue con el resto.
     """
     if should_cancel is not None and should_cancel():
         raise ProjectCancelled()
@@ -578,9 +591,14 @@ def _propose_valid_signals(
             "instalado. Reinstala la aplicación."
         ) from error
     event_timeline = None
+    speaker_timeline = None
+    visual = None
+    semantic_module = None
+    semantic_ready = False
     if transcript:
-        # Sin frases no hay candidatos: no merece descargar el modelo
-        # (~15 MB) ni correr la inferencia para un resultado vacío.
+        # Sin frases no hay candidatos: no merece descargar modelos
+        # (~15 MB YAMNet, ~33 MB diarización, ~23 MB MiniLM) ni correr
+        # inferencias para un resultado vacío.
         try:
             from . import audio_events
         except ImportError:
@@ -596,15 +614,78 @@ def _propose_valid_signals(
                 )
             except audio_events.AudioEventsCancelled as error:
                 raise ProjectCancelled() from error
-    proposals = moments.detect_moments(
-        transcript,
-        project,
-        duration,
-        input_path=input_path,
-        ffmpeg_path=ffmpeg_path,
-        event_timeline=event_timeline,
-        should_cancel=should_cancel,
-    )
+        try:
+            from . import diarization
+        except ImportError:
+            diarization = None
+        if diarization is not None:
+            try:
+                speaker_timeline = diarization.get_speaker_timeline(
+                    input_path,
+                    duration,
+                    ffmpeg_path,
+                    on_progress=on_diarization_download_progress,
+                    should_cancel=should_cancel,
+                )
+            except diarization.DiarizationCancelled as error:
+                raise ProjectCancelled() from error
+        if input_path is not None and ffmpeg_path:
+            try:
+                from . import visual_signals
+
+                visual = visual_signals.extract_visual_timelines(
+                    input_path, ffmpeg_path, duration, should_cancel=should_cancel
+                )
+            except Exception as error:  # noqa: BLE001 - lo visual jamás rompe Tier 0
+                logger.warning(
+                    "La extracción de señales visuales falló (%s); "
+                    "el motor sigue sin el canal visual.",
+                    error,
+                )
+                visual = None
+        try:
+            from . import semantic as semantic_module
+        except ImportError:
+            semantic_module = None
+        if semantic_module is not None:
+            try:
+                semantic_module.ensure_minilm_model(
+                    on_progress=on_semantic_download_progress,
+                    should_cancel=should_cancel,
+                )
+                semantic_ready = True
+            except semantic_module.SemanticCancelled as error:
+                raise ProjectCancelled() from error
+            except Exception as error:  # noqa: BLE001 - sin MiniLM, solo TF-IDF
+                logger.warning(
+                    "La capa semántica MiniLM no está disponible (%s); "
+                    "la deduplicación sigue solo con TF-IDF.",
+                    error,
+                )
+    try:
+        proposals = moments.detect_moments(
+            transcript,
+            project,
+            duration,
+            input_path=input_path,
+            ffmpeg_path=ffmpeg_path,
+            event_timeline=event_timeline,
+            speaker_timeline=speaker_timeline,
+            visual_timeline=visual.combined if visual is not None else None,
+            face_timeline=visual.face if visual is not None else None,
+            scene_cut_timeline=visual.scene_cuts if visual is not None else None,
+            motion_timeline=visual.motion if visual is not None else None,
+            visual_stats=visual.stats if visual is not None else None,
+            should_cancel=should_cancel,
+            on_profile=on_profile,
+            enable_semantic=semantic_ready,
+        )
+    except Exception as error:  # noqa: BLE001 - solo se traduce la cancelación semántica
+        if semantic_module is not None and isinstance(
+            error, semantic_module.SemanticCancelled
+        ):
+            raise ProjectCancelled() from error
+        raise
     if not proposals:
         return []
     valid, _errors = _validate_and_complete_proposals(
@@ -1338,6 +1419,9 @@ def process_project(
                 f"Reintentando {len(proposal_records)} clip(s) fallido(s) sin volver a llamar a la IA…",
             )
         else:
+            # Perfil de contenido (Fase C): lo rellena el callback
+            # on_profile del camino de señales; vacío en modo "llm".
+            content_profile_holder: dict[str, str] = {}
             if project_config.moment_engine == "llm":
                 if llm is None:
                     raise LLMConfigurationError("No se pudo configurar el proveedor de IA.")
@@ -1396,6 +1480,35 @@ def process_project(
                         f"Descargando el modelo de eventos de audio ({percent:.0f}%)…",
                     )
 
+                def on_semantic_download_progress(percent: float) -> None:
+                    # Aviso visible mientras se descarga el modelo MiniLM
+                    # (~23 MB, solo la primera vez): deduplicación por
+                    # paráfrasis (Fase D).
+                    _publish(
+                        settings,
+                        project_id,
+                        "processing",
+                        "finding",
+                        None,
+                        f"Descargando el modelo semántico ({percent:.0f}%)…",
+                    )
+
+                def on_diarization_download_progress(percent: float) -> None:
+                    # Aviso visible mientras se descargan los modelos de
+                    # diarización (~33 MB, solo la primera vez): turnos
+                    # de hablante (Fase C).
+                    _publish(
+                        settings,
+                        project_id,
+                        "processing",
+                        "finding",
+                        None,
+                        f"Descargando el modelo de diarización ({percent:.0f}%)…",
+                    )
+
+                def on_content_profile(profile: str) -> None:
+                    content_profile_holder["profile"] = profile
+
                 proposals = _propose_valid_clips(
                     transcript,
                     project_config,
@@ -1405,6 +1518,9 @@ def process_project(
                     input_path=input_path,
                     ffmpeg_path=ffmpeg_path,
                     on_event_download_progress=on_event_download_progress,
+                    on_profile=on_content_profile,
+                    on_semantic_download_progress=on_semantic_download_progress,
+                    on_diarization_download_progress=on_diarization_download_progress,
                 )
                 engine_used = "signals"
                 if project_config.moment_engine == "signals+ai" and proposals:
@@ -1470,6 +1586,8 @@ def process_project(
                 metadata["signal_score_threshold"] = (
                     project_config.signal_score_threshold
                 )
+                if content_profile_holder.get("profile"):
+                    metadata["content_profile"] = content_profile_holder["profile"]
             database.update_project(
                 settings.database_path, project_id, metadata=metadata
             )

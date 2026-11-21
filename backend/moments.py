@@ -32,8 +32,26 @@ la calibración con videos reales es la Fase E):
 - El canal de eventos de audio (risa, aplauso, ovación, grito; peso
   1.5) lo aporta la Fase B (Tier 1, YAMNet ONNX): ``backend.audio_events``
   produce el ``event_timeline`` y este scorer lo incluye en la media
-  ponderada solo cuando está presente. Escenas/movimiento/rostros son
-  Fase C.
+  ponderada solo cuando está presente.
+- La Fase C (v1.2.0) añade dos canales visuales Tier 0 (0 MB):
+  "visual" (cortes de escena + movimiento, peso 0.5) y "rostro"
+  (presencia de rostro, peso 0.5), producidos por
+  ``backend.visual_signals``. Un canal sin variación no entra en la
+  media (misma idea que el audio sin audio utilizable, v1.1.1): un
+  rostro siempre (o nunca) en cuadro no distingue momentos.
+- La Fase C también detecta el PERFIL de contenido (talk / mixed /
+  gameplay) por densidad de habla y actividad visual, y ajusta los
+  pesos: talk sube texto (2.0) y baja visual (0.25); gameplay sube
+  audio (1.5) y visual (1.0) y baja texto (1.0); mixed usa los pesos
+  v1.1.1 sin cambios. Sin estadísticas visuales no hay evidencia
+  visual y el perfil es "mixed": los fixtures de test sin timelines
+  visuales mantienen exactamente el comportamiento v1.1.1.
+- La Fase C añade además el canal "hablantes" (peso 0.75, Tier 2
+  opcional): ``backend.diarization`` produce el ``speaker_timeline``
+  (1 Hz, densidad de turnos de hablante) con sherpa-onnx bajo demanda
+  (~33 MB); sin él, el canal no participa. Como los visuales, un
+  timeline sin turnos no entra en la media (un monólogo no debe
+  perder puntos por no tener cambios de hablante).
 """
 
 from __future__ import annotations
@@ -57,6 +75,7 @@ from .llm import (
     _request_clip_content,
 )
 from .schemas import ClipProposal, ProjectConfig, TranscriptSegment, Word
+from .visual_signals import VisualStats, combine_visual_timeline, extract_visual_timelines
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +85,73 @@ _WEIGHT_SPEECH = 1.0
 _WEIGHT_TEXT = 1.5
 _WEIGHT_OPENING = 1.0
 _WEIGHT_EVENTS = 1.5  # Solo cuando la Fase B aporta event_timeline.
+_WEIGHT_VISUAL = 0.5  # Fase C: cortes + movimiento (Tier 0).
+_WEIGHT_FACE = 0.5  # Fase C: presencia de rostro (Tier 0).
+_WEIGHT_SPEAKERS = 0.75  # Fase C: turnos de hablante (Tier 2, diarización).
+
+# Pesos por perfil de contenido (Fase C). "mixed" es el perfil por
+# defecto y usa EXACTAMENTE los pesos v1.1.1: sin estadísticas visuales
+# no hay evidencia para otro perfil y el comportamiento no cambia.
+_PROFILE_WEIGHTS: dict[str, dict[str, float]] = {
+    "mixed": {
+        "audio": _WEIGHT_AUDIO,
+        "texto": _WEIGHT_TEXT,
+        "ritmo": _WEIGHT_SPEECH,
+        "gancho_inicial": _WEIGHT_OPENING,
+        "eventos": _WEIGHT_EVENTS,
+        "visual": _WEIGHT_VISUAL,
+        "rostro": _WEIGHT_FACE,
+        "hablantes": _WEIGHT_SPEAKERS,
+    },
+    # Charla a cámara: lo que importa es lo que se dice; lo visual
+    # apenas varía y no debe pesar.
+    "talk": {
+        "audio": _WEIGHT_AUDIO,
+        "texto": 2.0,
+        "ritmo": _WEIGHT_SPEECH,
+        "gancho_inicial": _WEIGHT_OPENING,
+        "eventos": _WEIGHT_EVENTS,
+        "visual": 0.25,
+        "rostro": _WEIGHT_FACE,
+        "hablantes": _WEIGHT_SPEAKERS,
+    },
+    # Gameplay / acción: hay poco que decir y mucho que ver y oír.
+    "gameplay": {
+        "audio": 1.5,
+        "texto": 1.0,
+        "ritmo": _WEIGHT_SPEECH,
+        "gancho_inicial": _WEIGHT_OPENING,
+        "eventos": _WEIGHT_EVENTS,
+        "visual": 1.0,
+        "rostro": _WEIGHT_FACE,
+        "hablantes": _WEIGHT_SPEAKERS,
+    },
+}
+
+# Umbrales de perfil (Fase C, documentados; la calibración fina es la
+# Fase E). Habla densa de video conversacional: 120–180 palabras/min
+# mientras se habla y ~85 % del video con habla; un gameplay con
+# comentarios dispersos queda muy por debajo. Movimiento crudo medido en
+# la VM (visual_signals.py): estático 0,0; testsrc2 3,6; objeto pequeño
+# en movimiento rápido 7,9; zoom 14,8; paneo 90. Los umbrales son
+# conservadores a propósito: ante la duda, "mixed" (pesos sin cambios).
+_PROFILE_TALK_MIN_WPM = 100.0
+_PROFILE_TALK_MIN_SPEECH_FRACTION = 0.5
+_PROFILE_TALK_MAX_CUT_RATE = 2.0  # Cortes por minuto.
+_PROFILE_TALK_MAX_MOTION_RAW = 5.0  # MAD medio en niveles de gris.
+_PROFILE_GAMEPLAY_MAX_WPM = 60.0
+_PROFILE_GAMEPLAY_MAX_SPEECH_FRACTION = 0.35
+_PROFILE_GAMEPLAY_MIN_CUT_RATE = 6.0  # Cortes por minuto.
+_PROFILE_GAMEPLAY_MIN_MOTION_RAW = 8.0  # MAD medio en niveles de gris.
+
+# Activación de los canales visuales (Fase C): un canal sin variación no
+# entra en la media. Visual: basta un segundo notable (máximo > 0.1).
+# Rostro: la presencia debe variar (desviación típica > 0.05).
+# Hablantes: basta un turno en el video (el timeline vale 0.25 con un
+# solo turno en ±10 s; un monólogo queda en 0 y no entra en la media).
+_VISUAL_MIN_PEAK = 0.1
+_FACE_MIN_STD = 0.05
+_SPEAKER_MIN_PEAK = 0.1
 
 # Separación MMR por defecto: los clips elegidos tienden a estar al menos
 # a esta distancia entre sí (proporcional a la duración, con topes).
@@ -458,6 +544,57 @@ def _clip01(value: float) -> float:
     return min(1.0, max(0.0, value))
 
 
+def detect_content_profile(
+    phrases: list[Phrase],
+    duration: float,
+    *,
+    cut_rate_per_minute: float | None = None,
+    mean_motion_raw: float | None = None,
+) -> str:
+    """Clasifica el video: "talk", "mixed" o "gameplay" (determinista).
+
+    Por densidad de habla (palabras/minuto sobre el video completo y
+    fracción de segundos con habla) y actividad visual (tasa de cortes
+    y movimiento medio crudo, de ``visual_signals.VisualStats``).
+    - talk: habla densa + imagen calma (cabeza parlante).
+    - gameplay: habla dispersa + imagen activa (cortes rápidos o mucho
+      movimiento).
+    - mixed: todo lo demás, y SIEMPRE que no haya estadísticas visuales
+      (sin evidencia visual no se toca ningún peso: los fixtures de test
+      y los videos sin timelines visuales mantienen el comportamiento
+      v1.1.1). Un solo dato visual ausente no bloquea la clasificación:
+      se usa el que haya; para "gameplay" basta con que UNO de los dos
+      marque actividad alta.
+    """
+    if duration <= 0 or not phrases:
+        return "mixed"
+    if cut_rate_per_minute is None and mean_motion_raw is None:
+        return "mixed"
+    total_words = sum(phrase.word_count for phrase in phrases)
+    speech_seconds = sum(max(0.1, phrase.end - phrase.start) for phrase in phrases)
+    wpm = total_words / duration * 60.0
+    speech_fraction = min(1.0, speech_seconds / duration)
+    calm = (cut_rate_per_minute is None or cut_rate_per_minute <= _PROFILE_TALK_MAX_CUT_RATE) and (
+        mean_motion_raw is None or mean_motion_raw <= _PROFILE_TALK_MAX_MOTION_RAW
+    )
+    active = (
+        cut_rate_per_minute is not None and cut_rate_per_minute >= _PROFILE_GAMEPLAY_MIN_CUT_RATE
+    ) or (mean_motion_raw is not None and mean_motion_raw >= _PROFILE_GAMEPLAY_MIN_MOTION_RAW)
+    if (
+        wpm >= _PROFILE_TALK_MIN_WPM
+        and speech_fraction >= _PROFILE_TALK_MIN_SPEECH_FRACTION
+        and calm
+    ):
+        return "talk"
+    if (
+        wpm <= _PROFILE_GAMEPLAY_MAX_WPM
+        and speech_fraction <= _PROFILE_GAMEPLAY_MAX_SPEECH_FRACTION
+        and active
+    ):
+        return "gameplay"
+    return "mixed"
+
+
 class MomentScorer:
     """Canales de señal precalculados + puntuación de ventanas.
 
@@ -465,7 +602,12 @@ class MomentScorer:
     pico de energía, un máximo numpy sobre ~30–180 valores). ``event_timeline``
     es el hook de la Fase B: por segundo, 0–1 de eventos de audio (risa,
     aplauso, grito); ausente en Tier 0, en cuyo caso el canal no participa
-    en la media ponderada.
+    en la media ponderada. ``visual_timeline`` (Fase C) es el timeline
+    combinado de cortes + movimiento; si en vez de él llegan los
+    componentes (``scene_cut_timeline`` / ``motion_timeline``), se
+    combinan aquí. ``face_timeline`` (Fase C) es la presencia de rostro
+    0–1 por segundo. ``profile`` elige los pesos (ver
+    ``_PROFILE_WEIGHTS``); un perfil desconocido cae a "mixed".
     """
 
     def __init__(
@@ -474,11 +616,57 @@ class MomentScorer:
         audio_rms: np.ndarray,
         duration: float,
         event_timeline: np.ndarray | None = None,
+        visual_timeline: np.ndarray | None = None,
+        face_timeline: np.ndarray | None = None,
+        scene_cut_timeline: np.ndarray | None = None,
+        motion_timeline: np.ndarray | None = None,
+        speaker_timeline: np.ndarray | None = None,
+        profile: str = "mixed",
     ) -> None:
         self.phrases = phrases
         self.duration = duration
         self.audio_rms = audio_rms
         self.event_timeline = event_timeline
+        self.speaker_timeline = speaker_timeline
+        self.scene_cut_timeline = scene_cut_timeline
+        self.motion_timeline = motion_timeline
+        # El timeline visual combinado: si llega ya calculado (el
+        # pipeline lo combina), se usa tal cual; si solo llegan los
+        # componentes, se combinan aquí (máximo por segundo).
+        if visual_timeline is not None:
+            self.visual_timeline = visual_timeline
+        else:
+            self.visual_timeline = combine_visual_timeline(scene_cut_timeline, motion_timeline)
+        self.face_timeline = face_timeline
+        self.profile = profile if profile in _PROFILE_WEIGHTS else "mixed"
+        self._weights = _PROFILE_WEIGHTS[self.profile]
+        # Un canal sin variación no aporta información sobre QUÉ momento
+        # elegir: participa en el desglose pero no en la media (misma
+        # idea que el audio sin audio utilizable, v1.1.1). Visual: basta
+        # un segundo notable. Rostro: la presencia debe variar; un
+        # rostro siempre (o nunca) en cuadro no distingue momentos, y
+        # sin esta guarda un video de cabeza parlante perdería ~0.7
+        # puntos en todas sus ventanas por un canal centrado en 0.
+        self._visual_active = (
+            self.visual_timeline is not None
+            and self.visual_timeline.size > 0
+            and float(np.max(self.visual_timeline)) > _VISUAL_MIN_PEAK
+        )
+        self._face_active = (
+            face_timeline is not None
+            and face_timeline.size > 0
+            and float(np.std(face_timeline)) > _FACE_MIN_STD
+        )
+        self._speaker_active = (
+            speaker_timeline is not None
+            and speaker_timeline.size > 0
+            and float(np.max(speaker_timeline)) > _SPEAKER_MIN_PEAK
+        )
+        self._face_mean = (
+            float(np.mean(face_timeline))
+            if face_timeline is not None and face_timeline.size
+            else 0.0
+        )
         # Audio utilizable: si el timeline es todo ceros (ffmpeg falló o
         # el video no tiene pista de audio), el canal de audio NO entra
         # en la media ponderada (un 0 arrastraría la puntuación) y no se
@@ -633,6 +821,79 @@ class MomentScorer:
         frac = float(np.mean(window > 0.5))
         return 0.5 * _clip01((peak - 0.3) / 0.5) + 0.5 * frac
 
+    def _speaker_channel(self, start: float, end: float) -> float:
+        """Canal de turnos de hablante (Fase C, diarización). Misma forma
+        que eventos: pico + fracción de segundos con actividad alta.
+        Un debate vivo puntúa alto; un monólogo, cero."""
+        timeline = self.speaker_timeline
+        if timeline is None:
+            return 0.0
+        first = max(0, math.floor(start))
+        last = min(timeline.size, math.ceil(end))
+        if last <= first:
+            return 0.0
+        window = timeline[first:last]
+        peak = float(np.max(window))
+        frac = float(np.mean(window > 0.5))
+        return 0.5 * _clip01((peak - 0.3) / 0.5) + 0.5 * frac
+
+    def _visual_channel(self, start: float, end: float) -> float:
+        """Canal visual (Fase C): cortes + movimiento, misma forma que eventos.
+
+        Pico + fracción de segundos notables: un corte aislado en una
+        ventana larga puntúa menos que una racha de cortes o de acción.
+        """
+        timeline = self.visual_timeline
+        if timeline is None:
+            return 0.0
+        first = max(0, math.floor(start))
+        last = min(timeline.size, math.ceil(end))
+        if last <= first:
+            return 0.0
+        window = timeline[first:last]
+        peak = float(np.max(window))
+        frac = float(np.mean(window > 0.5))
+        return 0.5 * _clip01((peak - 0.3) / 0.5) + 0.5 * frac
+
+    def _face_channel(self, start: float, end: float) -> float:
+        """Canal de rostro (Fase C): presencia RELATIVA al video.
+
+        Un rostro en cuadro puntúa cuando aparece AQUÍ más que en el
+        resto del video: en una cabeza parlante (rostro siempre
+        presente) el canal vale ~0 en todas partes y no infla nada (y
+        la guarda de variación lo excluye de la media).
+        """
+        timeline = self.face_timeline
+        if timeline is None:
+            return 0.0
+        first = max(0, math.floor(start))
+        last = min(timeline.size, math.ceil(end))
+        if last <= first:
+            return 0.0
+        window_mean = float(np.mean(timeline[first:last]))
+        return _clip01((window_mean - self._face_mean) / 0.5)
+
+    def _visual_component_peaks(self, start: float, end: float) -> tuple[float, float]:
+        """(Pico de cortes, pico de movimiento) en la ventana (0.0 si ausentes).
+
+        Solo para las etiquetas: el canal "visual" no distingue qué lo
+        disparó, pero las etiquetas sí ("Cambio de escena" / "Momento
+        de mucha acción").
+        """
+        scene_peak = 0.0
+        if self.scene_cut_timeline is not None:
+            first = max(0, math.floor(start))
+            last = min(self.scene_cut_timeline.size, math.ceil(end))
+            if last > first:
+                scene_peak = float(np.max(self.scene_cut_timeline[first:last]))
+        motion_peak = 0.0
+        if self.motion_timeline is not None:
+            first = max(0, math.floor(start))
+            last = min(self.motion_timeline.size, math.ceil(end))
+            if last > first:
+                motion_peak = float(np.max(self.motion_timeline[first:last]))
+        return scene_peak, motion_peak
+
     # -- bordes ------------------------------------------------------------
     def trim_edges(self, start: float, end: float) -> tuple[float, float, float]:
         """Recorta silencios en los bordes (máx. 2 s por lado).
@@ -684,24 +945,45 @@ class MomentScorer:
         speech, speech_detail = self._speech_channel(first_idx, last_idx, start, end)
         text, text_labels = self._text_channel(first_idx, last_idx)
         opening = self._opening_channel(first_idx, last_idx, start)
+        weights = self._weights
         channels: list[tuple[str, float, float]] = [
-            ("audio", audio, _WEIGHT_AUDIO),
-            ("texto", text, _WEIGHT_TEXT),
-            ("ritmo", speech, _WEIGHT_SPEECH),
-            ("gancho_inicial", opening, _WEIGHT_OPENING),
+            ("audio", audio, weights["audio"]),
+            ("texto", text, weights["texto"]),
+            ("ritmo", speech, weights["ritmo"]),
+            ("gancho_inicial", opening, weights["gancho_inicial"]),
         ]
         if self.event_timeline is not None:
             events_score = self._events_channel(start, end)
-            channels.append(("eventos", events_score, _WEIGHT_EVENTS))
+            channels.append(("eventos", events_score, weights["eventos"]))
         else:
             events_score = 0.0
+        if self.visual_timeline is not None:
+            visual_score = self._visual_channel(start, end)
+            channels.append(("visual", visual_score, weights["visual"]))
+        else:
+            visual_score = 0.0
+        if self.face_timeline is not None:
+            face_score = self._face_channel(start, end)
+            channels.append(("rostro", face_score, weights["rostro"]))
+        else:
+            face_score = 0.0
+        if self.speaker_timeline is not None:
+            speaker_score = self._speaker_channel(start, end)
+            channels.append(("hablantes", speaker_score, weights["hablantes"]))
+        else:
+            speaker_score = 0.0
         # Sin audio utilizable, el canal de audio (0.0) no entra en la
-        # media: un dato ausente no debe arrastrar la puntuación. El
-        # desglose sigue mostrando audio 0.0 (ver breakdown abajo).
+        # media: un dato ausente no debe arrastrar la puntuación. Lo
+        # mismo para visual/rostro sin variación y para hablantes sin
+        # turnos (ver __init__). El desglose sigue mostrando todos los
+        # valores (ver breakdown abajo).
         scoring = [
             (name, value, weight)
             for name, value, weight in channels
-            if self._has_audio or name != "audio"
+            if (self._has_audio or name != "audio")
+            and (self._visual_active or name != "visual")
+            and (self._face_active or name != "rostro")
+            and (self._speaker_active or name != "hablantes")
         ]
         total_weight = sum(weight for _, _, weight in scoring)
         weighted = sum(value * weight for _, value, weight in scoring) / total_weight
@@ -709,8 +991,19 @@ class MomentScorer:
         score = min(10.0, max(0.0, weighted * 10.0 * completeness))
         breakdown = {name: round(value * 10.0, 1) for name, value, _ in channels}
         breakdown["completitud"] = round(completeness, 2)
+        scene_peak, motion_peak = self._visual_component_peaks(start, end)
         labels = self._build_labels(
-            text_labels, peak_z, speech_detail, opening, first_idx, events_score
+            text_labels,
+            peak_z,
+            speech_detail,
+            opening,
+            first_idx,
+            events_score,
+            visual_score,
+            face_score,
+            scene_peak,
+            motion_peak,
+            speaker_score,
         )
         return score, breakdown, labels
 
@@ -722,6 +1015,11 @@ class MomentScorer:
         opening: float,
         first_idx: int,
         events_score: float = 0.0,
+        visual_score: float = 0.0,
+        face_score: float = 0.0,
+        scene_peak: float = 0.0,
+        motion_peak: float = 0.0,
+        speaker_score: float = 0.0,
     ) -> list[str]:
         """Etiquetas legibles para razon_viral, en orden de prioridad."""
         labels: list[str] = []
@@ -740,6 +1038,21 @@ class MomentScorer:
             # aplauso) es más específica que un pico de volumen, y
             # razon_viral solo muestra las 3 primeras etiquetas.
             labels.append("Reacción del público (risa o aplauso)")
+        if self.scene_cut_timeline is not None or self.motion_timeline is not None:
+            # Componentes disponibles: etiqueta precisa de lo que disparó
+            # el canal visual (pueden ser las dos a la vez: un corte
+            # suele coincidir con un pico de movimiento).
+            if scene_peak >= 0.5:
+                labels.append("Cambio de escena")
+            if motion_peak >= 0.5:
+                labels.append("Momento de mucha acción")
+        elif visual_score >= 0.5:
+            # Solo llegó el timeline combinado: sin saber qué lo disparó.
+            labels.append("Cambio visual brusco")
+        if face_score >= 0.5:
+            labels.append("Rostro en cuadro")
+        if speaker_score >= 0.5:
+            labels.append("Intercambio animado entre hablantes")
         if peak_z >= 2.0:
             labels.append("Pico de energía")
         if speech_detail.get("fast", 0.0) >= 0.6:
@@ -848,6 +1161,9 @@ def _select_diverse(
     separation_seconds: float,
     max_clips: int,
     idf_corpus: list[str],
+    enable_semantic: bool = False,
+    semantic_threshold: float | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[_ScoredCandidate]:
     """Elige hasta max_clips por puntuación, con diversidad MMR + TF-IDF.
 
@@ -859,6 +1175,14 @@ def _select_diverse(
       momento excepcional puede quedar junto a otro elegido.
     - TF-IDF: si el texto es casi idéntico al de un clip elegido
       (similitud > 0.55), se queda el de mayor puntuación.
+    - Semántico (Fase D, solo si ``enable_semantic``): además del
+      TF-IDF, se descarta un candidato si su embedding MiniLM es casi
+      idéntico al de un clip elegido (coseno > umbral, 0.85 por
+      defecto): caza paráfrasis (misma idea con otras palabras) que el
+      TF-IDF no ve. Filtro ADICIONAL, nunca reemplazo: si los
+      embeddings no están disponibles, la selección sigue solo con
+      TF-IDF. La cancelación del usuario (``SemanticCancelled``) NO se
+      traga: se propaga para que el pipeline la traduzca.
     """
     ordered = sorted(
         (cand for cand in candidates if cand.score >= threshold),
@@ -867,8 +1191,27 @@ def _select_diverse(
     if not ordered:
         return []
     vectors = _tfidf_vectors([cand.text for cand in ordered], idf_corpus)
+    embeddings: np.ndarray | None = None
+    if enable_semantic:
+        try:
+            from . import semantic
+        except ImportError:
+            semantic = None  # type: ignore[assignment]
+        if semantic is not None:
+            if semantic_threshold is None:
+                semantic_threshold = semantic.DEFAULT_PARAPHRASE_THRESHOLD
+            embeddings = semantic.embed_texts(
+                [cand.text for cand in ordered], should_cancel=should_cancel
+            )
+            if embeddings is not None and embeddings.shape[0] != len(ordered):
+                logger.warning(
+                    "Los embeddings semánticos no cubren todos los candidatos; "
+                    "se sigue solo con TF-IDF."
+                )
+                embeddings = None
     selected: list[_ScoredCandidate] = []
     selected_vectors: list[dict[str, float]] = []
+    selected_embeddings: list[np.ndarray] = []
     for index, candidate in enumerate(ordered):
         if len(selected) >= max_clips:
             break
@@ -895,8 +1238,20 @@ def _select_diverse(
             for chosen in selected_vectors
         ):
             continue
+        if (
+            embeddings is not None
+            and selected_embeddings
+            and semantic_threshold is not None
+            and any(
+                float(embeddings[index] @ chosen) > semantic_threshold
+                for chosen in selected_embeddings
+            )
+        ):
+            continue
         selected.append(candidate)
         selected_vectors.append(vector)
+        if embeddings is not None:
+            selected_embeddings.append(embeddings[index])
     return sorted(selected, key=lambda cand: cand.start)
 
 
@@ -994,10 +1349,18 @@ def detect_moments(
     ffmpeg_path: str | None = None,
     audio_timeline: np.ndarray | None = None,
     event_timeline: np.ndarray | None = None,
+    visual_timeline: np.ndarray | None = None,
+    face_timeline: np.ndarray | None = None,
+    scene_cut_timeline: np.ndarray | None = None,
+    motion_timeline: np.ndarray | None = None,
+    speaker_timeline: np.ndarray | None = None,
+    visual_stats: VisualStats | None = None,
     threshold: float | None = None,
     min_separation_seconds: float | None = None,
     max_clips: int = 10,
     should_cancel: Callable[[], bool] | None = None,
+    on_profile: Callable[[str], None] | None = None,
+    enable_semantic: bool = False,
 ) -> list[ClipProposal]:
     """Detecta momentos por señales sobre el video COMPLETO (sin ventanas).
 
@@ -1007,8 +1370,26 @@ def detect_moments(
     ffmpeg; sin ninguno, el motor trabaja solo con texto (canal de audio
     en cero). ``event_timeline`` es el hook del Tier 1 (Fase B): lo
     produce ``backend.audio_events.get_event_timeline`` y es None cuando
-    Tier 1 no está disponible. Devuelve [] si ningún candidato supera el
-    umbral: "cero clips" es un resultado válido, no un error.
+    Tier 1 no está disponible. ``visual_timeline`` (combinado) /
+    ``scene_cut_timeline`` / ``motion_timeline`` / ``face_timeline`` son
+    los hooks visuales de la Fase C: si no se inyecta NINGUNO y hay
+    ``input_path`` + ``ffmpeg_path``, se extraen aquí en una sola pasada
+    (``backend.visual_signals.extract_visual_timelines``); si el
+    llamador inyecta al menos uno, se asume que el pipeline ya hizo la
+    extracción y no se duplica trabajo. ``visual_stats`` alimenta la
+    detección de perfil (sin él, el perfil es "mixed"); ``on_profile``
+    recibe el perfil detectado para que el llamador lo guarde (p. ej.
+    en la metadata del proyecto). ``speaker_timeline`` es el hook de
+    diarización (Fase C, Tier 2): lo produce
+    ``backend.diarization.get_speaker_timeline`` y es None cuando la
+    diarización no está disponible; aquí NO se extrae (la descarga de
+    ~33 MB la gestiona el pipeline, como el Tier 1). ``enable_semantic``
+    (Fase D) activa
+    la deduplicación por paráfrasis con MiniLM en la selección; por
+    defecto False (sin descargas en llamadas directas ni en tests): el
+    pipeline lo activa tras precalentar el modelo. Devuelve [] si ningún
+    candidato supera el umbral: "cero clips" es un resultado válido, no
+    un error.
     """
     threshold = project.signal_score_threshold if threshold is None else threshold
     phrases = build_phrases(transcript)
@@ -1032,7 +1413,62 @@ def detect_moments(
         )
         return []
     minimum, maximum = bounds
-    scorer = MomentScorer(phrases, audio_timeline, duration, event_timeline)
+    if (
+        visual_timeline is None
+        and face_timeline is None
+        and scene_cut_timeline is None
+        and motion_timeline is None
+        and input_path is not None
+        and ffmpeg_path
+    ):
+        # El pipeline puede inyectar los timelines (evita duplicar la
+        # extracción); si no inyectó ninguno, se extraen aquí. La
+        # extracción visual jamás rompe Tier 0: un fallo deja los
+        # canales en None y el motor sigue con texto/audio.
+        try:
+            bundle = extract_visual_timelines(
+                input_path, ffmpeg_path, duration, should_cancel=should_cancel
+            )
+        except Exception as error:  # noqa: BLE001 - la extracción visual jamás rompe Tier 0
+            logger.warning("La extracción de señales visuales falló: %s", error)
+            bundle = None
+        if bundle is not None:
+            visual_timeline = bundle.combined
+            face_timeline = bundle.face
+            scene_cut_timeline = bundle.scene_cuts
+            motion_timeline = bundle.motion
+            if visual_stats is None:
+                visual_stats = bundle.stats
+    # Perfil de contenido (Fase C): ajusta los pesos del scorer. Sin
+    # estadísticas visuales no hay evidencia visual y el perfil es
+    # "mixed" (pesos v1.1.1 sin cambios).
+    cut_rate = visual_stats.cut_rate_per_minute if visual_stats is not None else None
+    mean_motion = visual_stats.mean_motion_raw if visual_stats is not None else None
+    if cut_rate is None and scene_cut_timeline is not None and duration > 0:
+        # Respaldo: si el llamador inyectó los cortes pero no las
+        # estadísticas, la tasa se estima contando los segundos con corte.
+        cut_rate = float(np.count_nonzero(scene_cut_timeline > 0.5)) / duration * 60.0
+    profile = detect_content_profile(
+        phrases, duration, cut_rate_per_minute=cut_rate, mean_motion_raw=mean_motion
+    )
+    logger.info("Perfil de contenido detectado: %s.", profile)
+    if on_profile is not None:
+        try:
+            on_profile(profile)
+        except Exception as error:  # noqa: BLE001 - el callback no rompe la detección
+            logger.warning("El callback de perfil falló: %s", error)
+    scorer = MomentScorer(
+        phrases,
+        audio_timeline,
+        duration,
+        event_timeline,
+        visual_timeline=visual_timeline,
+        face_timeline=face_timeline,
+        scene_cut_timeline=scene_cut_timeline,
+        motion_timeline=motion_timeline,
+        speaker_timeline=speaker_timeline,
+        profile=profile,
+    )
     # Candidatos: cada frase es un inicio; el final es el final natural de
     # una frase posterior dentro del rango de duración pedido.
     candidates: list[_ScoredCandidate] = []
@@ -1091,6 +1527,8 @@ def detect_moments(
         separation_seconds=separation,
         max_clips=max_clips,
         idf_corpus=[phrase.text for phrase in phrases],
+        enable_semantic=enable_semantic,
+        should_cancel=should_cancel,
     )
     # Tema del video: contenido más frecuente de toda la transcripción,
     # para hashtags genéricos del tema en cada clip.

@@ -3,7 +3,7 @@ import {
   AlertCircle, ArrowRight, Download, FileText, FileVideo2, LoaderCircle, Scissors, Search, Share2, Sparkles, Trash2, WandSparkles,
 } from 'lucide-react';
 import { apiFetch } from '../auth';
-import { API_BASE, MOMENT_ENGINE_LABELS, formatBytes, type MomentEngine } from '../context/constants';
+import { API_BASE, CONTENT_PROFILE_LABELS, MOMENT_ENGINE_LABELS, formatBytes, type ContentProfile, type MomentEngine } from '../context/constants';
 import { ToastStack, useToasts, type ToastKind } from './Toasts';
 import type { ClipResult, ProjectResult, ScheduleJob } from '../types';
 import { formatDuration, responseError } from '../utils';
@@ -25,6 +25,9 @@ const SIGNAL_CHANNEL_LABELS: Record<string, string> = {
   ritmo: 'Ritmo de habla',
   gancho_inicial: 'Gancho inicial',
   eventos: 'Eventos de audio',
+  visual: 'Señales visuales',
+  rostro: 'Rostro en cuadro',
+  hablantes: 'Turnos de hablante',
 };
 
 function resolveEngine(project: ProjectResult | null): MomentEngine {
@@ -118,6 +121,11 @@ export function ResultsPage({
   const visibleReadyClips = visibleClips.filter((clip) => clip.status !== 'failed');
   // Motor efectivo que eligió los clips (registrado en metadatos).
   const engine = resolveEngine(project);
+  // Perfil de contenido auto-detectado (Fase C, v1.2.0; solo en
+  // proyectos procesados con el motor de señales desde la 1.2.0).
+  const rawProfile = project?.metadata?.content_profile;
+  const contentProfile: ContentProfile | null =
+    rawProfile === 'talk' || rawProfile === 'mixed' || rawProfile === 'gameplay' ? rawProfile : null;
   const allSelected = visibleReadyClips.length > 0 && visibleReadyClips.every((clip) => selected.has(clip.id));
   const selectedClips = readyClips.filter((clip) => selected.has(clip.id));
 
@@ -210,6 +218,31 @@ export function ResultsPage({
       await onProjectUpdated(project.id);
     } catch (error) {
       notify(error instanceof Error ? error.message : 'No se pudieron reintentar los clips fallidos.', 'error');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  // Fase D (ítem 6): pulir los títulos de los clips con UNA llamada a la IA.
+  const improveTitles = async () => {
+    if (!project || !clips.length) return;
+    setBusyAction('improve-titles');
+    try {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/improve-titles`, {
+        method: 'POST',
+      });
+      // El 409 trae el motivo en español (sin clave de IA, sin clips o
+      // procesando); se muestra tal cual, incluido el aviso de ir a Ajustes.
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { improved: number; message?: string };
+      if (result.improved > 0) {
+        await onProjectUpdated(project.id);
+        notify(result.message ?? `Se mejoraron ${result.improved} título(s).`, 'success');
+      } else {
+        notify('Los títulos ya están bien, no hubo cambios.');
+      }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'No se pudieron mejorar los títulos.', 'error');
     } finally {
       setBusyAction('');
     }
@@ -451,6 +484,10 @@ export function ResultsPage({
             Guardar video original
           </button>
           <button type="button" onClick={editSelected}><Scissors size={15} /> Editar clips</button>
+          <button type="button" onClick={() => void improveTitles()} disabled={!clips.length || busyAction === 'improve-titles' || project?.status === 'processing' || project?.status === 'queued'}>
+            {busyAction === 'improve-titles' ? <LoaderCircle size={15} className="spin" /> : <Sparkles size={15} />}
+            {busyAction === 'improve-titles' ? 'Mejorando títulos…' : 'Mejorar títulos con IA'}
+          </button>
           <button type="button" className="delete-project-button" onClick={() => void deleteProject()} disabled={busyAction === 'delete-project'}>
             {busyAction === 'delete-project' ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}
             Eliminar proyecto
@@ -461,6 +498,7 @@ export function ResultsPage({
         <div><span className="clips-version">V1</span><strong>CLIPS IA</strong></div>
         <span className="clips-count">{filtersActive ? `${visibleClips.length} de ${clips.length} clips` : `${clips.length} clips`}</span>
         <span className="engine-badge">Motor: {MOMENT_ENGINE_LABELS[engine]}</span>
+        {contentProfile && <span className="engine-badge">Perfil: {CONTENT_PROFILE_LABELS[contentProfile]}</span>}
         <span className="storage-usage" role="status">
           Almacenamiento local: {storageUsedBytes === null ? (storageError || 'calculando…') : formatBytes(storageUsedBytes)}
         </span>

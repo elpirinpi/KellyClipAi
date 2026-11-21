@@ -42,7 +42,7 @@ from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
-from . import database
+from . import database, moments
 from .auth import (
     AuthenticationError,
     AuthenticationUnavailable,
@@ -72,7 +72,7 @@ from .integrations import (
 )
 from .llm import LLMConfigurationError, resolve_llm
 from .media import MediaProcessingError, format_subtitles
-from .pipeline import process_project
+from .pipeline import _resolve_llm_for_project, process_project
 from .process_queue import ProjectProcessingQueue, request_project_cancellation
 from .scheduler import schedule_worker
 from .schemas import (
@@ -81,6 +81,7 @@ from .schemas import (
     MAX_UPLOAD_BYTES,
     ClipArchiveRequest,
     ClipEditRequest,
+    ClipProposal,
     ClipResolutionRequest,
     CustomTemplateRequest,
     EditorRenderJobResponse,
@@ -94,6 +95,7 @@ from .schemas import (
     StagedDownloadRequest,
     StagedProjectRequest,
     StagedUploadRequest,
+    TranscriptSegment,
     ZoomImportRequest,
 )
 from .settings import AppSettings, get_settings
@@ -1938,6 +1940,145 @@ def create_app(
                 detail="La cola de procesamiento no está disponible. Inténtalo de nuevo.",
             ) from error
         return {"project_id": project_id, "status": "queued"}
+
+    @application.post("/api/projects/{project_id}/improve-titles")
+    def improve_titles(project_id: str) -> dict[str, Any]:
+        """Mejora los títulos de los clips de un proyecto con UNA llamada a la IA (Fase D).
+
+        Reutiliza moments.polish_titles, el mismo pulido del modo
+        "signals+ai". Actualiza las propuestas guardadas y los títulos de
+        los clips renderizados que comparten id con ellas, en una sola
+        escritura atómica. Sin clave de IA configurada responde 409: a
+        diferencia del pulido durante el procesado, aquí el usuario lo
+        pidió de forma explícita.
+        """
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Espera a que termine el procesamiento antes de mejorar los títulos.",
+            )
+        metadata = dict(project.get("metadata") or {})
+        records = metadata.get("clip_proposals") or []
+        proposals: list[ClipProposal] = []
+        record_ids: list[str] = []
+        for record in records:
+            if not isinstance(record, dict) or not record.get("id"):
+                continue
+            try:
+                proposals.append(ClipProposal.model_validate(record.get("proposal")))
+            except (ValidationError, TypeError):
+                # Propuesta corrupta: se conserva tal cual, sin pulir.
+                continue
+            record_ids.append(str(record["id"]))
+        if not proposals:
+            raise HTTPException(
+                status_code=409,
+                detail="Este proyecto no tiene clips para mejorar.",
+            )
+        try:
+            llm = _resolve_llm_for_project(project, None, app_settings)
+        except (LLMConfigurationError, CredentialStoreError, ValidationError) as error:
+            raise HTTPException(
+                status_code=409,
+                detail="Configura una clave de IA en Ajustes para mejorar títulos.",
+            ) from error
+        # La transcripción queda persistida en la columna transcript_json del
+        # proyecto (el pipeline la guarda al transcribir). Si un proyecto
+        # viejo no la trae, se construyen segmentos sintéticos desde el
+        # título y la descripción de cada clip para que polish_titles tenga
+        # contexto: cada segmento cubre la ventana de su clip.
+        transcript: list[TranscriptSegment] = []
+        for segment in project.get("transcript") or []:
+            try:
+                transcript.append(TranscriptSegment.model_validate(segment))
+            except (ValidationError, TypeError):
+                continue
+        if not transcript:
+            transcript = [
+                TranscriptSegment(
+                    start=proposal.inicio,
+                    end=proposal.fin,
+                    text=f"{proposal.titulo} {proposal.descripcion}".strip(),
+                )
+                for proposal in proposals
+            ]
+        polished = moments.polish_titles(proposals, transcript, llm)
+        if polished is None:
+            serialized = _serialize_project(project, include_transcript=False)
+            return {
+                "improved": 0,
+                "message": "Los títulos ya están bien, no hubo cambios.",
+                "clips": serialized.get("clips") or [],
+            }
+        improved = sum(
+            1
+            for original, updated in zip(proposals, polished, strict=True)
+            if updated.titulo != original.titulo
+        )
+        polished_by_id = {
+            record_id: proposal.model_dump(mode="json")
+            for record_id, proposal in zip(record_ids, polished, strict=True)
+        }
+        # Se reconstruyen los registros conservando los ids originales (los
+        # clips renderizados comparten id con su propuesta) y los registros
+        # que no se pudieron validar, tal cual estaban.
+        new_records: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict) or not record.get("id"):
+                new_records.append(record)
+                continue
+            updated = polished_by_id.get(str(record["id"]))
+            new_records.append(
+                {"id": record["id"], "proposal": updated} if updated is not None else record
+            )
+        metadata["clip_proposals"] = new_records
+        new_clips: list[dict[str, Any]] = []
+        for clip in project.get("clips") or []:
+            if not isinstance(clip, dict):
+                new_clips.append(clip)
+                continue
+            updated = polished_by_id.get(str(clip.get("id")))
+            if updated is None:
+                new_clips.append(clip)
+                continue
+            new_clips.append(
+                {
+                    **clip,
+                    "title": updated["titulo"],
+                    "description": updated.get("descripcion", clip.get("description", "")),
+                    "keywords": updated.get("palabras_clave", clip.get("keywords", [])),
+                }
+            )
+        try:
+            # Una sola sentencia UPDATE: o se guardan propuestas y clips
+            # juntos, o no se guarda nada.
+            database.update_project(
+                app_settings.database_path,
+                project_id,
+                metadata=metadata,
+                clips=new_clips,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"No se pudieron guardar los títulos mejorados: {error}",
+            ) from error
+        refreshed = database.get_project(app_settings.database_path, project_id)
+        if refreshed is None:  # pragma: no cover - el proyecto se borró entre medias
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        serialized = _serialize_project(refreshed, include_transcript=False)
+        return {
+            "improved": improved,
+            "message": (
+                f"Se mejoraron {improved} título(s)."
+                if improved
+                else "Los títulos ya están bien, no hubo cambios."
+            ),
+            "clips": serialized.get("clips") or [],
+        }
 
     @application.get("/api/projects/{project_id}/events")
     async def project_events(project_id: str, request: Request) -> EventSourceResponse:

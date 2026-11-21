@@ -131,7 +131,7 @@ export type ProjectResult = {
     signal_score_threshold?: number;
     schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
   };
-  metadata: { duration: number; width: number; height: number; language?: string; moment_engine?: string; signal_score_threshold?: number } | null;
+  metadata: { duration: number; width: number; height: number; language?: string; moment_engine?: string; signal_score_threshold?: number; content_profile?: string } | null;
   transcript: Array<{ start: number; end: number; text: string; words: Array<{ start: number; end: number; text: string }> }> | null;
   clips: ClipResult[];
   thumbnail_url: string | null;

@@ -48,6 +48,16 @@ export const MOMENT_ENGINE_LABELS: Record<MomentEngine, string> = {
   llm: 'IA',
 };
 
+// Perfil de contenido auto-detectado por el motor de señales (Fase C,
+// v1.2.0): ajusta los pesos del scorer según el tipo de video.
+export type ContentProfile = 'talk' | 'mixed' | 'gameplay';
+
+export const CONTENT_PROFILE_LABELS: Record<ContentProfile, string> = {
+  talk: 'Conversación',
+  mixed: 'Mixto',
+  gameplay: 'Gameplay / acción',
+};
+
 export function readStoredMomentEngine(): MomentEngine {
   try {
     const stored = window.localStorage.getItem(MOMENT_ENGINE_STORAGE_KEY);
