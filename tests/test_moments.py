@@ -255,6 +255,92 @@ def test_boring_video_produces_zero_clips() -> None:
     )
 
 
+# Frases conversacionales realistas (v1.1.1): habla normal en español con
+# densidad de ganchos natural — alguna pregunta, alguna exclamación, algún
+# número — y picos de audio de 1.5–1.8x (no los 6x del test caricaturesco).
+# Regresión del reporte de Kelly (21-11-2026): la v1.1.0 no encontraba
+# ningún clip en videos reales ni con el umbral en 5.0.
+_REALISTIC_TEXTS = [
+    "Bueno, hoy vamos a hablar de un tema que me preguntan mucho en los comentarios.",
+    "Lo primero que hay que entender es cómo funciona el proceso completo.",
+    "Yo empecé con esto hace un par de años y al principio cometí muchos errores.",
+    "La placa que tengo aquí es una de las más comunes en el mercado actual.",
+    "Mucha gente piensa que es complicado, pero en realidad es bastante directo.",
+    "Ahora vamos a ver qué pasa cuando encendemos el equipo por primera vez.",
+    "El ventilador hace un poco de ruido al arrancar, eso es normal.",
+    "¿Cuál es la diferencia entre estos dos modelos? Vamos a verlo en detalle.",
+    "Yo les recomiendo que revisen bien las especificaciones antes de comprar.",
+    "Miren este resultado, la diferencia es bastante clara en la práctica.",
+    "Cuando lo probé la primera vez no me lo esperaba, la verdad.",
+    "Hay tres cosas que siempre reviso antes de instalar cualquier pieza.",
+    "Primero la compatibilidad, segundo el consumo y tercero el tamaño físico.",
+    "¡Ojo con esto! Si lo conectas al revés puedes dañar la placa.",
+    "Para los que juegan, esto hace una diferencia notable en los cuadros por segundo.",
+    "Yo juego casi todos los días y nunca he tenido problemas de calentamiento.",
+    "Como pueden ver, el rendimiento es bastante bueno para el precio que tiene.",
+    "¿Vale la pena gastar el doble por el modelo superior? Depende de tu uso.",
+    "En resumen, es una buena opción si buscas algo equilibrado y sin gastar mucho.",
+    "Déjenme en los comentarios qué les parece y si quieren que lo compare con otro.",
+]
+
+
+def _realistic_transcript(duration: float) -> list[TranscriptSegment]:
+    rng = np.random.default_rng(42)
+    segments: list[TranscriptSegment] = []
+    cursor = 0.0
+    index = 0
+    while cursor < duration - 8:
+        segment = _segment(
+            cursor,
+            _REALISTIC_TEXTS[index % len(_REALISTIC_TEXTS)],
+            wpm=float(rng.uniform(130, 170)),
+        )
+        segments.append(segment)
+        cursor = segment.end + float(rng.uniform(0.3, 1.0))
+        index += 1
+    return segments
+
+
+def _realistic_audio(duration: float) -> Any:
+    rng = np.random.default_rng(42)
+    rms = 0.10 + 0.02 * rng.standard_normal(int(duration))
+    for at, length, level in [(90, 8, 0.16), (210, 6, 0.18), (350, 10, 0.15), (500, 7, 0.17)]:
+        rms[at : at + length] = level
+    return np.clip(rms, 0.001, None)
+
+
+def test_realistic_conversational_video_finds_clips_at_5() -> None:
+    # Un video conversacional normal (no caricaturesco) debe dar clips
+    # con el umbral en 5.0: la v1.1.0 daba cero.
+    transcript = _realistic_transcript(600)
+    audio = _realistic_audio(600)
+    clips = moments.detect_moments(
+        transcript,
+        ProjectConfig(signal_score_threshold=5.0),
+        600,
+        audio_timeline=audio,
+    )
+    assert len(clips) >= 2
+    assert all(clip.puntuacion >= 5.0 for clip in clips)
+
+
+def test_realistic_video_without_audio_finds_clips_at_5() -> None:
+    # Sin timeline de audio (ffmpeg falló o video sin pista), el canal de
+    # audio no debe arrastrar la puntuación: el video realista debe dar
+    # clips solo con texto y ritmo. La v1.1.0 daba cero (mejor ventana 4.4).
+    transcript = _realistic_transcript(600)
+    clips = moments.detect_moments(
+        transcript,
+        ProjectConfig(signal_score_threshold=5.0),
+        600,
+        audio_timeline=np.zeros(600),
+    )
+    assert len(clips) >= 2
+    assert all(clip.puntuacion >= 5.0 for clip in clips)
+    assert all(clip.signal_breakdown is not None for clip in clips)
+    assert all(clip.signal_breakdown["audio"] == 0.0 for clip in clips)
+
+
 def test_threshold_is_respected() -> None:
     transcript = _transcript(600, exciting_at=300)
     audio = _audio(600, peak_at=300)
@@ -315,6 +401,10 @@ def test_mmr_spreads_clips_across_video() -> None:
 def test_mmr_suppresses_nearby_duplicate_moment() -> None:
     # Dos momentos excitantes a 20 s: el segundo queda penalizado por MMR
     # (separación por defecto 45 s en un video de 600 s) y solo sale uno.
+    # Umbral explícito 8.0: con el umbral por defecto (5.0 desde v1.1.1),
+    # un momento excepcional (9.5 x 0.56 de penalización = 5.3) supera el
+    # umbral por diseño ("solo un momento excepcional puede quedar junto
+    # a otro elegido"); aquí lo que se prueba es la supresión MMR.
     transcript = _transcript(600, exciting_at=300)
     extra = []
     cursor = 325.0
@@ -329,7 +419,12 @@ def test_mmr_suppresses_nearby_duplicate_moment() -> None:
     merged.sort(key=lambda item: item.start)
     audio = _audio(600, peak_at=300)
     audio[325:345] = 0.6
-    clips = moments.detect_moments(merged, ProjectConfig(), 600, audio_timeline=audio)
+    clips = moments.detect_moments(
+        merged,
+        ProjectConfig(signal_score_threshold=8.0),
+        600,
+        audio_timeline=audio,
+    )
     assert len(clips) == 1
 
 
@@ -337,6 +432,10 @@ def test_tfidf_dedup_keeps_highest_scoring_copy() -> None:
     # El MISMO bloque excitante repetido lejos (120 s y 420 s): MMR lo
     # permitiría (280 s de separación), pero TF-IDF detecta que dicen lo
     # mismo y se queda solo con el de mayor puntuación.
+    # Umbral explícito 8.0: con el umbral por defecto (5.0 desde v1.1.1),
+    # una ventana parcial del segundo bloque (7.96, solo la última frase
+    # excitante + cola plana, similitud 0.46 < 0.55) también sería
+    # candidata; aquí lo que se prueba es la deduplicación TF-IDF.
     transcript = _transcript(600, exciting_at=120)
     extra = []
     cursor = 420.0
@@ -351,7 +450,12 @@ def test_tfidf_dedup_keeps_highest_scoring_copy() -> None:
     merged.sort(key=lambda item: item.start)
     audio = _audio(600, peak_at=120)
     audio[420:440] = 0.6
-    clips = moments.detect_moments(merged, ProjectConfig(), 600, audio_timeline=audio)
+    clips = moments.detect_moments(
+        merged,
+        ProjectConfig(signal_score_threshold=8.0),
+        600,
+        audio_timeline=audio,
+    )
     assert len(clips) == 1
 
 

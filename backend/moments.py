@@ -11,9 +11,14 @@ Diseño (patrón del proyecto Chopify, MIT):
   frase es un posible inicio; el final es el final natural de una frase
   posterior dentro del rango de duración pedido. Los clips nunca cortan
   una idea a la mitad.
-- Puntuación ABSOLUTA 0–10 + umbral (por defecto 8.0, ajustable en
+- Puntuación ABSOLUTA 0–10 + umbral (por defecto 5.0, ajustable en
   Ajustes): un video aburrido da pocos clips o ninguno — "cero clips"
   es un resultado válido, mejor que inventar clips malos.
+  Calibración v1.1.1: las curvas de los canales se ajustaron contra
+  contenido conversacional realista tras el reporte de Kelly de que la
+  v1.1.0 no encontraba ningún clip ni con el umbral en 5.0 (las curvas
+  originales solo se habían validado con ejemplos caricaturescos: picos
+  de audio de 6x y texto saturado de ganchos).
 - Diversidad temporal (MMR) + deduplicación semántica por TF-IDF
   implementado a mano (sin sklearn): los clips se reparten por el video
   y no repiten la misma idea.
@@ -474,6 +479,12 @@ class MomentScorer:
         self.duration = duration
         self.audio_rms = audio_rms
         self.event_timeline = event_timeline
+        # Audio utilizable: si el timeline es todo ceros (ffmpeg falló o
+        # el video no tiene pista de audio), el canal de audio NO entra
+        # en la media ponderada (un 0 arrastraría la puntuación) y no se
+        # recortan bordes por silencio (con RMS en cero todo parecería
+        # silencio). El desglose sigue mostrando audio 0.0.
+        self._has_audio = bool(audio_rms.size and float(np.max(audio_rms)) > 1e-3)
         # Z-score robusto del RMS por segundo (mediana + MAD): cuánto
         # destaca cada segundo respecto a la línea base DEL VIDEO.
         median = float(np.median(audio_rms)) if audio_rms.size else 0.0
@@ -517,7 +528,9 @@ class MomentScorer:
         if last <= first:
             return 0.0, 0.0
         peak_z = float(np.max(self.audio_z[first:last]))
-        peak_component = _clip01((peak_z - 0.5) / 3.0)
+        # v1.1.1: divisor 2.0 (antes 3.0): un pico realista (z ~2, un
+        # énfasis claro) debe puntuar alto, no a la mitad.
+        peak_component = _clip01((peak_z - 0.5) / 2.0)
         hot_fraction = float((self._hot_prefix[last] - self._hot_prefix[first]) / (last - first))
         return 0.6 * peak_component + 0.4 * hot_fraction, peak_z
 
@@ -528,10 +541,21 @@ class MomentScorer:
         if self._baseline_wpm <= 0:
             return 0.0, {}
         words = float(self._words_prefix[last_idx + 1] - self._words_prefix[first_idx])
-        span = max(0.1, end - start)
-        wpm = words / span * 60.0
+        # v1.1.1: el WPM se mide sobre el tiempo DE HABLA (suma de las
+        # duraciones de las frases), no sobre el lapso de pared: en
+        # ventanas con pausas largas (gameplay, comentarios dispersos),
+        # el lapso de pared deflactaba el WPM y la rama "lenta" premiaba
+        # el silencio como si fuera énfasis. La línea base ya se calcula
+        # así (_baseline_wpm), de modo que el ratio compara hablar con
+        # hablar.
+        speech_span = sum(
+            max(0.1, phrase.end - phrase.start) for phrase in self.phrases[first_idx : last_idx + 1]
+        )
+        wpm = words / max(0.1, speech_span) * 60.0
         ratio = wpm / self._baseline_wpm
-        fast = _clip01((ratio - 1.0) / 0.5)
+        # v1.1.1: divisor 0.35 (antes 0.5): una subida realista del ritmo
+        # (+25–35 %) debe puntuar alto, no a la mitad.
+        fast = _clip01((ratio - 1.0) / 0.35)
         # Habla lenta y pausada también es señal (énfasis), pero más débil.
         slow = _clip01((0.8 - ratio) / 0.4) * 0.7
         rhythm = 0.0
@@ -540,18 +564,26 @@ class MomentScorer:
             half = first_idx + count // 2
             words_first = float(self._words_prefix[half] - self._words_prefix[first_idx])
             words_second = float(self._words_prefix[last_idx + 1] - self._words_prefix[half])
-            span_first = max(0.1, self.phrases[half - 1].end - self.phrases[first_idx].start)
-            span_second = max(0.1, self.phrases[last_idx].end - self.phrases[half].start)
-            wpm_first = words_first / span_first * 60.0
-            wpm_second = words_second / span_second * 60.0
-            rhythm = _clip01(abs(wpm_first - wpm_second) / self._baseline_wpm / 0.8)
+            span_first = sum(
+                max(0.1, phrase.end - phrase.start) for phrase in self.phrases[first_idx:half]
+            )
+            span_second = sum(
+                max(0.1, phrase.end - phrase.start) for phrase in self.phrases[half : last_idx + 1]
+            )
+            wpm_first = words_first / max(0.1, span_first) * 60.0
+            wpm_second = words_second / max(0.1, span_second) * 60.0
+            # v1.1.1: divisor 0.5 (antes 0.8).
+            rhythm = _clip01(abs(wpm_first - wpm_second) / self._baseline_wpm / 0.5)
         score = 0.6 * max(fast, slow) + 0.4 * rhythm
         return score, {"ratio": ratio, "fast": fast, "slow": slow, "rhythm": rhythm}
 
     def _text_channel(self, first_idx: int, last_idx: int) -> tuple[float, list[str]]:
         """Ganchos de texto 0–1 + etiquetas (pregunta→respuesta incluida)."""
         points = float(self._hook_prefix[last_idx + 1] - self._hook_prefix[first_idx])
-        score = 1.0 - math.exp(-points / 3.0)
+        # v1.1.1: divisor 2.0 (antes 3.0): 2 puntos de gancho (p. ej. una
+        # pregunta, o dos palabras-gancho) ya son señal clara en habla
+        # real; con 3.0 apenas llegaban a la mitad.
+        score = 1.0 - math.exp(-points / 2.0)
         labels: list[str] = []
         for idx in range(first_idx, last_idx + 1):
             labels.extend(self._hook_labels[idx])
@@ -570,7 +602,10 @@ class MomentScorer:
             if self.phrases[idx].start >= opening_end:
                 break
             points += self._hook_points[idx]
-        text_open = 1.0 - math.exp(-points / 2.0)
+        # v1.1.1: divisor 1.5 (antes 2.0) y umbral de audio 0.25 (antes
+        # 0.5): los primeros 3 s rara vez acumulan muchos puntos, pero
+        # un gancho ahí es justo lo que retiene.
+        text_open = 1.0 - math.exp(-points / 1.5)
         if self.phrases[first_idx].is_question:
             text_open = max(text_open, 0.85)
         first = max(0, math.floor(start))
@@ -579,7 +614,7 @@ class MomentScorer:
             mean_z = float(np.mean(self.audio_z[first:last]))
         else:
             mean_z = 0.0
-        audio_open = _clip01((mean_z - 0.5) / 2.0)
+        audio_open = _clip01((mean_z - 0.25) / 1.5)
         # El gancho es fuerte si las palabras enganchan O la energía
         # sube: basta una de las dos (max, no media).
         return max(text_open, audio_open)
@@ -604,8 +639,12 @@ class MomentScorer:
 
         Devuelve (inicio, fin, multiplicador de completitud): 1.0 si el
         recorte es pequeño, 0.85 si movió un borde más de 1 s (la frontera
-        de frase caía en una pausa).
+        de frase caía en una pausa). Sin audio utilizable no se recorta
+        nada (con RMS en cero todo parecería silencio) y el multiplicador
+        es 1.0.
         """
+        if not self._has_audio:
+            return start, end, 1.0
         trimmed = 0.0
         new_start = start
         for _ in range(2):
@@ -656,8 +695,16 @@ class MomentScorer:
             channels.append(("eventos", events_score, _WEIGHT_EVENTS))
         else:
             events_score = 0.0
-        total_weight = sum(weight for _, _, weight in channels)
-        weighted = sum(value * weight for _, value, weight in channels) / total_weight
+        # Sin audio utilizable, el canal de audio (0.0) no entra en la
+        # media: un dato ausente no debe arrastrar la puntuación. El
+        # desglose sigue mostrando audio 0.0 (ver breakdown abajo).
+        scoring = [
+            (name, value, weight)
+            for name, value, weight in channels
+            if self._has_audio or name != "audio"
+        ]
+        total_weight = sum(weight for _, _, weight in scoring)
+        weighted = sum(value * weight for _, value, weight in scoring) / total_weight
         _, _, completeness = self.trim_edges(start, end)
         score = min(10.0, max(0.0, weighted * 10.0 * completeness))
         breakdown = {name: round(value * 10.0, 1) for name, value, _ in channels}
@@ -989,6 +1036,7 @@ def detect_moments(
     # Candidatos: cada frase es un inicio; el final es el final natural de
     # una frase posterior dentro del rango de duración pedido.
     candidates: list[_ScoredCandidate] = []
+    best_score = 0.0
     stride = 1
     estimated = len(phrases) * max(1, int((maximum - minimum) / 5))
     if estimated > _MAX_CANDIDATES:
@@ -1006,6 +1054,7 @@ def detect_moments(
             if clip_duration < minimum:
                 continue
             score, breakdown, labels = scorer.score_window(first_idx, last_idx)
+            best_score = max(best_score, score)
             if score < threshold:
                 continue
             text = " ".join(phrase.text for phrase in phrases[first_idx : last_idx + 1])
@@ -1022,10 +1071,13 @@ def detect_moments(
                 )
             )
     if not candidates:
+        # Se registra la mejor puntuación encontrada: si el usuario
+        # reporta "cero clips", el log dice a cuánto quedó de pasar.
         logger.info(
             "El motor de señales no encontró momentos por encima del umbral "
-            "%.1f (cero clips, resultado válido).",
+            "%.1f (cero clips, resultado válido; mejor ventana: %.1f).",
             threshold,
+            best_score,
         )
         return []
     separation = (

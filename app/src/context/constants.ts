@@ -38,7 +38,9 @@ export type MomentEngine = 'signals' | 'signals+ai' | 'llm';
 
 export const MOMENT_ENGINE_STORAGE_KEY = 'kellyclipai-moment-engine';
 export const SIGNAL_THRESHOLD_STORAGE_KEY = 'kellyclipai-signal-threshold';
-export const DEFAULT_SIGNAL_THRESHOLD = 8.0;
+// v1.1.1: 5.0 (antes 8.0). Ver backend/schemas.py: con la calibración
+// original, 8.0 era inalcanzable para contenido conversacional realista.
+export const DEFAULT_SIGNAL_THRESHOLD = 5.0;
 
 export const MOMENT_ENGINE_LABELS: Record<MomentEngine, string> = {
   signals: 'Señales locales',

@@ -33,7 +33,11 @@ MomentEngine = Literal["signals", "signals+ai", "llm"]
 # por debajo no hay clip ("cero clips" es un resultado válido). Valor
 # inicial del informe (patrón Chopify); la calibración con videos reales
 # es la Fase E.
-DEFAULT_SIGNAL_SCORE_THRESHOLD = 8.0
+# v1.1.1: 5.0 (antes 8.0). Con la calibración original, 8.0 era
+# inalcanzable para contenido conversacional realista (Kelly reportó cero
+# clips ni con el umbral en 5.0); 5.0 es "buen momento normal" con las
+# curvas recalibradas. El usuario puede subirlo hasta 9.5 en la UI.
+DEFAULT_SIGNAL_SCORE_THRESHOLD = 5.0
 
 
 class ScheduledPublishing(BaseModel):
