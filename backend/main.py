@@ -61,6 +61,12 @@ from .editor import (
     render_editor_version,
     save_editor_draft,
 )
+from .face_tracking import (
+    STUDIO_FACE_TRACK_SAMPLE_RATE,
+    STUDIO_FACE_TRACK_SIZES,
+    FaceTrackingError,
+    analyze_source_face_track,
+)
 from .integrations import (
     IntegrationError,
     authorization_url,
@@ -85,6 +91,8 @@ from .schemas import (
     ClipResolutionRequest,
     CustomTemplateRequest,
     EditorRenderJobResponse,
+    FaceTrackKeyframe,
+    FaceTrackResponse,
     LLMConfig,
     LLMSettingsRequest,
     OverdueScheduleResolution,
@@ -290,6 +298,21 @@ def _probe_clip_dimensions(path: Path) -> tuple[int, int] | None:
         return int(metadata["width"]), int(metadata["height"])
     except (KeyError, MediaProcessingError, OSError, TypeError, ValueError):
         return None
+
+
+def _probe_source_duration(path: Path) -> float | None:
+    """Duración del video fuente según el archivo, o None si no se lee.
+
+    La sonda exige pista de audio (como el pipeline); un video sin
+    audio o ilegible devuelve None y el llamador usa la duración
+    guardada en el proyecto.
+    """
+    try:
+        metadata = probe_media(path, shutil.which("ffprobe") or "ffprobe")
+        duration = float(metadata["duration"])
+    except (KeyError, MediaProcessingError, OSError, TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
 
 
 def _validate_download_url(value: str) -> str:
@@ -2802,6 +2825,72 @@ def create_app(
             )
         words = project_transcript_words(project.get("transcript"), start, end)
         return {"cues": words_to_cues(words)}
+
+    @application.get(
+        "/api/projects/{project_id}/face-track",
+        response_model=FaceTrackResponse,
+    )
+    def project_face_track(
+        project_id: str,
+        ratio: str = Query(default="9:16"),
+    ) -> FaceTrackResponse:
+        """Pista de seguimiento facial del video fuente (Studio, v1.3.1).
+
+        Cubre el video fuente completo a 2 fps (el Studio reproduce el
+        fuente). Los keyframes llevan tiempos absolutos y x/y como
+        fracción del desplazamiento máximo de recorte en cada eje. Sin
+        rostro en todo el video devuelve has_face=false y keyframes=[]
+        (no es un error). Primera llamada lenta (el análisis recorre
+        el video entero; ver ``analyze_source_face_track``); las
+        siguientes, mismo proyecto y ratio, son instantáneas por la
+        caché en memoria, que se pierde al reiniciar el backend.
+        """
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if ratio not in STUDIO_FACE_TRACK_SIZES:
+            raise HTTPException(
+                status_code=400,
+                detail="El ratio no es válido: usa 9:16, 1:1 o 16:9.",
+            )
+        source_path = app_settings.data_dir / "projects" / project_id / "source"
+        if not source_path.is_file():
+            raise HTTPException(status_code=404, detail="El video original ya no está disponible.")
+        duration = _probe_source_duration(source_path) or project_duration(project)
+        if duration is None or duration <= 0:
+            raise HTTPException(
+                status_code=503,
+                detail="No se pudo determinar la duración del video original.",
+            )
+        output_width, output_height = STUDIO_FACE_TRACK_SIZES[ratio]
+        # Intervalos de habla de la transcripción del proyecto (espejo
+        # de render_clip, media.py): activan la selección del orador
+        # por apertura de labios. Sin transcripción, None.
+        words = project_transcript_words(project.get("transcript"), 0.0, duration)
+        speech_intervals = (
+            [(float(word["start"]), float(word["end"])) for word in words] or None
+        )
+        try:
+            has_face, keyframes = analyze_source_face_track(
+                source_path,
+                duration,
+                output_width,
+                output_height,
+                speech_intervals=speech_intervals,
+            )
+        except FaceTrackingError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return FaceTrackResponse(
+            project_id=project_id,
+            ratio=ratio,  # type: ignore[arg-type]  # validado arriba
+            duration=duration,
+            sample_fps=STUDIO_FACE_TRACK_SAMPLE_RATE,
+            has_face=has_face,
+            keyframes=[
+                FaceTrackKeyframe(time=point.time, x=point.x, y=point.y)
+                for point in keyframes
+            ],
+        )
 
     @application.put("/api/projects/{project_id}/clips/{clip_id}/studio")
     def save_clip_studio_edit(

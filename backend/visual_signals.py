@@ -23,12 +23,15 @@ Extracción (un solo proceso ffmpeg para cortes + movimiento):
 
 Velocidad (medido en esta VM, 1,5 CPU, video 720p 60 s): decodificación
 completa 9,3 s; con ``-skip_frame noref -lowres 1`` 2,8 s (3,3x, con
-detección de cortes IDÉNTICA en el video de prueba). Cortes y
-movimiento comparten UNA decodificación (filter_complex con split); los
-rostros necesitan una segunda pasada (otros fps y resolución, y la
-detección YuNet), por eso son opcionales (``include_face``). En el PC
+detección de cortes IDÉNTICA en el video de prueba). Los TRES canales
+comparten UNA decodificación (filter_complex con split en 3: movimiento
+a un archivo temporal, rostros por stdout, cortes por showinfo en
+stderr); antes los rostros usaban una segunda pasada y costaban otros
+~46 s en un video de 320 s. La fusión da timelines bit-idénticos
+(medido el 21-11-2026 en un video 1080p60 de 320 s con rostros en 314
+de 321 segundos: diferencia máxima 0.0 en los tres canales). En el PC
 de Kelly (Xeon de 14 núcleos) un video de 1 h queda en decenas de
-segundos por pasada.
+segundos.
 
 Calibración del movimiento crudo (MAD medio, niveles de gris 0-255,
 medido en esta VM a 160x90 y 2 fps): video estático 0,0; patrón
@@ -53,6 +56,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -211,8 +215,15 @@ def extract_scene_cut_timeline(
         os.devnull,
     ]
     try:
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
         result = subprocess.run(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            check=False,
         )
     except OSError as error:
         logger.warning("No se pudo detectar cortes de escena: %s", error)
@@ -316,7 +327,15 @@ def extract_motion_timeline(
         "-",
     ]
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
     except OSError as error:
         logger.warning("No se pudo extraer el movimiento: %s", error)
         return None
@@ -481,7 +500,15 @@ def extract_face_timeline(
         "-",
     ]
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
     except OSError as error:
         logger.warning("No se pudo extraer frames para la detección de rostros: %s", error)
         return None
@@ -584,7 +611,15 @@ def _extract_scene_and_motion(
         os.devnull,
     ]
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
     except OSError as error:
         logger.warning("No se pudo extraer las señales visuales: %s", error)
         return None, None, 0, 0.0
@@ -651,6 +686,195 @@ def _extract_scene_and_motion(
     return scene_timeline, motion_timeline, cut_count, mean_raw
 
 
+def _extract_all_visual(
+    input_path: Path | str,
+    ffmpeg_path: str,
+    duration: float,
+    *,
+    scene_threshold: float = _SCENE_THRESHOLD,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, int, float]:
+    """Cortes + movimiento + rostros en UN solo proceso ffmpeg (una decodificación).
+
+    filter_complex con split en 3: la rama de movimiento va a un
+    archivo temporal (gris 160x90 a 2 fps, ~29 KB/s: 9 MB en un video
+    de 320 s, ~415 MB en el peor caso de 4 h, borrado al terminar), la
+    de rostros por stdout (BGR 320x320 a 1 fps, detección YuNet en
+    streaming) y la de cortes a null con showinfo (tiempos del stderr,
+    drenado por un hilo). Un solo stdout obliga a sacar el movimiento
+    por archivo: dos pipes no existen en Windows y un hstack
+    complicaría el sincronizado de fps distintos.
+
+    Los timelines son los mismos que los de las dos pasadas separadas:
+    la rama de movimiento y la de cortes usan los mismos filtros y la
+    misma decodificación (``-skip_frame noref -lowres 1``); la de
+    rostros comparte esa decodificación a media resolución y en el
+    video de prueba dio detecciones bit-idénticas (ver el docstring
+    del módulo). Devuelve (cortes, movimiento, rostros, nº de cortes,
+    media cruda de movimiento); todo None si se canceló o no hubo
+    frames. Nunca lanza: cada canal que falla queda en None.
+    """
+    seconds = max(1, math.ceil(duration))
+    if should_cancel is not None and should_cancel():
+        return None, None, None, 0, 0.0
+    detector = _create_face_detector(None)
+    face_timeline: np.ndarray | None = (
+        np.zeros(seconds, dtype=np.float64) if detector is not None else None
+    )
+    size = _FACE_FRAME_SIZE
+    with tempfile.TemporaryDirectory(prefix="kca-visual-") as tmp_dir:
+        motion_path = os.path.join(tmp_dir, "motion.raw")
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-v",
+            "info",
+            "-nostats",
+            "-skip_frame",
+            "noref",
+            "-lowres",
+            "1",
+            "-i",
+            str(input_path),
+            "-an",
+            "-filter_complex",
+            (
+                "[0:v]split=3[m_in][s_in][f_in];"
+                f"[m_in]fps={_MOTION_FPS},scale={_MOTION_WIDTH}:{_MOTION_HEIGHT},format=gray[m];"
+                f"[s_in]select='gt(scene,{scene_threshold})',showinfo[s];"
+                f"[f_in]fps={_FACE_FPS},scale={size}:{size}:force_original_aspect_ratio=decrease,"
+                f"pad={size}:{size}:(ow-iw)/2:(oh-ih)/2,format=bgr24[f]"
+            ),
+            "-map",
+            "[m]",
+            "-f",
+            "rawvideo",
+            motion_path,
+            "-map",
+            "[f]",
+            "-f",
+            "rawvideo",
+            "-",
+            "-map",
+            "[s]",
+            "-f",
+            "null",
+            os.devnull,
+        ]
+        try:
+            # stdin DEVNULL: ffmpeg lee stdin para sus comandos
+            # interactivos y se bloquea si hereda un pipe abierto sin EOF.
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            logger.warning("No se pudo extraer las señales visuales: %s", error)
+            return None, None, None, 0, 0.0
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stderr_chunks: list[bytes] = []
+
+        def _drain_stderr() -> None:
+            try:
+                while True:
+                    chunk = process.stderr.read(65536)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            except (OSError, ValueError):
+                pass
+
+        drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        drain_thread.start()
+        frame_bytes = size * size * 3
+        frame_index = 0
+        saw_face_frames = False
+        cancelled = False
+        try:
+            while True:
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+                data = process.stdout.read(frame_bytes)
+                if len(data) < frame_bytes:
+                    break
+                saw_face_frames = True
+                if detector is not None and face_timeline is not None:
+                    frame = np.frombuffer(data, dtype=np.uint8).reshape(size, size, 3).copy()
+                    second = min(int(frame_index / _FACE_FPS), seconds - 1)
+                    try:
+                        _, detections = detector.detect(frame)
+                    except Exception as error:  # noqa: BLE001 - un frame malo no tumba el canal
+                        logger.warning(
+                            "La detección de rostros falló en el segundo %d: %s",
+                            second,
+                            error,
+                        )
+                    else:
+                        face_timeline[second] = max(
+                            face_timeline[second],
+                            _face_frame_value(detections, size, size),
+                        )
+                frame_index += 1
+        except (OSError, ValueError) as error:
+            logger.warning("La extracción de señales visuales falló a medias: %s", error)
+        finally:
+            if cancelled:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+            drain_thread.join(timeout=10)
+        if cancelled:
+            return None, None, None, 0, 0.0
+        stderr_text = b"".join(stderr_chunks).decode("utf-8", "replace")
+        cut_times = parse_showinfo_cut_times(stderr_text)
+        scene_timeline, cut_count = _scene_timeline_from_cut_times(cut_times, duration)
+        accumulator = _MotionAccumulator(seconds, _MOTION_FPS)
+        motion_frame_bytes = _MOTION_WIDTH * _MOTION_HEIGHT
+        try:
+            with open(motion_path, "rb") as motion_file:
+                while True:
+                    data = motion_file.read(motion_frame_bytes)
+                    if len(data) < motion_frame_bytes:
+                        break
+                    accumulator.add(np.frombuffer(data, dtype=np.uint8))
+        except OSError as error:
+            # ffmpeg falló antes de crear el archivo (p. ej. video
+            # inexistente): sin frames de movimiento.
+            logger.warning("No se pudo leer el movimiento extraído: %s", error)
+        if accumulator.frames == 0:
+            if not saw_face_frames:
+                detail = stderr_text.strip().splitlines()
+                logger.warning(
+                    "ffmpeg no devolvió frames para las señales visuales (%s).",
+                    detail[-1][:200] if detail else "sin pista de video",
+                )
+            return None, None, face_timeline if saw_face_frames else None, 0, 0.0
+        motion_timeline, mean_raw = _normalize_motion(accumulator.raw_per_second())
+        return (
+            scene_timeline,
+            motion_timeline,
+            face_timeline if saw_face_frames else None,
+            cut_count,
+            mean_raw,
+        )
+
+
 def extract_visual_timelines(
     input_path: Path | str,
     ffmpeg_path: str,
@@ -662,21 +886,28 @@ def extract_visual_timelines(
 ) -> VisualTimelines:
     """Extrae todas las señales visuales (el punto de entrada del pipeline).
 
-    Cortes + movimiento comparten una sola decodificación; los rostros
-    usan una segunda pasada (otros fps y resolución, y la detección
-    YuNet), por eso son opcionales. Nunca lanza: cada canal que falla
-    queda en None y el motor sigue con el resto.
+    Con rostros, los tres canales salen de UNA decodificación
+    (``_extract_all_visual``); sin rostros, cortes + movimiento usan
+    su propia pasada. Nunca lanza: cada canal que falla queda en None
+    y el motor sigue con el resto.
     """
-    scene, motion, cut_count, mean_raw = _extract_scene_and_motion(
-        input_path,
-        ffmpeg_path,
-        duration,
-        scene_threshold=scene_threshold,
-        should_cancel=should_cancel,
-    )
-    face = None
-    if include_face and not (should_cancel is not None and should_cancel()):
-        face = extract_face_timeline(input_path, ffmpeg_path, duration, should_cancel=should_cancel)
+    if include_face:
+        scene, motion, face, cut_count, mean_raw = _extract_all_visual(
+            input_path,
+            ffmpeg_path,
+            duration,
+            scene_threshold=scene_threshold,
+            should_cancel=should_cancel,
+        )
+    else:
+        scene, motion, cut_count, mean_raw = _extract_scene_and_motion(
+            input_path,
+            ffmpeg_path,
+            duration,
+            scene_threshold=scene_threshold,
+            should_cancel=should_cancel,
+        )
+        face = None
     return VisualTimelines(
         scene_cuts=scene,
         motion=motion,

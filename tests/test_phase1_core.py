@@ -1284,3 +1284,96 @@ def test_delete_project_still_rejects_active_processing_via_api(
 
     assert response.status_code == 409
     assert database.get_project(settings.database_path, project_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# v1.3.1: cableado del modo rápido (fast_detection) en process_project
+# ---------------------------------------------------------------------------
+
+
+def test_fast_detection_defaults_to_full_engine() -> None:
+    assert ProjectConfig().fast_detection is False
+    assert ProjectConfig(fast_detection=True).fast_detection is True
+
+
+def _run_project_with_fast(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    fast_detection: bool,
+) -> tuple[list[dict[str, Any]], list[tuple[Any, ...]]]:
+    """Ejecuta process_project con el proposer y el solape instrumentados.
+
+    Devuelve (llamadas a _propose_valid_clips, llamadas a
+    _start_signal_channels). El proyecto NO trae transcripción guardada,
+    para pasar por la rama que transcribe (la única donde vive la puerta
+    de solape: sin transcripción no hay ventana que solapar). Las puertas
+    de solape se fuerzan abiertas para que el único factor sea
+    fast_detection.
+    """
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    project_id = str(uuid.uuid4())
+    _create_ready_project(
+        settings,
+        project_id,
+        config=ProjectConfig(fast_detection=fast_detection),
+    )
+    _mock_ffmpeg_and_llm(monkeypatch)
+    _mock_render(monkeypatch)
+    monkeypatch.setattr(
+        pipeline,
+        "probe_media",
+        lambda *_args, **_kwargs: {"width": 720, "height": 1280, "duration": 100},
+    )
+    monkeypatch.setattr(pipeline, "create_thumbnail", lambda *_args, **_kwargs: None)
+    fake_transcript = [
+        TranscriptSegment.model_validate(segment) for segment in _transcript_data()
+    ]
+    monkeypatch.setattr(
+        pipeline, "transcribe", lambda *_args, **_kwargs: (fake_transcript, "es")
+    )
+    propose_calls: list[dict[str, Any]] = []
+
+    def fake_propose(*_args: object, **kwargs: Any) -> list[ClipProposal]:
+        propose_calls.append(kwargs)
+        return [_proposal("Nuevo")]
+
+    monkeypatch.setattr(pipeline, "_propose_valid_clips", fake_propose)
+    start_calls: list[tuple[Any, ...]] = []
+
+    def fake_start(*args: Any) -> Any:
+        start_calls.append(args)
+        return None
+
+    monkeypatch.setattr(pipeline, "_should_overlap_channels", lambda: True)
+    monkeypatch.setattr(pipeline, "_signal_models_cached", lambda: True)
+    monkeypatch.setattr(pipeline, "_start_signal_channels", fake_start)
+    pipeline.process_project(project_id, None, settings)
+    return propose_calls, start_calls
+
+
+def test_process_project_passes_fast_to_proposer_and_skips_overlap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Con fast_detection, el proposer recibe fast=True y no se arrancan
+    canales en segundo plano (el modo rápido los abandonaría)."""
+    propose_calls, start_calls = _run_project_with_fast(
+        monkeypatch, tmp_path, fast_detection=True
+    )
+    assert len(propose_calls) == 1
+    assert propose_calls[0]["fast"] is True
+    assert start_calls == []
+
+
+def test_process_project_without_fast_starts_overlap_channels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sin fast_detection, el proposer recibe fast=False y el solape
+    arranca los canales cuando las puertas están abiertas."""
+    propose_calls, start_calls = _run_project_with_fast(
+        monkeypatch, tmp_path, fast_detection=False
+    )
+    assert len(propose_calls) == 1
+    assert propose_calls[0]["fast"] is False
+    assert len(start_calls) == 1

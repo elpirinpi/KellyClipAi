@@ -1049,3 +1049,57 @@ def test_detect_moments_clip_ends_do_not_cut_words() -> None:
     all_words = [word for item in transcript for word in item.words]
     for clip in clips:
         assert not any(word.start < clip.fin < word.end for word in all_words)
+
+
+# --- selección con semántica perezosa (v1.3.1) --------------------------------
+
+
+def test_select_diverse_only_touches_embeddings_it_needs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Con max_clips=2, _select_diverse solo pide 2 embeddings de 70."""
+    from backend import semantic
+
+    touched: list[int] = []
+    seen_texts: list[list[str]] = []
+
+    class _RecordingLazy:
+        def __init__(self, texts: list[str], **kwargs: Any) -> None:
+            seen_texts.append(texts)
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def get(self, index: int) -> np.ndarray:
+            touched.append(index)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[index % 384] = 1.0  # Ortogonales: sin filtrado por paráfrasis.
+            return vector
+
+    monkeypatch.setattr(semantic, "LazyEmbeddings", _RecordingLazy)
+    candidates = [
+        _candidate(
+            7.5,
+            float(i * 60),
+            float(i * 60 + 20),
+            # Sufijo de letras (el tokenizador TF-IDF quita dígitos):
+            # cada candidato tiene tokens propios, sin duplicados TF-IDF.
+            " ".join(
+                f"{stem}{chr(97 + i % 26)}{chr(97 + i // 26)}"
+                for stem in ("palabra", "unica", "distinta", "tema", "especial", "raro")
+            ),
+        )
+        for i in range(70)
+    ]
+    selected = _select_diverse(
+        candidates,
+        threshold=5.0,
+        separation_seconds=0.001,  # Sin supresión por cercanía.
+        max_clips=2,
+        idf_corpus=[c.text for c in candidates],
+        enable_semantic=True,
+    )
+    assert len(selected) == 2
+    assert len(seen_texts[0]) == 70  # Recibió todos los textos...
+    assert set(touched) == {0, 1}  # ...pero solo embebió los 2 necesarios.

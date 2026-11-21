@@ -18,6 +18,7 @@ import {
   apiCuesToLocal,
   exportStudioVideo,
   fetchClipCues,
+  fetchFaceTrack,
   fetchRangeCues,
   saveStudioEdit,
 } from './api';
@@ -29,14 +30,17 @@ import { StudioHeader, type StudioSaveState } from './components/StudioHeader';
 import { Timeline } from './components/Timeline';
 import {
   DEFAULT_SETTINGS,
+  getCanvasDimensions,
   normalizeStudioEdit,
   type EditorSettings,
+  type FaceTrack,
+  type FaceTrackStatus,
   type LeftTab,
   type SafeZoneMode,
   type StudioEditSpec,
   type SubtitleCue,
 } from './types/editor';
-import { renderEditorFrame } from './utils/canvasRenderer';
+import { renderEditorFrame, smoothFaceTrack } from './utils/canvasRenderer';
 import { exportSubtitlesToSRT, formatTime, parseSRT, splitScriptToSubtitles } from './utils/srt';
 import './studio.css';
 
@@ -105,7 +109,7 @@ export function StudioPage({
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportStatus, setExportStatus] = useState(
-    'Preparando renderizado en 1080×1920 con mezcla de audio...'
+    'Preparando renderizado con mezcla de audio...'
   );
   const [scriptModalOpen, setScriptModalOpen] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -121,6 +125,13 @@ export function StudioPage({
   const [savedSpecJson, setSavedSpecJson] = useState<string | null>(null);
   const [cuesReady, setCuesReady] = useState(false);
 
+  // Pista de seguimiento facial (follow-cam, v1.3.1): dato calculado
+  // por el backend, con caché propia por proyecto+ratio; nunca se
+  // guarda en studio_edit. Mientras carga o si falla, el encuadre
+  // sigue centrado (el interruptor queda activo pero sin efecto).
+  const [faceTrack, setFaceTrack] = useState<FaceTrack | null>(null);
+  const [faceTrackStatus, setFaceTrackStatus] = useState<FaceTrackStatus>('idle');
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const bgmRef = useRef<HTMLAudioElement | null>(null);
@@ -132,6 +143,8 @@ export function StudioPage({
 
   const settingsRef = useRef(settings);
   const subtitlesRef = useRef(subtitles);
+  const faceTrackRef = useRef<FaceTrack | null>(null);
+  const faceTrackCacheRef = useRef(new Map<string, FaceTrack>());
   const sourceReadyRef = useRef(false);
   const isPlayingRef = useRef(isPlaying);
   const loopRef = useRef(loop);
@@ -160,6 +173,7 @@ export function StudioPage({
 
   settingsRef.current = settings;
   subtitlesRef.current = subtitles;
+  faceTrackRef.current = faceTrack;
   sourceReadyRef.current = sourceState === 'ready';
   isPlayingRef.current = isPlaying;
   loopRef.current = loop;
@@ -272,6 +286,50 @@ export function StudioPage({
     return () => controller.abort();
   }, [initialized, cuesReady, clipId, isManual, duration, projectId, nextCueId, showToast]);
 
+  // Pista de seguimiento facial al activar "Seguir rostro" (v1.3.1):
+  // caché por proyecto+ratio en un ref; si cambia el ratio con el
+  // seguimiento activo, se vuelve a pedir. La primera llamada tarda
+  // (el backend recorre el video entero); mientras tanto el render
+  // sigue centrado. Si la petición falla (red, 404, 503), un solo
+  // toast y fallback a centrado: el interruptor queda activo pero sin
+  // efecto visible, y el estado en el LeftSidebar lo refleja.
+  useEffect(() => {
+    if (!settings.faceFollow) {
+      setFaceTrack(null);
+      setFaceTrackStatus('idle');
+      return;
+    }
+    const cacheKey = `${projectId}:${settings.ratio}`;
+    const cached = faceTrackCacheRef.current.get(cacheKey);
+    if (cached) {
+      setFaceTrack(cached);
+      setFaceTrackStatus(cached.hasFace ? 'ready' : 'no-face');
+      return;
+    }
+    let cancelled = false;
+    setFaceTrack(null);
+    setFaceTrackStatus('loading');
+    fetchFaceTrack(projectId, settings.ratio)
+      .then((track) => {
+        if (cancelled) return;
+        const smoothed = smoothFaceTrack(track);
+        faceTrackCacheRef.current.set(cacheKey, smoothed);
+        setFaceTrack(smoothed);
+        setFaceTrackStatus(smoothed.hasFace ? 'ready' : 'no-face');
+      })
+      .catch((trackError: unknown) => {
+        if (cancelled) return;
+        setFaceTrack(null);
+        setFaceTrackStatus('error');
+        showToast(trackError instanceof Error
+          ? `No se pudo calcular el seguimiento de rostro: ${trackError.message}`
+          : 'No se pudo calcular el seguimiento de rostro.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.faceFollow, settings.ratio, projectId, showToast]);
+
   const getBlurResources = useCallback(() => {
     if (!blurCanvasRef.current) {
       const bc = document.createElement('canvas');
@@ -306,6 +364,11 @@ export function StudioPage({
         currentTime: t,
         settings: settingsRef.current,
         subtitles: subtitlesRef.current,
+        // La exportación MediaRecorder captura este mismo canvas y el
+        // bucle de dibujo es el mismo (rAF llama a drawCurrentFrame
+        // también durante la exportación), así que el follow-cam se
+        // aplica en la exportación sin ningún cambio en ese camino.
+        faceTrack: faceTrackRef.current,
       });
     },
     [getBlurResources]
@@ -471,7 +534,7 @@ export function StudioPage({
     if (!isPlaying && !isExporting) {
       drawCurrentFrame();
     }
-  }, [settings, subtitles, sourceState, isPlaying, isExporting, drawCurrentFrame]);
+  }, [settings, subtitles, sourceState, isPlaying, isExporting, drawCurrentFrame, faceTrack]);
 
   useEffect(() => {
     applyAudioVolumes(settings.volVideo, settings.volBgm, hasBgm);
@@ -645,9 +708,16 @@ export function StudioPage({
     setSourceState('ready');
     setSourceError('');
     const start = settingsRef.current.trimStart;
-    v.currentTime = start;
-    setCurrentTime(start);
-    drawCurrentFrame(start);
+    // Clamp de seek (lección de ShortStudio): nunca buscar a 0 exacto,
+    // porque asignar el currentTime actual no dispara 'seeked' y el
+    // primer frame quedaría sin dibujar. Si la duración no es válida,
+    // solo se aplica el suelo de 0.01 s.
+    const clampedStart = Number.isFinite(dur) && dur > 0.05
+      ? Math.min(dur - 0.05, Math.max(0.01, start))
+      : Math.max(0.01, start);
+    v.currentTime = clampedStart;
+    setCurrentTime(clampedStart);
+    drawCurrentFrame(clampedStart);
   };
 
   const handleVideoError = () => {
@@ -881,7 +951,8 @@ export function StudioPage({
     setIsExporting(true);
     isExportingRef.current = true;
     setExportProgress(0);
-    setExportStatus('Renderizando en 1080×1920 (30fps)... No minimices esta pestaña.');
+    const exportDims = getCanvasDimensions(spec.settings.ratio);
+    setExportStatus(`Renderizando en ${exportDims.width}×${exportDims.height} (30fps)... No minimices esta pestaña.`);
     setBannerError('');
 
     if (speakerGainRef.current && audioCtxRef.current) {
@@ -984,7 +1055,7 @@ export function StudioPage({
         const pct = Math.min(100, Math.max(0, (elapsed / segDur) * 100));
         setExportProgress(pct);
         setExportStatus(
-          `Renderizando 1080×1920 · ${pct.toFixed(0)}% (${formatTime(elapsed)} / ${formatTime(segDur)})`
+          `Renderizando ${exportDims.width}×${exportDims.height} · ${pct.toFixed(0)}% (${formatTime(elapsed)} / ${formatTime(segDur)})`
         );
 
         if (cur >= s.trimEnd || videoRef.current?.ended) {
@@ -1046,9 +1117,13 @@ export function StudioPage({
           ref={videoRef}
           src={`${API_BASE}/api/projects/${projectId}/source`}
           playsInline
+          preload="auto"
           crossOrigin="use-credentials"
           onLoadedMetadata={handleVideoLoadedMetadata}
           onError={handleVideoError}
+          onLoadedData={() => {
+            if (!isPlayingRef.current) drawCurrentFrame();
+          }}
           onSeeked={() => {
             if (!isPlayingRef.current) drawCurrentFrame();
           }}
@@ -1103,6 +1178,7 @@ export function StudioPage({
             duration={duration}
             hasBgm={hasBgm}
             bgmName={bgmName}
+            faceTrackStatus={faceTrackStatus}
             onUpdateSetting={updateSetting}
             onApplySubtitlePreset={applySubtitlePreset}
             onTrimStartChange={handleTrimStartChange}
@@ -1118,6 +1194,7 @@ export function StudioPage({
 
           <PreviewStage
             canvasRef={canvasRef}
+            ratio={settings.ratio}
             safeZone={safeZone}
             onSafeZoneChange={setSafeZone}
             sourceState={sourceState}

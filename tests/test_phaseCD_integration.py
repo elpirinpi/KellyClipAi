@@ -242,7 +242,7 @@ def test_pipeline_wires_visual_semantic_and_profile(monkeypatch: pytest.MonkeyPa
         lambda *a, **k: _fake_visual(),
     )
     monkeypatch.setattr(
-        "backend.semantic.ensure_minilm_model",
+        "backend.semantic.preload_minilm_model",
         lambda *a, **k: Path("minilm.onnx"),
     )
     monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
@@ -268,7 +268,7 @@ def test_pipeline_wires_visual_semantic_and_profile(monkeypatch: pytest.MonkeyPa
 
 
 def test_pipeline_semantic_failure_disables_semantic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Si ensure_minilm_model falla, enable_semantic=False y todo sigue."""
+    """Si preload_minilm_model falla, enable_semantic=False y todo sigue."""
     seen: dict[str, Any] = {}
 
     def _fake_detect(transcript: Any, project: Any, duration: float, **kwargs: Any) -> list:
@@ -284,7 +284,7 @@ def test_pipeline_semantic_failure_disables_semantic(monkeypatch: pytest.MonkeyP
         "backend.visual_signals.extract_visual_timelines",
         lambda *a, **k: _fake_visual(),
     )
-    monkeypatch.setattr("backend.semantic.ensure_minilm_model", _fail)
+    monkeypatch.setattr("backend.semantic.preload_minilm_model", _fail)
     monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
     result = _propose_valid_clips(
         _transcript(),
@@ -310,7 +310,7 @@ def test_pipeline_semantic_cancelled_from_ensure(monkeypatch: pytest.MonkeyPatch
         "backend.visual_signals.extract_visual_timelines",
         lambda *a, **k: _fake_visual(),
     )
-    monkeypatch.setattr("backend.semantic.ensure_minilm_model", _cancelled)
+    monkeypatch.setattr("backend.semantic.preload_minilm_model", _cancelled)
     with pytest.raises(ProjectCancelled):
         _propose_valid_clips(
             _transcript(),
@@ -335,7 +335,7 @@ def test_pipeline_semantic_cancelled_from_detect(monkeypatch: pytest.MonkeyPatch
         lambda *a, **k: _fake_visual(),
     )
     monkeypatch.setattr(
-        "backend.semantic.ensure_minilm_model",
+        "backend.semantic.preload_minilm_model",
         lambda *a, **k: Path("minilm.onnx"),
     )
     monkeypatch.setattr("backend.moments.detect_moments", _cancelled_detect)
@@ -365,7 +365,7 @@ def test_pipeline_visual_failure_keeps_tier0(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("backend.diarization.get_speaker_timeline", lambda *a, **k: None)
     monkeypatch.setattr("backend.visual_signals.extract_visual_timelines", _boom)
     monkeypatch.setattr(
-        "backend.semantic.ensure_minilm_model",
+        "backend.semantic.preload_minilm_model",
         lambda *a, **k: Path("minilm.onnx"),
     )
     monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
@@ -398,7 +398,7 @@ def test_pipeline_empty_transcript_skips_downloads(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr("backend.audio_events.get_event_timeline", _record("events"))
     monkeypatch.setattr("backend.diarization.get_speaker_timeline", _record("diarization"))
     monkeypatch.setattr("backend.visual_signals.extract_visual_timelines", _record("visual"))
-    monkeypatch.setattr("backend.semantic.ensure_minilm_model", _record("semantic"))
+    monkeypatch.setattr("backend.semantic.preload_minilm_model", _record("semantic"))
     monkeypatch.setattr("backend.moments.detect_moments", lambda *a, **k: [])
     result = _propose_valid_clips([], ProjectConfig(), 120.0, None)
     assert result == []
@@ -479,7 +479,7 @@ def test_pipeline_wires_speaker_timeline(monkeypatch: pytest.MonkeyPatch) -> Non
         lambda *a, **k: _fake_visual(),
     )
     monkeypatch.setattr(
-        "backend.semantic.ensure_minilm_model",
+        "backend.semantic.preload_minilm_model",
         lambda *a, **k: Path("minilm.onnx"),
     )
     monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
@@ -529,7 +529,7 @@ def test_pipeline_diarization_none_keeps_working(monkeypatch: pytest.MonkeyPatch
         lambda *a, **k: _fake_visual(),
     )
     monkeypatch.setattr(
-        "backend.semantic.ensure_minilm_model",
+        "backend.semantic.preload_minilm_model",
         lambda *a, **k: Path("minilm.onnx"),
     )
     monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
@@ -543,3 +543,173 @@ def test_pipeline_diarization_none_keeps_working(monkeypatch: pytest.MonkeyPatch
     )
     assert result == []
     assert seen["speaker_timeline"] is None
+
+
+# --- modo rápido + solape de canales (v1.3.1) ---------------------------------
+
+
+def test_fast_mode_skips_optional_channels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fast=True: ningún canal opcional se extrae; detect_moments en Tier 0."""
+
+    def _must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("el modo rápido no debe extraer canales opcionales")
+
+    monkeypatch.setattr("backend.audio_events.get_event_timeline", _must_not_run)
+    monkeypatch.setattr("backend.diarization.get_speaker_timeline", _must_not_run)
+    monkeypatch.setattr("backend.visual_signals.extract_visual_timelines", _must_not_run)
+    monkeypatch.setattr("backend.semantic.preload_minilm_model", _must_not_run)
+    seen: dict[str, Any] = {}
+
+    def _fake_detect(transcript: Any, project: Any, duration: float, **kwargs: Any) -> list:
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
+    monkeypatch.setattr(
+        "backend.moments.extract_audio_timeline", lambda *a, **k: np.zeros(120)
+    )
+    result = _propose_valid_clips(
+        _transcript(),
+        ProjectConfig(),
+        120.0,
+        None,
+        input_path=Path("video.mp4"),
+        ffmpeg_path="ffmpeg",
+        fast=True,
+    )
+    assert result == []
+    assert seen["input_path"] is None  # detect_moments no extrae lo visual.
+    assert seen["enable_semantic"] is False
+    assert seen["audio_timeline"] is not None
+
+
+def test_fast_mode_abandons_background_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fast=True con handle en segundo plano: se abandona, no se espera."""
+    from backend.pipeline import _ChannelsHandle
+
+    abandoned: list[bool] = []
+    handle = _ChannelsHandle.__new__(_ChannelsHandle)
+    handle._future = None  # type: ignore[attr-defined]
+    handle._cancelled = False  # type: ignore[attr-defined]
+    handle._executor = None  # type: ignore[attr-defined]
+
+    def _abandon() -> None:
+        abandoned.append(True)
+
+    monkeypatch.setattr(handle, "abandon", _abandon)
+    monkeypatch.setattr("backend.moments.detect_moments", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "backend.moments.extract_audio_timeline", lambda *a, **k: np.zeros(120)
+    )
+    _propose_valid_clips(
+        _transcript(),
+        ProjectConfig(),
+        120.0,
+        None,
+        input_path=Path("video.mp4"),
+        ffmpeg_path="ffmpeg",
+        channels=handle,
+        fast=True,
+    )
+    assert abandoned == [True]
+
+
+def test_overlap_handle_results_are_consumed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un handle de solape entrega sus canales a detect_moments sin re-extraer."""
+    from backend.pipeline import _start_signal_channels
+
+    events = np.zeros(120)
+    events[10] = 1.0
+    speakers = np.zeros(120)
+    speakers[20] = 0.5
+    monkeypatch.setattr("backend.audio_events.get_event_timeline", lambda *a, **k: events)
+    monkeypatch.setattr("backend.diarization.get_speaker_timeline", lambda *a, **k: speakers)
+    monkeypatch.setattr(
+        "backend.visual_signals.extract_visual_timelines",
+        lambda *a, **k: _fake_visual(),
+    )
+    monkeypatch.setattr(
+        "backend.semantic.preload_minilm_model", lambda *a, **k: Path("minilm.onnx")
+    )
+    monkeypatch.setattr(
+        "backend.moments.extract_audio_timeline", lambda *a, **k: np.zeros(120)
+    )
+    handle = _start_signal_channels(Path("video.mp4"), 120.0, "ffmpeg", None)
+    handle.results()  # Espera a que termine ANTES de re-parchear.
+    seen: dict[str, Any] = {}
+
+    def _fake_detect(transcript: Any, project: Any, duration: float, **kwargs: Any) -> list:
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr("backend.moments.detect_moments", _fake_detect)
+    # Los mocks ya no deben llamarse: los canales vienen del handle.
+    monkeypatch.setattr(
+        "backend.audio_events.get_event_timeline",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-extracción")),
+    )
+    result = _propose_valid_clips(
+        _transcript(), ProjectConfig(), 120.0, None, channels=handle
+    )
+    assert result == []
+    assert seen["event_timeline"] is events
+    assert seen["speaker_timeline"] is speakers
+    assert seen["face_timeline"] is not None
+    assert seen["enable_semantic"] is True
+
+
+def test_overlap_gate_needs_many_cpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    """El solape solo se activa con >= 8 CPU lógicas."""
+    import os
+
+    from backend.pipeline import _should_overlap_channels
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    assert _should_overlap_channels() is False
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    assert _should_overlap_channels() is True
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert _should_overlap_channels() is False
+
+
+def test_signal_models_cached_needs_all_three(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_signal_models_cached es True solo con los 3 modelos en caché."""
+    from backend import audio_events, diarization, semantic
+    from backend.pipeline import _signal_models_cached
+
+    monkeypatch.setattr(audio_events, "is_tier1_available", lambda: True)
+    monkeypatch.setattr(diarization, "is_diarization_available", lambda: True)
+    monkeypatch.setattr(semantic, "is_semantic_available", lambda: True)
+    assert _signal_models_cached() is True
+    monkeypatch.setattr(diarization, "is_diarization_available", lambda: False)
+    assert _signal_models_cached() is False
+
+
+def test_channels_handle_abandon_stops_slow_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """abandon() despierta un trabajo lento que respeta should_cancel."""
+    import time
+
+    from backend.audio_events import AudioEventsCancelled
+    from backend.pipeline import _start_signal_channels
+
+    def _slow_events(*args: Any, **kwargs: Any) -> Any:
+        should_cancel = kwargs.get("should_cancel")
+        for _ in range(600):  # Hasta 60 s si nadie lo abandona.
+            if should_cancel is not None and should_cancel():
+                raise AudioEventsCancelled("abandonado")
+            time.sleep(0.1)
+        return None
+
+    monkeypatch.setattr("backend.audio_events.get_event_timeline", _slow_events)
+    monkeypatch.setattr("backend.diarization.get_speaker_timeline", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "backend.visual_signals.extract_visual_timelines", lambda *a, **k: None
+    )
+    monkeypatch.setattr("backend.semantic.preload_minilm_model", lambda *a, **k: None)
+    monkeypatch.setattr("backend.moments.extract_audio_timeline", lambda *a, **k: None)
+    handle = _start_signal_channels(Path("video.mp4"), 120.0, "ffmpeg", None)
+    time.sleep(0.3)  # Deja que el trabajo lento arranque.
+    started = time.monotonic()
+    handle.abandon()
+    assert time.monotonic() - started < 10.0
+    handle.abandon()  # Idempotente.

@@ -79,6 +79,8 @@ export function AppShell() {
           setMomentEngine={config.setMomentEngine}
           signalThreshold={config.signalThreshold}
           setSignalThreshold={config.setSignalThreshold}
+          fastDetection={config.fastDetection}
+          setFastDetection={config.setFastDetection}
           theme={theme.preference}
           setTheme={theme.setPreference}
           onBack={() => navigate(settingsReturnPath)}

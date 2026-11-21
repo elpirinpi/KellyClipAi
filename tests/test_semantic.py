@@ -25,6 +25,7 @@ from backend import semantic  # noqa: E402
 from backend.semantic import (  # noqa: E402
     DEFAULT_PARAPHRASE_THRESHOLD,
     EMBEDDING_DIM,
+    LazyEmbeddings,
     SemanticCancelled,
     SemanticError,
     _load_tokenizer,
@@ -32,6 +33,7 @@ from backend.semantic import (  # noqa: E402
     _WordPieceTokenizer,
     embed_texts,
     find_paraphrase_duplicates,
+    preload_minilm_model,
     semantic_similarity,
 )
 
@@ -765,3 +767,137 @@ def test_real_minilm_progress_reaches_100() -> None:
     assert embeddings is not None
     assert calls[0] == 0
     assert calls[-1] == 100
+
+
+# --- embeddings perezosos (v1.3.1): solo se embeben los lotes tocados -------
+
+
+def _seed_caches(
+    monkeypatch: pytest.MonkeyPatch,
+    session: Any,
+    tokenizer: _WordPieceTokenizer,
+) -> Path:
+    """Sesión + tokenizador falsos en las cachés del módulo (sin descargas)."""
+    model_path = Path("/cache/minilm.onnx")
+    semantic._SESSION_CACHE = (model_path, session)  # type: ignore[attr-defined]
+    semantic._TOKENIZER_CACHE = (model_path, tokenizer)  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        semantic, "ensure_minilm_model", lambda *a, **k: model_path
+    )
+    return model_path
+
+
+def test_lazy_embeddings_matches_eager(
+    tiny_tokenizer: _WordPieceTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LazyEmbeddings devuelve los mismos vectores que embed_texts directo."""
+    session = _FakeSession()
+    _seed_caches(monkeypatch, session, tiny_tokenizer)
+    texts = [f"hola mundo {i}" for i in range(70)]
+    eager = embed_texts(texts, session=session, tokenizer=tiny_tokenizer)
+    assert eager is not None
+    lazy = LazyEmbeddings(texts)
+    assert lazy.available
+    for index in (0, 31, 32, 33, 63, 64, 69):
+        assert np.array_equal(lazy.get(index), eager[index])
+
+
+def test_lazy_embeddings_only_embeds_touched_batches(
+    tiny_tokenizer: _WordPieceTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El constructor embebe el lote 0; tocar otro lote embebe solo ese."""
+    session = _FakeSession()
+    _seed_caches(monkeypatch, session, tiny_tokenizer)
+    texts = [f"hola mundo {i}" for i in range(70)]
+    lazy = LazyEmbeddings(texts)
+    assert len(session.feeds) == 1  # Lote 0, eager en el constructor.
+    assert session.feeds[0]["input_ids"].shape[0] == 32
+    lazy.get(0)
+    lazy.get(31)  # Mismo lote: sin inferencia nueva.
+    assert len(session.feeds) == 1
+    lazy.get(64)  # Tercer lote (solo 6 textos).
+    assert len(session.feeds) == 2
+    assert session.feeds[1]["input_ids"].shape[0] == 6
+
+
+def test_lazy_embeddings_empty_get_is_none() -> None:
+    lazy = LazyEmbeddings([])
+    assert lazy.get(0) is None
+    assert lazy.get(-1) is None
+
+
+def test_lazy_embeddings_failed_first_batch_is_unavailable(
+    tiny_tokenizer: _WordPieceTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Si el primer lote falla, available es False y get devuelve None."""
+
+    class _FailingSession(_FakeSession):
+        def run(self, _outputs: list[str], feeds: dict[str, np.ndarray]) -> list[np.ndarray]:
+            raise RuntimeError("sesión rota")
+
+    _seed_caches(monkeypatch, _FailingSession(), tiny_tokenizer)
+    lazy = LazyEmbeddings(["hola"])
+    assert not lazy.available
+    assert lazy.get(0) is None
+
+
+def test_lazy_embeddings_get_out_of_range_is_none(
+    tiny_tokenizer: _WordPieceTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_caches(monkeypatch, _FakeSession(), tiny_tokenizer)
+    lazy = LazyEmbeddings(["hola"])
+    assert lazy.get(-1) is None
+    assert lazy.get(1) is None
+
+
+def test_embed_texts_skips_ensure_when_session_cached(
+    tiny_tokenizer: _WordPieceTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con sesión + tokenizador en caché, embed_texts no llama a ensure."""
+    model_path = Path("/cache/minilm.onnx")
+    semantic._SESSION_CACHE = (model_path, _FakeSession())  # type: ignore[attr-defined]
+    semantic._TOKENIZER_CACHE = (model_path, tiny_tokenizer)  # type: ignore[attr-defined]
+
+    def _must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("ensure_minilm_model no debe llamarse con caché llena")
+
+    monkeypatch.setattr(semantic, "ensure_minilm_model", _must_not_run)
+    embeddings = embed_texts(["hola"])
+    assert embeddings is not None
+    assert embeddings.shape == (1, EMBEDDING_DIM)
+
+
+def test_preload_minilm_model_loads_session_and_tokenizer(
+    tiny_tokenizer: _WordPieceTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """preload asegura el modelo y deja cargados sesión + tokenizador."""
+    model_path = Path("/cache/minilm.onnx")
+    session = _FakeSession()
+    monkeypatch.setattr(semantic, "ensure_minilm_model", lambda *a, **k: model_path)
+    monkeypatch.setattr(semantic, "load_minilm_session", lambda path: session)
+    monkeypatch.setattr(semantic, "_load_tokenizer", lambda path: tiny_tokenizer)
+    assert preload_minilm_model() == model_path
+
+
+def test_preload_minilm_model_failure_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Si ensure falla, preload propaga SemanticError (el pipeline lo caza)."""
+
+    def _fail(*args: Any, **kwargs: Any) -> Any:
+        raise SemanticError("sin modelo")
+
+    monkeypatch.setattr(semantic, "ensure_minilm_model", _fail)
+    with pytest.raises(SemanticError):
+        preload_minilm_model()
+
+
+def test_preload_minilm_model_cancelled_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _cancelled(*args: Any, **kwargs: Any) -> Any:
+        raise SemanticCancelled("cancelado")
+
+    monkeypatch.setattr(semantic, "ensure_minilm_model", _cancelled)
+    with pytest.raises(SemanticCancelled):
+        preload_minilm_model()

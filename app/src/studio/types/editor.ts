@@ -4,6 +4,7 @@
 // exportación; es JSON plano y versionada para poder migrarla.
 
 export type FitMode = 'cover' | 'blur' | 'fit';
+export type TargetRatio = '9:16' | '1:1' | '16:9';
 export type SafeZoneMode = 'none' | 'tiktok' | 'shorts' | 'grid';
 export type SubMode = 'karaoke' | 'reveal' | 'bounce' | 'classic';
 export type SubBgMode = 'none' | 'word-pill' | 'line-box' | 'glass-card';
@@ -17,12 +18,49 @@ export interface SubtitleCue {
   text: string;
 }
 
+// Pista de seguimiento facial (follow-cam, v1.3.1), respuesta de
+// GET /api/projects/{id}/face-track ya validada por api.ts. Los
+// tiempos son absolutos del video fuente, ascendentes; x/y son la
+// posición de la ventana de recorte como FRACCIÓN del desplazamiento
+// máximo en cada eje (0 = un extremo, 1 = el otro, 0.5 = centrado o
+// sin desplazamiento posible en ese eje). Sin rostro en todo el
+// video, hasFace es false y keyframes va vacío (no es un error).
+// La pista es dato calculado por el backend: vive solo en memoria
+// (caché en StudioPage), nunca en studio_edit.
+export interface FaceTrackKeyframe {
+  time: number;
+  x: number;
+  y: number;
+}
+
+export interface FaceTrack {
+  projectId: string;
+  ratio: TargetRatio;
+  duration: number;
+  sampleFps: number;
+  hasFace: boolean;
+  keyframes: FaceTrackKeyframe[];
+}
+
+// Estado de la pista para el interruptor "Seguir rostro" del
+// LeftSidebar: 'idle' = interruptor apagado; 'loading' = pidiendo
+// la pista (la primera llamada recorre el video entero y tarda);
+// 'ready' = pista lista; 'no-face' = has_face=false; 'error' = la
+// petición falló (red, 404, 503): el interruptor queda activo pero
+// el encuadre sigue centrado.
+export type FaceTrackStatus = 'idle' | 'loading' | 'ready' | 'no-face' | 'error';
+
 export interface EditorSettings {
+  ratio: TargetRatio;
   fitMode: FitMode;
   zoom: number;
   panX: number;
   panY: number;
   rounded: boolean;
+  // Seguimiento de rostro (follow-cam, v1.3.1): solo tiene efecto en
+  // modo cover; la pista la calcula el backend y NO se guarda en
+  // studio_edit (se pide de nuevo al activar el interruptor).
+  faceFollow: boolean;
 
   trimStart: number;
   trimEnd: number;
@@ -61,11 +99,13 @@ export interface StudioEditSpec {
 }
 
 export const DEFAULT_SETTINGS: EditorSettings = {
+  ratio: '9:16',
   fitMode: 'cover',
   zoom: 100,
   panX: 0,
   panY: 0,
   rounded: true,
+  faceFollow: false,
 
   trimStart: 0,
   trimEnd: 12,
@@ -107,11 +147,19 @@ export function normalizeStudioEdit(value: unknown): StudioEditSpec | null {
   if (!Array.isArray(spec.cues)) return null;
   const settings: EditorSettings = { ...DEFAULT_SETTINGS };
   for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof EditorSettings>) {
+    // El ratio se valida aparte: el filtro por tipo dejaría pasar
+    // cualquier string guardado ('4:3', 'vertical'...).
+    if (key === 'ratio') continue;
     const candidate = (spec.settings as Partial<EditorSettings>)[key];
     if (typeof candidate === typeof DEFAULT_SETTINGS[key]) {
       (settings as unknown as Record<string, unknown>)[key] = candidate;
     }
   }
+  const savedRatio = (spec.settings as Partial<EditorSettings>).ratio;
+  settings.ratio =
+    savedRatio === '9:16' || savedRatio === '1:1' || savedRatio === '16:9'
+      ? savedRatio
+      : '9:16';
   const cues: SubtitleCue[] = [];
   spec.cues.forEach((cue, index) => {
     if (typeof cue !== 'object' || cue === null) return;
@@ -135,4 +183,13 @@ export function normalizeStudioEdit(value: unknown): StudioEditSpec | null {
   });
   cues.sort((a, b) => a.start - b.start);
   return { version: 1, settings, cues };
+}
+
+// Dimensiones del canvas de render y exportación según el ratio
+// (verificado contra shortstudio-v2 src/types/editor.ts:332-336).
+// Cualquier valor fuera de los tres válidos cae al 9:16 por defecto.
+export function getCanvasDimensions(ratio: TargetRatio): { width: number; height: number } {
+  if (ratio === '1:1') return { width: 1080, height: 1080 };
+  if (ratio === '16:9') return { width: 1920, height: 1080 };
+  return { width: 1080, height: 1920 };
 }

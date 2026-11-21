@@ -18,7 +18,7 @@ function defaultModelFor(provider: string): string {
   }[provider] ?? '';
 }
 
-export function SettingsPage({ provider, setProvider, whisper, setWhisper, momentEngine, setMomentEngine, signalThreshold, setSignalThreshold, theme, setTheme, onBack, onNotice }: {
+export function SettingsPage({ provider, setProvider, whisper, setWhisper, momentEngine, setMomentEngine, signalThreshold, setSignalThreshold, fastDetection, setFastDetection, theme, setTheme, onBack, onNotice }: {
   provider: string;
   setProvider: (value: string) => void;
   whisper: string;
@@ -27,6 +27,8 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
   setMomentEngine: (value: MomentEngine) => void;
   signalThreshold: number;
   setSignalThreshold: (value: number) => void;
+  fastDetection: boolean;
+  setFastDetection: (value: boolean) => void;
   theme: ThemePreference;
   setTheme: (value: ThemePreference) => void;
   onBack: () => void;
@@ -226,6 +228,18 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
             /></label>
           )}
         </div>
+        {/* v1.3.1: detección rápida (Tier 0) por defecto en los proyectos
+        nuevos — solo aplica a los motores de señales. */}
+        {momentEngine !== 'llm' && (
+          <label className="fast-detection-toggle">
+            <input
+              type="checkbox"
+              checked={fastDetection}
+              onChange={(event) => setFastDetection(event.target.checked)}
+            />
+            <span><strong>Detección rápida por defecto</strong><small>Solo audio y texto (Tier 0): la búsqueda de clips tarda segundos en vez de minutos, sin análisis de video, hablantes ni semántica. La transcripción tarda lo mismo.</small></span>
+          </label>
+        )}
         <p className="settings-explainer">El motor de señales mide la energía del audio, el ritmo del habla y los ganchos del texto, y solo convierte en clips los momentos por encima del umbral. Si un video no da clips, baja el umbral y reprocesa. El modo “Solo IA” necesita la clave del proveedor.</p>
       </section>
       {/* Fase 2 (ítem 17): apariencia — modo oscuro con seguimiento del sistema. */}

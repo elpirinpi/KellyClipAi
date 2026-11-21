@@ -160,6 +160,20 @@ def _lip_measurements(
 
 
 _SAMPLE_RATE = 4.0
+# Frecuencia de muestreo del seguimiento facial para el editor visual
+# (v1.3.1, GET /api/projects/{id}/face-track): el render de clips
+# muestrea a 4 fps, pero la pista del Studio cubre el video fuente
+# completo y 2 fps bastan para interpolar el recorte en el navegador;
+# a 4 fps un video de 1 h analizaría 14.400 fotogramas.
+STUDIO_FACE_TRACK_SAMPLE_RATE = 2.0
+# Dimensiones de salida por ratio para la pista del Studio. La
+# geometría de recorte depende del ratio, así que cada ratio tiene su
+# propia entrada en la caché (la clave incluye las dimensiones).
+STUDIO_FACE_TRACK_SIZES: dict[str, tuple[int, int]] = {
+    "9:16": (1080, 1920),
+    "1:1": (1080, 1080),
+    "16:9": (1920, 1080),
+}
 _MAX_DETECTOR_DIMENSION = 1280
 _DROPOUT_HOLD_SECONDS = 1.5
 _MAX_KEYFRAMES = 48
@@ -173,10 +187,12 @@ _LIP_LANDMARKER: tuple[Any, Any] | None = None
 # si hay voz): es el paso más caro del render después del propio encode,
 # y el editor lo repetía entero en cada re-render del mismo clip. Clave:
 # identidad del archivo (ruta + tamaño + mtime) + inicio del clip +
-# rangos retenidos + dimensiones de salida + intervalos de voz. Si cambia
-# cualquiera de ellos, la clave cambia y la caché se invalida sola. Los
-# resultados son listas de FaceCropKeyframe (frozen): seguros de compartir
-# entre renders. Acotada (LRU simple por orden de inserción).
+# rangos retenidos + dimensiones de salida + intervalos de voz +
+# frecuencia de muestreo (el render usa 4 fps y la pista del Studio
+# 2 fps, sin colisionar). Si cambia cualquiera de ellos, la clave
+# cambia y la caché se invalida sola. Los resultados son listas de
+# FaceCropKeyframe (frozen): seguros de compartir entre renders.
+# Acotada (LRU simple por orden de inserción).
 _FACE_ANALYSIS_CACHE: dict[tuple[Any, ...], list[list[FaceCropKeyframe] | None]] = {}
 _FACE_ANALYSIS_CACHE_LOCK = threading.Lock()
 _FACE_ANALYSIS_CACHE_MAX_ENTRIES = 16
@@ -189,6 +205,7 @@ def _face_cache_key(
     output_width: int,
     output_height: int,
     speech_intervals: list[tuple[float, float]] | None,
+    sample_rate: float = _SAMPLE_RATE,
 ) -> tuple[Any, ...] | None:
     try:
         stat = input_path.stat()
@@ -204,6 +221,7 @@ def _face_cache_key(
         tuple(
             (round(start, 3), round(end, 3)) for start, end in (speech_intervals or [])
         ),
+        round(sample_rate, 3),
     )
 
 
@@ -239,6 +257,18 @@ def _crop_position(
     x = min(max_x, max(0.0, face_center[0] * scale - output_width / 2))
     y = min(max_y, max(0.0, face_center[1] * scale - output_height * headroom))
     return x, y
+
+
+def _crop_fraction(value: float, maximum: float) -> float:
+    """Posición de recorte como fracción del desplazamiento máximo.
+
+    Sin desplazamiento posible en ese eje (la fuente y la salida
+    coinciden en esa dimensión), la ventana está centrada: 0.5. Se
+    limita a [0, 1] por redondeo de coma flotante.
+    """
+    if maximum <= 0:
+        return 0.5
+    return min(1.0, max(0.0, value / maximum))
 
 
 def _intersection_over_union(left: _Face, right: _Face) -> float:
@@ -392,13 +422,18 @@ def analyze_face_crop_paths(
     output_height: int,
     speech_intervals: list[tuple[float, float]] | None = None,
     on_progress: Callable[[float], None] | None = None,
+    sample_rate: float = _SAMPLE_RATE,
 ) -> list[list[FaceCropKeyframe] | None]:
     """Rutas de recorte facial, con caché por clip (B-R4).
 
     En un acierto de caché se devuelve el resultado guardado sin abrir
     el video ni cargar OpenCV/MediaPipe; se sigue notificando el 100 %
-    de progreso para que el llamador no se quede esperando.
+    de progreso para que el llamador no se quede esperando. La
+    frecuencia de muestreo forma parte de la clave de caché: el render
+    de clips usa 4 fps y la pista del Studio 2 fps sin colisionar.
     """
+    if sample_rate <= 0:
+        raise ValueError("La frecuencia de muestreo debe ser positiva.")
     cache_key = _face_cache_key(
         input_path,
         clip_start,
@@ -406,6 +441,7 @@ def analyze_face_crop_paths(
         output_width,
         output_height,
         speech_intervals,
+        sample_rate,
     )
     if cache_key is not None:
         with _FACE_ANALYSIS_CACHE_LOCK:
@@ -422,6 +458,7 @@ def analyze_face_crop_paths(
         output_height,
         speech_intervals=speech_intervals,
         on_progress=on_progress,
+        sample_rate=sample_rate,
     )
     if cache_key is not None:
         with _FACE_ANALYSIS_CACHE_LOCK:
@@ -429,6 +466,94 @@ def analyze_face_crop_paths(
             while len(_FACE_ANALYSIS_CACHE) > _FACE_ANALYSIS_CACHE_MAX_ENTRIES:
                 _FACE_ANALYSIS_CACHE.pop(next(iter(_FACE_ANALYSIS_CACHE)))
     return result
+
+
+def _probe_video_dimensions(input_path: Path) -> tuple[int, int]:
+    """Dimensiones del video sin decodificar fotogramas (solo metadatos)."""
+    try:
+        import cv2
+    except ImportError as error:
+        raise FaceTrackingError(
+            "Falta OpenCV para realizar el seguimiento facial. Reinstala la aplicación."
+        ) from error
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        capture.release()
+        raise FaceTrackingError("No se pudo abrir el video para analizar los rostros.")
+    try:
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    if width < 1 or height < 1:
+        raise FaceTrackingError("No se pudieron leer las dimensiones del video.")
+    return width, height
+
+
+def analyze_source_face_track(
+    input_path: Path,
+    duration: float,
+    output_width: int,
+    output_height: int,
+    speech_intervals: list[tuple[float, float]] | None = None,
+    sample_rate: float = STUDIO_FACE_TRACK_SAMPLE_RATE,
+) -> tuple[bool, list[FaceCropKeyframe]]:
+    """Pista de seguimiento facial del video fuente completo (Studio, v1.3.1).
+
+    Reutiliza ``analyze_face_crop_paths`` con un solo intervalo
+    (0, duration) y clip_start=0, y convierte las posiciones de
+    recorte en píxeles a FRACCIONES del desplazamiento máximo en cada
+    eje (x = cropX / maxX; 0.5 si no hay desplazamiento posible en ese
+    eje), para que el frontend las convierta a píxeles según su zoom.
+    Devuelve (has_face, keyframes): tiempos absolutos del fuente,
+    ascendentes, como mucho ``_MAX_KEYFRAMES`` (48) tras la
+    simplificación. Sin rostro en todo el video — o si la fuente y la
+    salida comparten aspecto y la ventana de recorte no puede moverse —
+    devuelve (False, []).
+
+    Caché: la misma caché en memoria del análisis facial (clave:
+    identidad del archivo + intervalo + dimensiones de salida +
+    intervalos de voz + frecuencia de muestreo), así que cada ratio
+    tiene su propia entrada y la segunda llamada es instantánea. La
+    caché se pierde al reiniciar el backend, igual que en el render.
+
+    Latencia (estimación a partir del muestreo, sin mediciones en este
+    entorno): a 2 fps, un video de 1 h son 7.200 muestras (una
+    detección YuNet por muestra, más FaceLandmarker en las muestras
+    con voz y rostro), y el muestreo secuencial decodifica
+    prácticamente todos los fotogramas del video entre muestras
+    (~108.000 a 30 fps). En una CPU modesta, del orden de 10–20 min
+    para 1 h a 1080p, escalando linealmente con la duración (un video
+    de 10 min, unos 2–4 min). La primera llamada es lenta; las
+    siguientes, con la caché caliente, son instantáneas.
+    """
+    if duration <= 0:
+        raise ValueError("La duración del video debe ser positiva.")
+    paths = analyze_face_crop_paths(
+        input_path,
+        0.0,
+        [(0.0, duration)],
+        output_width,
+        output_height,
+        speech_intervals=speech_intervals,
+        sample_rate=sample_rate,
+    )
+    points = paths[0] if paths else None
+    if not points:
+        return False, []
+    source_width, source_height = _probe_video_dimensions(input_path)
+    _, max_x, max_y = _crop_geometry(
+        source_width, source_height, output_width, output_height
+    )
+    keyframes = [
+        FaceCropKeyframe(
+            point.time,
+            _crop_fraction(point.x, max_x),
+            _crop_fraction(point.y, max_y),
+        )
+        for point in points
+    ]
+    return True, keyframes
 
 
 def _analyze_face_crop_paths_uncached(
@@ -439,6 +564,7 @@ def _analyze_face_crop_paths_uncached(
     output_height: int,
     speech_intervals: list[tuple[float, float]] | None = None,
     on_progress: Callable[[float], None] | None = None,
+    sample_rate: float = _SAMPLE_RATE,
 ) -> list[list[FaceCropKeyframe] | None]:
     model_path = Path(__file__).with_name("models") / _MODEL_FILENAME
     if not model_path.is_file():
@@ -493,7 +619,7 @@ def _analyze_face_crop_paths_uncached(
         any_face_detected = False
         all_paths: list[list[FaceCropKeyframe] | None] = []
         total_samples = sum(
-            max(1, math.ceil((interval_end - interval_start) * _SAMPLE_RATE))
+            max(1, math.ceil((interval_end - interval_start) * sample_rate))
             for interval_start, interval_end in intervals
         )
         if total_samples == 0:
@@ -506,7 +632,7 @@ def _analyze_face_crop_paths_uncached(
 
         for interval_start, interval_end in intervals:
             interval_duration = interval_end - interval_start
-            sample_count = max(1, math.ceil(interval_duration * _SAMPLE_RATE))
+            sample_count = max(1, math.ceil(interval_duration * sample_rate))
             if sequential_sampling:
                 sequential_sampling = capture.set(
                     cv2.CAP_PROP_POS_MSEC,

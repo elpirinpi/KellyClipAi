@@ -1,11 +1,13 @@
 import { RotateCcw, Trash2 } from 'lucide-react';
 import {
   EditorSettings,
+  FaceTrackStatus,
   FitMode,
   LeftTab,
   ProgressPos,
   SubBgMode,
   SubMode,
+  TargetRatio,
 } from '../types/editor';
 
 interface LeftSidebarProps {
@@ -15,6 +17,9 @@ interface LeftSidebarProps {
   duration: number;
   hasBgm: boolean;
   bgmName: string;
+  // Estado de la pista de seguimiento facial (v1.3.1): lo gestiona
+  // StudioPage; aquí solo se muestra junto al interruptor.
+  faceTrackStatus: FaceTrackStatus;
   onUpdateSetting: <K extends keyof EditorSettings>(key: K, value: EditorSettings[K]) => void;
   onApplySubtitlePreset: (patch: Partial<EditorSettings>) => void;
   onTrimStartChange: (val: number) => void;
@@ -31,6 +36,7 @@ export function LeftSidebar({
   duration,
   hasBgm,
   bgmName,
+  faceTrackStatus,
   onUpdateSetting,
   onApplySubtitlePreset,
   onTrimStartChange,
@@ -183,7 +189,7 @@ export function LeftSidebar({
           <>
             <section className="p-4 flex flex-col gap-3.5">
               <div className="flex items-center justify-between">
-                <h2 className="text-xs font-semibold text-slate-300">Modo 9:16</h2>
+                <h2 className="text-xs font-semibold text-slate-300">Formato y Encuadre</h2>
                 <button
                   type="button"
                   onClick={onResetFraming}
@@ -192,6 +198,29 @@ export function LeftSidebar({
                   <RotateCcw className="w-3 h-3" />
                   <span>Restablecer</span>
                 </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5 bg-[#0b0d11] p-1 rounded-lg border border-slate-800/80">
+                {(
+                  [
+                    { id: '9:16', label: '9:16 Short' },
+                    { id: '1:1', label: '1:1 Cuadrado' },
+                    { id: '16:9', label: '16:9 Horiz.' },
+                  ] as Array<{ id: TargetRatio; label: string }>
+                ).map((r) => (
+                  <button
+                    key={r.id}
+                    type="button"
+                    onClick={() => onUpdateSetting('ratio', r.id)}
+                    className={`py-1.5 px-1.5 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                      settings.ratio === r.id
+                        ? 'bg-indigo-600 text-white'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {r.label}
+                  </button>
+                ))}
               </div>
 
               <div className="grid grid-cols-3 gap-1.5 bg-[#0b0d11] p-1 rounded-lg border border-slate-800/80">
@@ -215,6 +244,40 @@ export function LeftSidebar({
                     {mode.label}
                   </button>
                 ))}
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
+                  <span>Seguir rostro</span>
+                  <input
+                    type="checkbox"
+                    checked={settings.faceFollow}
+                    onChange={(e) => onUpdateSetting('faceFollow', e.target.checked)}
+                    className="w-4 h-4 accent-indigo-500 cursor-pointer"
+                  />
+                </label>
+                {settings.faceFollow && faceTrackStatus === 'loading' && (
+                  <p className="text-[11px] text-slate-500">Calculando…</p>
+                )}
+                {settings.faceFollow && faceTrackStatus === 'no-face' && (
+                  // Texto neutro a propósito: has_face=false también se
+                  // devuelve cuando el ratio no deja moverse al recorte
+                  // (p. ej. fuente 16:9 con ratio 16:9), no solo cuando
+                  // no hay rostros en el video.
+                  <p className="text-[11px] text-slate-500">Seguimiento no disponible para este video o formato</p>
+                )}
+                {settings.faceFollow && faceTrackStatus === 'error' && (
+                  <p className="text-[11px] text-slate-500">
+                    No se pudo calcular el seguimiento
+                  </p>
+                )}
+                {settings.faceFollow
+                  && faceTrackStatus === 'ready'
+                  && settings.fitMode !== 'cover' && (
+                  <p className="text-[11px] text-slate-500">
+                    Solo se aplica en modo Llenar
+                  </p>
+                )}
               </div>
 
               <div className="flex flex-col gap-1.5">

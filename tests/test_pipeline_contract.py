@@ -699,6 +699,8 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
             # v1.1.1: el umbral por defecto bajó de 8.0 a 5.0 (ver
             # backend/schemas.py: 8.0 era inalcanzable para contenido real).
             "signal_score_threshold": 5.0,
+            # v1.3.1: detección rápida desactivada por defecto.
+            "fast_detection": False,
             "subtitle_style": {
                 "font_family": None,
                 "font_size": None,

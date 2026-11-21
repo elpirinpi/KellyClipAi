@@ -520,7 +520,14 @@ def test_get_project_cues_404_for_missing_project(tmp_path: Path) -> None:
 def test_put_studio_saves_edit_and_survives_round_trip(tmp_path: Path) -> None:
     settings = _settings(tmp_path / "data")
     _create_project(settings, "project-1", clips=[_clip("clip-1")])
-    edit = {"ratio": "9:16", "captions": {"enabled": True, "style": "karaoke"}}
+    # Spec con la forma real de StudioEditSpec (v1.3.1): el ratio vive
+    # en settings.ratio; el backend la trata como un dict opaco y debe
+    # devolverla tal cual, sin validar ni tocar el ratio.
+    edit = {
+        "version": 1,
+        "settings": {"ratio": "1:1", "fitMode": "cover", "zoom": 100},
+        "cues": [{"id": 1, "start": 0.0, "end": 2.0, "text": "Hola"}],
+    }
     with _client(settings) as client:
         response = client.put(
             "/api/projects/project-1/clips/clip-1/studio",
@@ -528,14 +535,17 @@ def test_put_studio_saves_edit_and_survives_round_trip(tmp_path: Path) -> None:
         )
         assert response.status_code == 200
         assert response.json()["studio_edit"] == edit
+        assert response.json()["studio_edit"]["settings"]["ratio"] == "1:1"
         assert response.json()["video_url"] == "/api/projects/project-1/clips/clip-1/file"
         detail = client.get("/api/projects/project-1")
     assert detail.status_code == 200
     saved = next(clip for clip in detail.json()["clips"] if clip["id"] == "clip-1")
     assert saved["studio_edit"] == edit
+    assert saved["studio_edit"]["settings"]["ratio"] == "1:1"
     stored = database.get_project(settings.database_path, "project-1")
     assert stored is not None
     assert stored["clips"][0]["studio_edit"] == edit
+    assert stored["clips"][0]["studio_edit"]["settings"]["ratio"] == "1:1"
 
 
 def test_put_studio_404_for_missing_clip(tmp_path: Path) -> None:

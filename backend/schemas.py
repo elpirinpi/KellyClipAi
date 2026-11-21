@@ -118,6 +118,12 @@ class ProjectConfig(BaseModel):
     signal_score_threshold: float = Field(
         default=DEFAULT_SIGNAL_SCORE_THRESHOLD, ge=0, le=10
     )
+    # Detección rápida (v1.3.1): solo Tier 0 (transcripción + timeline de
+    # audio + señales de texto), sin YAMNet, diarización, visual ni
+    # semántica. La fase de señales pasa de minutos a segundos; el motor
+    # completo sigue siendo el predeterminado. Solo aplica a los motores
+    # de señales; el modo "llm" lo ignora.
+    fast_detection: bool = False
     schedule: ScheduledPublishing | None = None
 
 
@@ -306,6 +312,42 @@ class StudioEditRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     studio_edit: dict[str, Any]
+
+
+class FaceTrackKeyframe(BaseModel):
+    """Un keyframe de la pista de seguimiento facial (Studio, v1.3.1).
+
+    ``time`` es el tiempo absoluto en segundos del video fuente.
+    ``x`` e ``y`` son la posición de la ventana de recorte como
+    FRACCIÓN del desplazamiento máximo en cada eje (0 = un extremo,
+    1 = el otro, 0.5 = centrado o sin desplazamiento posible en ese
+    eje); el frontend las convierte a píxeles según su zoom.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    time: float = Field(ge=0)
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+
+
+class FaceTrackResponse(BaseModel):
+    """Respuesta de GET /api/projects/{id}/face-track (Studio, v1.3.1).
+
+    La pista cubre el video fuente completo. Sin rostro en todo el
+    video, ``has_face`` es False y ``keyframes`` va vacío (no es un
+    error). Como mucho 48 keyframes (tope de la simplificación del
+    seguimiento facial).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str
+    ratio: Literal["9:16", "1:1", "16:9"]
+    duration: float = Field(gt=0)
+    sample_fps: float = Field(gt=0)
+    has_face: bool
+    keyframes: list[FaceTrackKeyframe] = Field(default_factory=list)
 
 
 class ClipArchiveRequest(BaseModel):

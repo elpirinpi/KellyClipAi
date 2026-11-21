@@ -486,7 +486,15 @@ def extract_audio_timeline(
         "-",
     ]
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
     except OSError as error:
         logger.warning("No se pudo extraer el audio para el motor de señales: %s", error)
         return rms
@@ -1319,7 +1327,10 @@ def _select_diverse(
       TF-IDF, se descarta un candidato si su embedding MiniLM es casi
       idéntico al de un clip elegido (coseno > umbral, 0.85 por
       defecto): caza paráfrasis (misma idea con otras palabras) que el
-      TF-IDF no ve. Filtro ADICIONAL, nunca reemplazo: si los
+      TF-IDF no ve. Los embeddings se calculan por lotes bajo demanda
+      (``semantic.LazyEmbeddings``): solo los que el bucle toca, en
+      los mismos lotes que ``embed_texts`` directo (bit-idénticos).
+      Filtro ADICIONAL, nunca reemplazo: si los
       embeddings no están disponibles, la selección sigue solo con
       TF-IDF. La cancelación del usuario (``SemanticCancelled``) NO se
       traga: se propaga para que el pipeline la traduzca.
@@ -1331,7 +1342,7 @@ def _select_diverse(
     if not ordered:
         return []
     vectors = _tfidf_vectors([cand.text for cand in ordered], idf_corpus)
-    embeddings: np.ndarray | None = None
+    lazy_embeddings = None
     if enable_semantic:
         try:
             from . import semantic
@@ -1340,15 +1351,16 @@ def _select_diverse(
         if semantic is not None:
             if semantic_threshold is None:
                 semantic_threshold = semantic.DEFAULT_PARAPHRASE_THRESHOLD
-            embeddings = semantic.embed_texts(
+            # Perezoso: solo se embeben los lotes que el bucle toca
+            # (medido: 6 de 323 textos en un video real); los lotes son
+            # los mismos que los de embed_texts directo, así que los
+            # vectores son bit-idénticos. Si el primer lote falla, lo
+            # semántico queda desactivado como antes.
+            lazy_embeddings = semantic.LazyEmbeddings(
                 [cand.text for cand in ordered], should_cancel=should_cancel
             )
-            if embeddings is not None and embeddings.shape[0] != len(ordered):
-                logger.warning(
-                    "Los embeddings semánticos no cubren todos los candidatos; "
-                    "se sigue solo con TF-IDF."
-                )
-                embeddings = None
+            if not lazy_embeddings.available:
+                lazy_embeddings = None
     selected: list[_ScoredCandidate] = []
     selected_vectors: list[dict[str, float]] = []
     selected_embeddings: list[np.ndarray] = []
@@ -1379,19 +1391,22 @@ def _select_diverse(
         ):
             continue
         if (
-            embeddings is not None
+            lazy_embeddings is not None
             and selected_embeddings
             and semantic_threshold is not None
-            and any(
-                float(embeddings[index] @ chosen) > semantic_threshold
-                for chosen in selected_embeddings
-            )
         ):
-            continue
+            embedding = lazy_embeddings.get(index)
+            if embedding is not None and any(
+                float(embedding @ chosen) > semantic_threshold
+                for chosen in selected_embeddings
+            ):
+                continue
         selected.append(candidate)
         selected_vectors.append(vector)
-        if embeddings is not None:
-            selected_embeddings.append(embeddings[index])
+        if lazy_embeddings is not None:
+            embedding = lazy_embeddings.get(index)
+            if embedding is not None:
+                selected_embeddings.append(embedding)
     return sorted(selected, key=lambda cand: cand.start)
 
 

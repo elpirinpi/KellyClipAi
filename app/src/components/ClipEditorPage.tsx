@@ -328,10 +328,11 @@ export function ClipEditorPage({
                 src={`${API_BASE}/api/projects/${projectId}/source`}
                 style={{ display: 'none' }}
                 playsInline
-                preload="metadata"
+                preload="auto"
                 crossOrigin="use-credentials"
                 onLoadedMetadata={preview.handleLoadedMetadata}
                 onError={preview.handleVideoError}
+                onLoadedData={preview.handleLoadedData}
                 onSeeked={preview.handleSeeked}
               />
               <div className="editor-preview-frame">

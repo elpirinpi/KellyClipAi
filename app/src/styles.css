@@ -218,6 +218,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .settings-explainer { margin: 15px 0 0; padding: 11px 12px; border-radius: 8px; background: #f7f7fa; color: #5f6b80; font-size: 11px; line-height: 1.55; }
+/* v1.3.1: toggle de detección rápida en la tarjeta del motor de momentos. */
+.fast-detection-toggle { display: flex; align-items: flex-start; gap: 9px; margin: 14px 0 0; cursor: pointer; }
+.fast-detection-toggle input { margin-top: 2px; accent-color: #7c5cff; }
+.fast-detection-toggle span { display: flex; flex-direction: column; gap: 2px; }
+.fast-detection-toggle strong { font-size: 13px; font-weight: 600; }
+.fast-detection-toggle small { color: #5f6b80; font-size: 11px; line-height: 1.5; }
 .save-settings { margin-top: 14px; }
 .integrations-list .card-heading { margin-bottom: 12px; }
 .integration-icon { color: #8062df; }

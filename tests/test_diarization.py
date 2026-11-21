@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -420,10 +421,16 @@ class _FakeSegSession:
 
 
 class _FakeEmbSession:
-    """Sesión de embedding simulada: alterna dos vectores ortogonales."""
+    """Sesión de embedding simulada: alterna dos vectores ortogonales.
+
+    Segura para hilos: el diarizador corre los embeddings en un pool
+    por defecto, y sin el lock dos llamadas concurrentes podrían leer
+    el mismo contador y devolver el mismo vector.
+    """
 
     def __init__(self) -> None:
         self.calls = 0
+        self._lock = threading.Lock()
 
     def get_inputs(self) -> list[_FakeIO]:
         return [_FakeIO("x")]
@@ -432,9 +439,10 @@ class _FakeEmbSession:
         return [_FakeIO("embedding")]
 
     def run(self, _outputs: list[str], _feed: dict[str, Any]) -> list[np.ndarray]:
-        emb = np.zeros((1, 192), dtype=np.float32)
-        emb[0, self.calls % 2] = 1.0
-        self.calls += 1
+        with self._lock:
+            emb = np.zeros((1, 192), dtype=np.float32)
+            emb[0, self.calls % 2] = 1.0
+            self.calls += 1
         return [emb]
 
 
@@ -918,3 +926,54 @@ def test_real_diarization_tone_is_no_speech(tmp_path: Path) -> None:
     assert result.num_speakers == 0
     assert result.segments == []
     assert float(np.max(result.timeline)) == 0.0
+
+
+# --- embeddings en paralelo (v1.3.1): mismo resultado que en serie -----------
+
+class _DeterministicFakeEmbSession:
+    """Embedding derivado solo del feed: misma entrada -> mismo vector.
+
+    El fake alternante (_FakeEmbSession) depende del orden de llamada,
+    que con el pool no es determinista; este permite comparar en serie
+    y en paralelo sin flakiness.
+    """
+
+    def get_inputs(self) -> list[_FakeIO]:
+        return [_FakeIO("x")]
+
+    def get_outputs(self) -> list[_FakeIO]:
+        return [_FakeIO("embedding")]
+
+    def run(self, _outputs: list[str], feed: dict[str, Any]) -> list[np.ndarray]:
+        feats = np.asarray(feed["x"], dtype=np.float64)
+        emb = np.zeros((1, 192), dtype=np.float32)
+        emb[0, 0] = float(feats.mean())
+        emb[0, 1] = float(feats.std())
+        return [emb]
+
+
+def test_parallel_embeddings_match_sequential() -> None:
+    """embed_workers=4 da las mismas clases, pares y embeddings que =1."""
+    rng = np.random.default_rng(7)
+    audio = rng.normal(0, 0.1, 90 * _SAMPLE_RATE).astype(np.float32)
+    seg_seq = _FakeSegSession(pattern=lambda frame: frame % 3)
+    diar_seq = _StreamingDiarizer(seg_seq, _DeterministicFakeEmbSession(), embed_workers=1)
+    diar_seq.feed(audio)
+    classes_seq, pairs_seq, embs_seq, total_seq = diar_seq.finish()
+    seg_par = _FakeSegSession(pattern=lambda frame: frame % 3)
+    diar_par = _StreamingDiarizer(seg_par, _DeterministicFakeEmbSession(), embed_workers=4)
+    diar_par.feed(audio)
+    classes_par, pairs_par, embs_par, total_par = diar_par.finish()
+    assert total_seq == total_par
+    assert np.array_equal(classes_seq, classes_par)
+    assert pairs_seq == pairs_par
+    assert embs_seq.shape == embs_par.shape
+    assert np.array_equal(embs_seq, embs_par)
+    assert len(pairs_seq) > 0  # El test ejercita de verdad el pool.
+
+
+def test_diarizer_close_is_idempotent() -> None:
+    diar = _StreamingDiarizer(_FakeSegSession(), _FakeEmbSession())
+    diar.feed(np.zeros(20 * _SAMPLE_RATE, dtype=np.float32))
+    diar.close()
+    diar.close()  # Sin error la segunda vez.

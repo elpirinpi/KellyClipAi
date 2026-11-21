@@ -30,6 +30,7 @@ export function HomePage() {
       schedulePlatform, setSchedulePlatform, scheduleVisibility, setScheduleVisibility,
       whisperLanguage, setWhisperLanguage, subtitleStyle, setSubtitleStyle,
       momentEngine, setMomentEngine, signalThreshold, setSignalThreshold,
+      fastDetection, setFastDetection,
       visibleTemplates, saveCurrentTemplate, onTemplateTabKeyDown,
     },
     importer: {
@@ -188,6 +189,18 @@ export function HomePage() {
                 </label>
               )}
             </div>
+            {/* v1.3.1: detección rápida (Tier 0) — solo aplica a los
+            motores de señales; el modo "Solo IA" lo ignora. */}
+            {momentEngine !== 'llm' && (
+              <label className="fast-detection-toggle">
+                <input
+                  type="checkbox"
+                  checked={fastDetection}
+                  onChange={(event) => setFastDetection(event.target.checked)}
+                />
+                <span><strong>Detección rápida</strong><small>Solo audio y texto (Tier 0): la búsqueda de clips tarda segundos en vez de minutos, sin análisis de video, hablantes ni semántica. La transcripción tarda lo mismo.</small></span>
+              </label>
+            )}
             <p className="settings-explainer">
               {momentEngine === 'signals'
                 ? 'El motor local mide la energía del audio, el ritmo del habla y los ganchos del texto. Funciona sin conexión y sin clave de IA.'

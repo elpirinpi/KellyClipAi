@@ -20,6 +20,17 @@ import type { SourceState } from '../components/PreviewStage';
 import type { EditorSettings, SubtitleCue } from '../types/editor';
 import { renderEditorFrame } from '../utils/canvasRenderer';
 
+// Clamp de seek (lección de ShortStudio): nunca buscar a 0 exacto —
+// asignar el currentTime actual no dispara 'seeked', y sin ese evento
+// el primer frame no se dibuja. Si la duración no es válida, solo se
+// aplica el suelo de 0.01 s.
+function clampSeekTarget(target: number, duration: number): number {
+  const floored = Math.max(0.01, target);
+  return Number.isFinite(duration) && duration > 0.05
+    ? Math.min(duration - 0.05, floored)
+    : floored;
+}
+
 export interface CanvasPreviewOptions {
   enabled: boolean;
   settings: EditorSettings;
@@ -43,6 +54,7 @@ export interface CanvasPreview {
   playFrom: (time: number) => void;
   retrySource: () => void;
   handleLoadedMetadata: () => void;
+  handleLoadedData: () => void;
   handleVideoError: () => void;
   handleSeeked: () => void;
 }
@@ -152,9 +164,10 @@ export function useCanvasPreview({
   useEffect(() => {
     if (!enabled || !sourceReadyRef.current || !videoRef.current) return;
     if (isPlayingRef.current) return;
-    videoRef.current.currentTime = trimStart;
-    setCurrentTime(trimStart);
-    drawCurrentFrame(trimStart);
+    const clampedStart = clampSeekTarget(trimStart, videoRef.current.duration);
+    videoRef.current.currentTime = clampedStart;
+    setCurrentTime(clampedStart);
+    drawCurrentFrame(clampedStart);
   }, [trimStart, enabled, drawCurrentFrame]);
 
   // Al cambiar de clip sin remontar la página, el <video> se vuelve a
@@ -239,9 +252,18 @@ export function useCanvasPreview({
     setSourceState('ready');
     setSourceError('');
     const start = settingsRef.current.trimStart;
-    video.currentTime = start;
-    setCurrentTime(start);
-    drawCurrentFrame(start);
+    const clampedStart = clampSeekTarget(start, video.duration);
+    video.currentTime = clampedStart;
+    setCurrentTime(clampedStart);
+    drawCurrentFrame(clampedStart);
+  }, [drawCurrentFrame]);
+
+  // Redibujo al llegar los primeros datos del video: en 'loadedmetadata'
+  // el readyState aún es 1 y paintMedia no dibuja; si además el recorte
+  // empieza en 0, el seek no dispara 'seeked' y el primer frame quedaría
+  // en negro hasta pulsar Play. Espejo de handleSeeked.
+  const handleLoadedData = useCallback(() => {
+    if (!isPlayingRef.current) drawCurrentFrame();
   }, [drawCurrentFrame]);
 
   const handleVideoError = useCallback(() => {
@@ -274,6 +296,7 @@ export function useCanvasPreview({
     playFrom,
     retrySource,
     handleLoadedMetadata,
+    handleLoadedData,
     handleVideoError,
     handleSeeked,
   };

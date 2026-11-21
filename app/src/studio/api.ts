@@ -5,7 +5,13 @@ import { apiFetch } from '../auth';
 import { API_BASE } from '../context/constants';
 import type { ClipResult } from '../types';
 import { responseError } from '../utils';
-import type { StudioEditSpec, SubtitleCue } from './types/editor';
+import type {
+  FaceTrack,
+  FaceTrackKeyframe,
+  StudioEditSpec,
+  SubtitleCue,
+  TargetRatio,
+} from './types/editor';
 
 export type ApiCue = { id: string; start: number; end: number; text: string };
 
@@ -61,6 +67,78 @@ export async function fetchRangeCues(
   const response = await apiFetch(`${API_BASE}/api/projects/${projectId}/cues?${params}`);
   if (!response.ok) throw new Error(await responseError(response));
   return parseCues(await response.json() as unknown);
+}
+
+// Valida la respuesta de face-track: descarta keyframes inválidos,
+// sujeta las fracciones a [0, 1] y ordena por tiempo ascendente (el
+// render interpola por búsqueda binaria y asume ese orden). Una
+// respuesta sin forma aprovechable lanza: el llamador la trata como
+// fallo de petición (toast + encuadre centrado).
+function parseFaceTrack(value: unknown, projectId: string, ratio: TargetRatio): FaceTrack {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Respuesta de seguimiento facial inválida.');
+  }
+  const candidate = value as {
+    project_id?: unknown;
+    ratio?: unknown;
+    duration?: unknown;
+    sample_fps?: unknown;
+    has_face?: unknown;
+    keyframes?: unknown;
+  };
+  if (typeof candidate.has_face !== 'boolean' || !Array.isArray(candidate.keyframes)) {
+    throw new Error('Respuesta de seguimiento facial inválida.');
+  }
+  const keyframes: FaceTrackKeyframe[] = [];
+  candidate.keyframes.forEach((keyframe) => {
+    if (typeof keyframe !== 'object' || keyframe === null) return;
+    const point = keyframe as Partial<FaceTrackKeyframe>;
+    if (
+      typeof point.time !== 'number'
+      || typeof point.x !== 'number'
+      || typeof point.y !== 'number'
+      || !Number.isFinite(point.time)
+      || !Number.isFinite(point.x)
+      || !Number.isFinite(point.y)
+      || point.time < 0
+    ) return;
+    keyframes.push({
+      time: point.time,
+      x: Math.max(0, Math.min(1, point.x)),
+      y: Math.max(0, Math.min(1, point.y)),
+    });
+  });
+  keyframes.sort((a, b) => a.time - b.time);
+  return {
+    projectId: typeof candidate.project_id === 'string' ? candidate.project_id : projectId,
+    ratio: candidate.ratio === '9:16' || candidate.ratio === '1:1' || candidate.ratio === '16:9'
+      ? candidate.ratio
+      : ratio,
+    duration: typeof candidate.duration === 'number' && Number.isFinite(candidate.duration)
+      ? candidate.duration
+      : 0,
+    sampleFps: typeof candidate.sample_fps === 'number' && Number.isFinite(candidate.sample_fps)
+      ? candidate.sample_fps
+      : 0,
+    hasFace: candidate.has_face,
+    keyframes,
+  };
+}
+
+// Pista de seguimiento facial del video fuente (v1.3.1). La primera
+// llamada recorre el video entero en el backend y tarda; las
+// siguientes, mismo proyecto y ratio, son instantáneas por la caché
+// del servidor. Sin rostro devuelve hasFace=false y keyframes=[]
+// (no es error). Proyecto inexistente: 404; video sin duración o
+// fallo del detector: 503 — ambos se propagan como Error.
+export async function fetchFaceTrack(
+  projectId: string,
+  ratio: TargetRatio,
+): Promise<FaceTrack> {
+  const params = new URLSearchParams({ ratio });
+  const response = await apiFetch(`${API_BASE}/api/projects/${projectId}/face-track?${params}`);
+  if (!response.ok) throw new Error(await responseError(response));
+  return parseFaceTrack(await response.json() as unknown, projectId, ratio);
 }
 
 export async function saveStudioEdit(

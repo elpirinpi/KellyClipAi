@@ -257,9 +257,13 @@ class MediaProcessingError(RuntimeError):
 
 
 def _subprocess_options() -> dict[str, int]:
+    # stdin DEVNULL en TODOS los ffmpeg: ffmpeg lee stdin para sus
+    # comandos interactivos ('q', ...) y, si hereda un pipe abierto sin
+    # EOF, se bloquea para siempre en la lectura (deadlock medido el
+    # 21-11-2026 al perfilar; el proceso quedaba al 0 % de CPU).
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NO_WINDOW}
-    return {}
+        return {"creationflags": subprocess.CREATE_NO_WINDOW, "stdin": subprocess.DEVNULL}
+    return {"stdin": subprocess.DEVNULL}
 
 
 def _render_subprocess_options() -> dict[str, object]:
@@ -268,15 +272,18 @@ def _render_subprocess_options() -> dict[str, object]:
     En POSIX, start_new_session=True crea un grupo nuevo; en Windows,
     CREATE_NEW_PROCESS_GROUP hace lo mismo. Así el apagado elegante
     puede matar el grupo sin tocar al resto de la app (B-P14).
+    stdin DEVNULL: ver _subprocess_options (ffmpeg se bloquea leyendo
+    un stdin heredado que sea un pipe abierto sin EOF).
     """
     if os.name == "nt":
         create_new_process_group = int(
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
         )
         return {
-            "creationflags": subprocess.CREATE_NO_WINDOW | create_new_process_group
+            "creationflags": subprocess.CREATE_NO_WINDOW | create_new_process_group,
+            "stdin": subprocess.DEVNULL,
         }
-    return {"start_new_session": True}
+    return {"start_new_session": True, "stdin": subprocess.DEVNULL}
 
 
 def _run(arguments: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
@@ -603,6 +610,7 @@ def _detect_silence_intervals(
                 "-",
             ],
             check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,

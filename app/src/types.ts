@@ -134,6 +134,9 @@ export type ProjectResult = {
     // Opcionales: los proyectos anteriores a v1.1.0 no los traen.
     moment_engine?: 'signals' | 'signals+ai' | 'llm';
     signal_score_threshold?: number;
+    // Detección rápida (v1.3.1): solo Tier 0 (audio + texto). Opcional:
+    // los proyectos anteriores a v1.3.1 no la traen (motor completo).
+    fast_detection?: boolean;
     schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
   };
   metadata: { duration: number; width: number; height: number; language?: string; moment_engine?: string; signal_score_threshold?: number; content_profile?: string } | null;

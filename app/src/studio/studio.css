@@ -3,6 +3,11 @@
    de kellyClipAi: el Studio es oscuro mientras la app es clara. */
 
 .studio-page {
+  /* Altura definida (TopBar de la app: 56 px): sin ella la cadena de
+     alturas es solo min-height y la fila del Studio crece hasta el
+     contenido — con cientos de subtítulos, decenas de miles de px —,
+     dejando el transporte y la línea de tiempo fuera de la vista. */
+  height: calc(100dvh - 56px);
   flex: 1 1 auto;
   min-height: 0;
   display: flex;

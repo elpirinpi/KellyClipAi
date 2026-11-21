@@ -142,6 +142,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,16 @@ _FFMPEG_READ_SECONDS = 5  # lectura de ffmpeg por bloques (como audio_events)
 # --- Embeddings -----------------------------------------------------------------
 _EMBEDDING_DIM = 192
 _EMBED_STRIDE = 2  # un embedding cada 2 chunks (2 s)
+# Hilos para los embeddings: medido en un video de 320 s, las 161
+# llamadas secuenciales al modelo de embedding costaban 33,6 s de los
+# 54 s de diarización (~0,2 s cada una, fbank + inferencia). Son
+# independientes entre sí y la sesión ONNX admite run() concurrente,
+# así que van a un pool; los resultados se recogen en orden de envío
+# (finish), idénticos a la ejecución secuencial. 4 hilos es un
+# equilibrio: en el PC de Kelly (28 hilos) sobra CPU para Whisper y
+# ffmpeg a la vez; en equipos pequeños el pool no empeora nada frente
+# a la secuencia (mismo trabajo total).
+_EMBED_WORKERS = 4
 _MAX_EMBED_SECONDS = 2.0  # tope de audio por par (chunk, slot)
 _MIN_ACTIVE_FRAMES = 10  # regla del script de referencia (~0,17 s)
 _MIN_EMBED_SECONDS = 0.25  # por debajo, el embedding no sirve
@@ -706,7 +717,10 @@ class _StreamingDiarizer:
     ``feed`` recibe bloques de audio (p. ej. lecturas de 5 s de
     ffmpeg) y corre la segmentación en lotes de 32 ventanas de 10 s
     con salto de 1 s; ``finish`` procesa la cola y devuelve las
-    etiquetas, los pares embebidos y sus embeddings.
+    etiquetas, los pares embebidos y sus embeddings. Los embeddings
+    (fbank + inferencia, lo más caro de la diarización) van a un pool
+    de ``embed_workers`` hilos cuando es > 1 y se recogen en orden en
+    ``finish``; con 1, el camino es secuencial (el de siempre).
     """
 
     def __init__(
@@ -715,10 +729,12 @@ class _StreamingDiarizer:
         emb_session: Any,
         *,
         embed_stride: int = _EMBED_STRIDE,
+        embed_workers: int = _EMBED_WORKERS,
     ) -> None:
         self._seg_session = seg_session
         self._emb_session = emb_session
         self._embed_stride = max(1, embed_stride)
+        self._embed_workers = max(1, embed_workers)
         self._seg_input = seg_session.get_inputs()[0].name
         self._emb_input = emb_session.get_inputs()[0].name
         self._emb_output = emb_session.get_outputs()[0].name
@@ -728,6 +744,10 @@ class _StreamingDiarizer:
         self._pairs: list[tuple[int, int]] = []
         self._embeddings: list[np.ndarray] = []
         self._total_samples = 0
+        # Pool perezoso (sin trabajos de embedding no se crea ningún
+        # hilo) + futuros en orden de envío (futuro, chunk, slot).
+        self._embed_pool: ThreadPoolExecutor | None = None
+        self._embed_futures: list[tuple[Future[np.ndarray | None], int, int]] = []
 
     @property
     def total_samples(self) -> int:
@@ -781,11 +801,42 @@ class _StreamingDiarizer:
             classes = np.stack(self._labels, axis=0)
         else:
             classes = np.empty((0, _FRAMES_PER_WINDOW), dtype=np.int8)
+        self._gather_embeddings()
         if self._embeddings:
             embeddings = np.stack(self._embeddings)
         else:
             embeddings = np.empty((0, _EMBEDDING_DIM), dtype=np.float64)
         return classes, self._pairs, embeddings, total
+
+    def _gather_embeddings(self) -> None:
+        """Recoge los embeddings del pool en orden de envío y lo cierra.
+
+        El orden de envío es el mismo en que la versión secuencial
+        añadía los pares, así que (pares, embeddings) quedan idénticos.
+        Una excepción en un trabajador se propaga aquí (el llamador la
+        trata como un fallo del canal, igual que un fallo en feed).
+        """
+        try:
+            for future, chunk, slot in self._embed_futures:
+                embedding = future.result()
+                if embedding is not None:
+                    self._pairs.append((chunk, slot))
+                    self._embeddings.append(embedding)
+        finally:
+            self._embed_futures.clear()
+            self.close()
+
+    def close(self) -> None:
+        """Cierra el pool de embeddings (idempotente; cancela pendientes).
+
+        ``finish`` ya lo cierra tras recoger los resultados;
+        ``detect_speakers`` lo llama en sus vías de error para no dejar
+        hilos si ``feed`` falla o se cancela. Las tareas en cola se
+        cancelan; las que ya corrían terminan (cada una ~0,2 s).
+        """
+        pool, self._embed_pool = self._embed_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _process_windows(self, windows: np.ndarray) -> None:
         """Segmenta un lote de ventanas y embebe los pares con stride."""
@@ -800,7 +851,14 @@ class _StreamingDiarizer:
                 self._embed_chunk(chunk, classes[b], windows[b])
 
     def _embed_chunk(self, chunk: int, classes: np.ndarray, window_audio: np.ndarray) -> None:
-        """Un embedding por slot activo >= 10 frames en el chunk."""
+        """Un embedding por slot activo >= 10 frames en el chunk.
+
+        La selección de slots y el recorte del clip son baratos y se
+        hacen en el hilo de lectura; el fbank + la inferencia ONNX
+        (lo caro: ~0,2 s por par) van al pool cuando embed_workers > 1
+        y se recogen en orden en finish(). Con embed_workers=1 el
+        embedding corre aquí mismo, como siempre.
+        """
         labels = _POWERSET[classes]  # (589, 3)
         for slot in range(_NUM_LOCAL_SPEAKERS):
             frames = labels[:, slot]
@@ -809,14 +867,32 @@ class _StreamingDiarizer:
             clip = _active_fragments(frames, window_audio, _MAX_EMBED_SECONDS)
             if clip.size < int(_MIN_EMBED_SECONDS * _SAMPLE_RATE):
                 continue
-            feats = _embedding_features(clip)
-            if feats.shape[0] == 0:
+            if self._embed_workers <= 1:
+                embedding = self._run_embedding(clip)
+                if embedding is not None:
+                    self._pairs.append((chunk, slot))
+                    self._embeddings.append(embedding)
                 continue
-            (emb,) = self._emb_session.run(
-                [self._emb_output], {self._emb_input: feats[None].astype(np.float32)}
+            pool = self._embed_pool
+            if pool is None:
+                pool = ThreadPoolExecutor(
+                    max_workers=self._embed_workers,
+                    thread_name_prefix="kca-embed",
+                )
+                self._embed_pool = pool
+            self._embed_futures.append(
+                (pool.submit(self._run_embedding, clip), chunk, slot)
             )
-            self._pairs.append((chunk, slot))
-            self._embeddings.append(np.asarray(emb[0], dtype=np.float64))
+
+    def _run_embedding(self, clip: np.ndarray) -> np.ndarray | None:
+        """Fbank + inferencia de embedding para un clip (hilo de trabajo)."""
+        feats = _embedding_features(clip)
+        if feats.shape[0] == 0:
+            return None
+        (emb,) = self._emb_session.run(
+            [self._emb_output], {self._emb_input: feats[None].astype(np.float32)}
+        )
+        return np.asarray(emb[0], dtype=np.float64)
 
 
 # --- funciones puras: conteo, clustering, segmentos, timeline -----------------------
@@ -1122,6 +1198,7 @@ def detect_speakers(
     sessions: tuple[Any, Any] | None = None,
     on_progress: ProgressCallback | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    embed_workers: int = _EMBED_WORKERS,
 ) -> DiarizationResult:
     """Diariza un video y devuelve timeline de turnos + segmentos.
 
@@ -1132,6 +1209,8 @@ def detect_speakers(
     tiene audio o la diarización no está disponible;
     DiarizationCancelled si el usuario cancela. Sin habla, devuelve
     un resultado vacío (timeline en ceros), no un error.
+    ``embed_workers`` paraleliza los embeddings (ver _EMBED_WORKERS);
+    con 1, secuencial.
     """
     if sessions is None:
         model_paths = ensure_diarization_models(on_progress, should_cancel=should_cancel)
@@ -1153,13 +1232,23 @@ def detect_speakers(
         "-",
     ]
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
     except OSError as error:
         raise DiarizationError(
             f"No se pudo ejecutar ffmpeg para la diarización: {error}"
         ) from error
     assert process.stdout is not None
-    diarizer = _StreamingDiarizer(seg_session, emb_session)
+    diarizer = _StreamingDiarizer(
+        seg_session, emb_session, embed_workers=embed_workers
+    )
     saw_samples = False
     read_bytes = _SAMPLE_RATE * 4 * _FFMPEG_READ_SECONDS
     try:
@@ -1173,8 +1262,10 @@ def detect_speakers(
             samples = np.frombuffer(data, dtype=np.float32)
             diarizer.feed(samples)
     except DiarizationCancelled:
+        diarizer.close()
         raise
     except (OSError, ValueError) as error:
+        diarizer.close()
         raise DiarizationError(
             f"La extracción de audio para la diarización falló: {error}"
         ) from error
@@ -1188,11 +1279,13 @@ def detect_speakers(
         except (OSError, subprocess.TimeoutExpired):
             stderr = b""
     if not saw_samples:
+        diarizer.close()
         detail = stderr.decode("utf-8", "replace").strip()[:200]
         raise DiarizationError(
             f"ffmpeg no devolvió audio para la diarización ({detail or 'sin pista de audio'})."
         )
     if should_cancel is not None and should_cancel():
+        diarizer.close()
         raise DiarizationCancelled("Diarización cancelada.")
     classes, pairs, embeddings, total_samples = diarizer.finish()
     speakers_per_frame = speaker_count_per_frame(classes)
@@ -1219,6 +1312,7 @@ def get_speaker_timeline(
     enabled: bool = True,
     on_progress: ProgressCallback | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    embed_workers: int = _EMBED_WORKERS,
 ) -> np.ndarray | None:
     """Timeline de turnos para ``moments.detect_moments`` (o None).
 
@@ -1227,6 +1321,7 @@ def get_speaker_timeline(
     sin audio) — registra un aviso y devuelve None para que el motor
     siga sin este canal. Solo propaga DiarizationCancelled, que el
     pipeline debe traducir a su propia cancelación.
+    ``embed_workers`` paraleliza los embeddings (ver _EMBED_WORKERS).
     """
     if not enabled or input_path is None or not ffmpeg_path:
         return None
@@ -1237,6 +1332,7 @@ def get_speaker_timeline(
             ffmpeg_path,
             on_progress=on_progress,
             should_cancel=should_cancel,
+            embed_workers=embed_workers,
         )
     except DiarizationCancelled:
         raise

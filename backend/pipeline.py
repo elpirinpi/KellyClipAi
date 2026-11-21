@@ -8,6 +8,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -515,6 +517,8 @@ def _propose_valid_clips(
     on_profile: Callable[[str], None] | None = None,
     on_semantic_download_progress: Callable[[float], None] | None = None,
     on_diarization_download_progress: Callable[[float], None] | None = None,
+    channels: _ChannelsHandle | None = None,
+    fast: bool = False,
 ) -> list[ClipProposal]:
     """Punto de entrada de propuestas: despacha según project.moment_engine.
 
@@ -522,6 +526,8 @@ def _propose_valid_clips(
       sin ventanas ni LLM para elegir; el pulido con IA de "signals+ai"
       lo hace process_project después de la selección).
     - "llm": camino anterior por ventanas de 5 min (llm obligatorio).
+    ``channels`` (extracción iniciada en segundo plano) y ``fast``
+    (modo rápido Tier 0) solo aplican al camino de señales.
     """
     if project.moment_engine in {"signals", "signals+ai"}:
         return _propose_valid_signals(
@@ -535,6 +541,8 @@ def _propose_valid_clips(
             on_profile=on_profile,
             on_semantic_download_progress=on_semantic_download_progress,
             on_diarization_download_progress=on_diarization_download_progress,
+            channels=channels,
+            fast=fast,
         )
     if llm is None:
         raise LLMConfigurationError(
@@ -551,6 +559,279 @@ def _propose_valid_clips(
     )
 
 
+# --- extracción de canales de señales (v1.3.1, velocidad) ----------------------
+# Los 5 canales (YAMNet, diarización, visual, MiniLM, audio) son
+# independientes entre sí: cada uno decodifica con su propio ffmpeg y
+# corre su propia inferencia. En serie sumaban ~156 s en un video de
+# 320 s en esta VM; en paralelo el tiempo lo marca el canal más lento
+# en equipos con núcleos de sobra (en esta VM, con 1,5 CPU de cuota,
+# el paralelismo es neutro: medido 159 s frente a 156 s en serie).
+# Además, la extracción puede solaparse con la transcripción (que no
+# necesita la transcripción para nada): ver _start_signal_channels.
+
+_OVERLAP_MIN_CPUS = 8  # Núcleos lógicos mínimos para solapar canales con Whisper.
+_CHANNELS_ABANDON_TIMEOUT_SECONDS = 10.0  # Tope al abandonar una extracción.
+
+
+@dataclass
+class _SignalChannels:
+    """Resultados de la extracción de canales (None = canal ausente)."""
+
+    event_timeline: Any = None
+    speaker_timeline: Any = None
+    visual: Any = None  # VisualTimelines de backend.visual_signals
+    semantic_ready: bool = False
+    audio_timeline: Any = None
+
+
+def _extract_signal_channels(
+    input_path: Path | None,
+    duration: float,
+    ffmpeg_path: str | None,
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    on_event_download_progress: Callable[[float], None] | None = None,
+    on_diarization_download_progress: Callable[[float], None] | None = None,
+    on_semantic_download_progress: Callable[[float], None] | None = None,
+) -> _SignalChannels:
+    """Extrae los 5 canales de señales en paralelo (hilos).
+
+    Cada canal mantiene su semántica de fallo de siempre: solo la
+    cancelación del usuario se propaga (ProjectCancelled); cualquier
+    otro fallo (sin runtime, sin modelo, sin red, sin audio, ffmpeg
+    roto) deja el canal apagado y el motor sigue con el resto. La
+    descarga de modelos (solo la primera vez) avisa por los callbacks
+    de progreso como antes; los callbacks escriben en SQLite (WAL,
+    timeout 30 s) y son seguros desde hilos.
+    """
+    def _events() -> Any:
+        try:
+            from . import audio_events
+        except ImportError:
+            return None
+        try:
+            return audio_events.get_event_timeline(
+                input_path,
+                duration,
+                ffmpeg_path,
+                on_progress=on_event_download_progress,
+                should_cancel=should_cancel,
+            )
+        except audio_events.AudioEventsCancelled as error:
+            raise ProjectCancelled() from error
+
+    def _speakers() -> Any:
+        try:
+            from . import diarization
+        except ImportError:
+            return None
+        try:
+            return diarization.get_speaker_timeline(
+                input_path,
+                duration,
+                ffmpeg_path,
+                on_progress=on_diarization_download_progress,
+                should_cancel=should_cancel,
+            )
+        except diarization.DiarizationCancelled as error:
+            raise ProjectCancelled() from error
+
+    def _visual() -> Any:
+        if input_path is None or not ffmpeg_path:
+            return None
+        try:
+            from . import visual_signals
+
+            return visual_signals.extract_visual_timelines(
+                input_path, ffmpeg_path, duration, should_cancel=should_cancel
+            )
+        except Exception as error:  # noqa: BLE001 - lo visual jamás rompe Tier 0
+            logger.warning(
+                "La extracción de señales visuales falló (%s); "
+                "el motor sigue sin el canal visual.",
+                error,
+            )
+            return None
+
+    def _semantic() -> bool:
+        try:
+            from . import semantic
+        except ImportError:
+            return False
+        try:
+            semantic.preload_minilm_model(
+                on_semantic_download_progress, should_cancel=should_cancel
+            )
+            return True
+        except semantic.SemanticCancelled as error:
+            raise ProjectCancelled() from error
+        except Exception as error:  # noqa: BLE001 - sin MiniLM, solo TF-IDF
+            logger.warning(
+                "La capa semántica MiniLM no está disponible (%s); "
+                "la deduplicación sigue solo con TF-IDF.",
+                error,
+            )
+            return False
+
+    def _audio() -> Any:
+        if input_path is None or not ffmpeg_path:
+            return None
+        try:
+            from . import moments
+        except ImportError:
+            return None
+        return moments.extract_audio_timeline(input_path, ffmpeg_path, duration)
+
+    jobs = {
+        "eventos": _events,
+        "hablantes": _speakers,
+        "visual": _visual,
+        "semántico": _semantic,
+        "audio": _audio,
+    }
+    results: dict[str, Any] = {}
+    cancelled: ProjectCancelled | None = None
+    with ThreadPoolExecutor(
+        max_workers=len(jobs), thread_name_prefix="kca-channel"
+    ) as pool:
+        futures = {name: pool.submit(job) for name, job in jobs.items()}
+        for name, future in futures.items():
+            try:
+                results[name] = future.result()
+            except ProjectCancelled as error:
+                # Se sigue esperando al resto (abortan pronto por
+                # should_cancel) y se propaga al final, sin dejar
+                # hilos sueltos.
+                if cancelled is None:
+                    cancelled = error
+                results[name] = None
+            except Exception as error:  # Defensa: un canal jamás rompe el proyecto.
+                logger.warning(
+                    "El canal %s falló de forma inesperada (%s); se sigue sin él.",
+                    name,
+                    error,
+                )
+                results[name] = None
+    if cancelled is not None:
+        raise cancelled
+    return _SignalChannels(
+        event_timeline=results.get("eventos"),
+        speaker_timeline=results.get("hablantes"),
+        visual=results.get("visual"),
+        semantic_ready=bool(results.get("semántico")),
+        audio_timeline=results.get("audio"),
+    )
+
+
+class _ChannelsHandle:
+    """Extracción de canales iniciada en segundo plano (solape con la transcripción).
+
+    Envuelve el Future de ``_extract_signal_channels``: ``results()``
+    espera y devuelve los canales (o propaga ProjectCancelled);
+    ``abandon()`` marca la extracción como innecesaria (p. ej. la
+    transcripción falló) y espera a que los trabajadores aborten, con
+    tope. Ambas son seguras de llamar en cualquier orden y repetidas.
+    """
+
+    def __init__(
+        self,
+        future: Any,
+        abandoned: threading.Event,
+        executor: ThreadPoolExecutor,
+    ) -> None:
+        self._future = future
+        self._abandoned = abandoned
+        self._executor = executor
+
+    def results(self) -> _SignalChannels:
+        """Espera a la extracción y devuelve los canales."""
+        try:
+            return self._future.result()
+        finally:
+            self._executor.shutdown(wait=True)
+
+    def abandon(self) -> None:
+        """Marca la extracción como innecesaria y espera a que aborte."""
+        self._abandoned.set()
+        try:
+            self._future.result(timeout=_CHANNELS_ABANDON_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - al abandonar, el resultado ya no importa
+            logger.debug(
+                "La extracción de canales en segundo plano no terminó "
+                "al abandonarla; el hilo termina solo."
+            )
+        finally:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _should_overlap_channels() -> bool:
+    """True si la máquina tiene núcleos de sobra para solapar.
+
+    Solapar la transcripción (Whisper: 2 workers + hilos de
+    CTranslate2) con los 5 canales (ffmpeg + ONNX) solo compensa con
+    núcleos de sobra: en esta VM (4 lógicos, 1,5 de cuota) el
+    paralelismo de canales fue neutro (159 s frente a 156 s en serie).
+    En el PC de Kelly (Xeon, 28 hilos) el solape ahorra ~100 s por
+    proyecto. Con menos de 8 núcleos, el camino en serie de siempre.
+    """
+    return (os.cpu_count() or 1) >= _OVERLAP_MIN_CPUS
+
+
+def _signal_models_cached() -> bool:
+    """True si YAMNet, diarización y MiniLM pueden correr sin descargar nada.
+
+    Puerta del solape con la transcripción: solo se solapa cuando no
+    hay descargas pendientes (una descarga en segundo plano no avisaría
+    al usuario con el progreso habitual y, en un video sin voz,
+    descargaría ~70 MB de modelos para nada). Nunca descarga ni lanza.
+    """
+    try:
+        from . import audio_events, diarization, semantic
+    except ImportError:
+        return False
+    try:
+        return (
+            audio_events.is_tier1_available()
+            and diarization.is_diarization_available()
+            and semantic.is_semantic_available()
+        )
+    except Exception:  # noqa: BLE001 - sin certeza de caché, camino en serie
+        return False
+
+
+def _start_signal_channels(
+    input_path: Path,
+    duration: float,
+    ffmpeg_path: str,
+    should_cancel: Callable[[], bool] | None = None,
+) -> _ChannelsHandle:
+    """Inicia la extracción de canales en un hilo (solape con la transcripción).
+
+    Los canales no necesitan la transcripción: solo el video y su
+    duración. Solo se llama cuando los modelos ya están en caché (ver
+    ``_signal_models_cached``), así que no hay descargas ni progreso
+    que avisar. Si la transcripción falla o se cancela, el llamador
+    abandona el handle y los trabajadores abortan en su siguiente
+    chequeo de cancelación.
+    """
+    abandoned = threading.Event()
+
+    def _combined_cancel() -> bool:
+        if abandoned.is_set():
+            return True
+        return should_cancel() if should_cancel is not None else False
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kca-channels")
+    future = executor.submit(
+        _extract_signal_channels,
+        input_path,
+        duration,
+        ffmpeg_path,
+        _combined_cancel,
+    )
+    return _ChannelsHandle(future, abandoned, executor)
+
+
 def _propose_valid_signals(
     transcript: list[TranscriptSegment],
     project: ProjectConfig,
@@ -563,6 +844,8 @@ def _propose_valid_signals(
     on_profile: Callable[[str], None] | None = None,
     on_semantic_download_progress: Callable[[float], None] | None = None,
     on_diarization_download_progress: Callable[[float], None] | None = None,
+    channels: _ChannelsHandle | None = None,
+    fast: bool = False,
 ) -> list[ClipProposal]:
     """Propuestas del motor de señales (Fases A–D, v1.2.0).
 
@@ -580,6 +863,11 @@ def _propose_valid_signals(
     diarización (Fase C, ~33 MB bajo demanda) y la capa semántica
     MiniLM (Fase D, ~23 MB bajo demanda): cualquier fallo deja el canal
     apagado y el motor sigue con el resto.
+
+    Los 5 canales se extraen en paralelo (``_extract_signal_channels``)
+    o se reutilizan si ``channels`` trae una extracción iniciada en
+    segundo plano durante la transcripción. ``fast`` activa el modo
+    rápido (Tier 0: solo audio + texto, sin canales opcionales).
     """
     if should_cancel is not None and should_cancel():
         raise ProjectCancelled()
@@ -590,78 +878,43 @@ def _propose_valid_signals(
             "El motor de señales locales necesita numpy, que no está "
             "instalado. Reinstala la aplicación."
         ) from error
-    event_timeline = None
-    speaker_timeline = None
-    visual = None
-    semantic_module = None
-    semantic_ready = False
-    if transcript:
+    if fast:
+        if channels is not None:
+            # El modo rápido no usa los canales: se abandona la
+            # extracción en segundo plano en vez de esperarla.
+            channels.abandon()
+        return _propose_valid_signals_fast(
+            transcript,
+            project,
+            duration,
+            input_path,
+            ffmpeg_path,
+            should_cancel,
+            on_profile,
+        )
+    if channels is not None:
+        # Extracción iniciada en segundo plano durante la transcripción.
+        extracted = channels.results()
+    elif transcript:
         # Sin frases no hay candidatos: no merece descargar modelos
         # (~15 MB YAMNet, ~33 MB diarización, ~23 MB MiniLM) ni correr
         # inferencias para un resultado vacío.
-        try:
-            from . import audio_events
-        except ImportError:
-            audio_events = None
-        if audio_events is not None:
-            try:
-                event_timeline = audio_events.get_event_timeline(
-                    input_path,
-                    duration,
-                    ffmpeg_path,
-                    on_progress=on_event_download_progress,
-                    should_cancel=should_cancel,
-                )
-            except audio_events.AudioEventsCancelled as error:
-                raise ProjectCancelled() from error
-        try:
-            from . import diarization
-        except ImportError:
-            diarization = None
-        if diarization is not None:
-            try:
-                speaker_timeline = diarization.get_speaker_timeline(
-                    input_path,
-                    duration,
-                    ffmpeg_path,
-                    on_progress=on_diarization_download_progress,
-                    should_cancel=should_cancel,
-                )
-            except diarization.DiarizationCancelled as error:
-                raise ProjectCancelled() from error
-        if input_path is not None and ffmpeg_path:
-            try:
-                from . import visual_signals
-
-                visual = visual_signals.extract_visual_timelines(
-                    input_path, ffmpeg_path, duration, should_cancel=should_cancel
-                )
-            except Exception as error:  # noqa: BLE001 - lo visual jamás rompe Tier 0
-                logger.warning(
-                    "La extracción de señales visuales falló (%s); "
-                    "el motor sigue sin el canal visual.",
-                    error,
-                )
-                visual = None
-        try:
-            from . import semantic as semantic_module
-        except ImportError:
-            semantic_module = None
-        if semantic_module is not None:
-            try:
-                semantic_module.ensure_minilm_model(
-                    on_progress=on_semantic_download_progress,
-                    should_cancel=should_cancel,
-                )
-                semantic_ready = True
-            except semantic_module.SemanticCancelled as error:
-                raise ProjectCancelled() from error
-            except Exception as error:  # noqa: BLE001 - sin MiniLM, solo TF-IDF
-                logger.warning(
-                    "La capa semántica MiniLM no está disponible (%s); "
-                    "la deduplicación sigue solo con TF-IDF.",
-                    error,
-                )
+        extracted = _extract_signal_channels(
+            input_path,
+            duration,
+            ffmpeg_path,
+            should_cancel,
+            on_event_download_progress=on_event_download_progress,
+            on_diarization_download_progress=on_diarization_download_progress,
+            on_semantic_download_progress=on_semantic_download_progress,
+        )
+    else:
+        extracted = _SignalChannels()
+    visual = extracted.visual
+    try:
+        from . import semantic as semantic_module
+    except ImportError:
+        semantic_module = None
     try:
         proposals = moments.detect_moments(
             transcript,
@@ -669,8 +922,9 @@ def _propose_valid_signals(
             duration,
             input_path=input_path,
             ffmpeg_path=ffmpeg_path,
-            event_timeline=event_timeline,
-            speaker_timeline=speaker_timeline,
+            audio_timeline=extracted.audio_timeline,
+            event_timeline=extracted.event_timeline,
+            speaker_timeline=extracted.speaker_timeline,
             visual_timeline=visual.combined if visual is not None else None,
             face_timeline=visual.face if visual is not None else None,
             scene_cut_timeline=visual.scene_cuts if visual is not None else None,
@@ -678,7 +932,7 @@ def _propose_valid_signals(
             visual_stats=visual.stats if visual is not None else None,
             should_cancel=should_cancel,
             on_profile=on_profile,
-            enable_semantic=semantic_ready,
+            enable_semantic=extracted.semantic_ready,
         )
     except Exception as error:  # noqa: BLE001 - solo se traduce la cancelación semántica
         if semantic_module is not None and isinstance(
@@ -686,6 +940,47 @@ def _propose_valid_signals(
         ):
             raise ProjectCancelled() from error
         raise
+    if not proposals:
+        return []
+    valid, _errors = _validate_and_complete_proposals(
+        proposals, transcript, duration, project.duration, source="de señales"
+    )
+    return valid
+
+
+def _propose_valid_signals_fast(
+    transcript: list[TranscriptSegment],
+    project: ProjectConfig,
+    duration: float,
+    input_path: Path | None,
+    ffmpeg_path: str | None,
+    should_cancel: Callable[[], bool] | None = None,
+    on_profile: Callable[[str], None] | None = None,
+) -> list[ClipProposal]:
+    """Propuestas Tier 0 (modo rápido): solo audio + texto.
+
+    Sin YAMNet, diarización, visual ni semántica: la transcripción +
+    el timeline de audio (RMS 1 Hz) + el scoring por señales de texto,
+    ritmo y gancho. Es el mismo motor con los canales opcionales
+    apagados (el motor completo es el predeterminado); en un video de
+    320 s ahorra ~170 s de canales en esta VM. ``input_path=None`` en
+    ``detect_moments`` evita que extraiga lo visual por su cuenta.
+    """
+    from . import moments
+
+    audio_timeline = None
+    if input_path is not None and ffmpeg_path:
+        audio_timeline = moments.extract_audio_timeline(input_path, ffmpeg_path, duration)
+    proposals = moments.detect_moments(
+        transcript,
+        project,
+        duration,
+        input_path=None,
+        audio_timeline=audio_timeline,
+        should_cancel=should_cancel,
+        on_profile=on_profile,
+        enable_semantic=False,
+    )
     if not proposals:
         return []
     valid, _errors = _validate_and_complete_proposals(
@@ -1205,6 +1500,10 @@ def process_project(
     settings = settings or get_settings()
     project_dir = settings.data_dir / "projects" / project_id
     input_path = project_dir / "source"
+    # Extracción de canales iniciada en segundo plano durante la
+    # transcripción (solo con núcleos de sobra y modelos en caché):
+    # se abandona en el finally si la transcripción falla o se cancela.
+    channels_handle: _ChannelsHandle | None = None
 
     def should_cancel() -> bool:
         return _is_cancelled(settings, project_id)
@@ -1287,6 +1586,26 @@ def process_project(
                 ffmpeg_path,
             )
             database.update_project(settings.database_path, project_id, metadata=metadata)
+            # Solape con la transcripción (v1.3.1): los canales de
+            # señales no necesitan la transcripción, así que con
+            # núcleos de sobra y modelos ya en caché empiezan ahora,
+            # en segundo plano, mientras Whisper transcribe (~107 s
+            # en un video de 320 s en esta VM; en el PC de Kelly el
+            # solape ahorra ~100 s por proyecto). Sin núcleos de sobra
+            # o con modelos por descargar, el camino en serie de
+            # siempre (los canales arrancan tras la transcripción).
+            if (
+                project_config.moment_engine in {"signals", "signals+ai"}
+                and not project_config.fast_detection
+                and _should_overlap_channels()
+                and _signal_models_cached()
+            ):
+                channels_handle = _start_signal_channels(
+                    input_path,
+                    float(metadata["duration"]),
+                    ffmpeg_path,
+                    should_cancel,
+                )
             _publish(
                 settings,
                 project_id,
@@ -1534,6 +1853,8 @@ def process_project(
                     on_profile=on_content_profile,
                     on_semantic_download_progress=on_semantic_download_progress,
                     on_diarization_download_progress=on_diarization_download_progress,
+                    channels=channels_handle,
+                    fast=project_config.fast_detection,
                 )
                 engine_used = "signals"
                 if project_config.moment_engine == "signals+ai" and proposals:
@@ -1827,3 +2148,10 @@ def process_project(
         logger.exception("Fallo inesperado al procesar el proyecto %s", project_id)
         message = str(error).strip() or "Error inesperado durante el procesamiento."
         _publish(settings, project_id, "failed", "failed", None, message)
+    finally:
+        # Si la extracción de canales en segundo plano no se consumió
+        # (la transcripción falló o se canceló antes de las propuestas),
+        # se abandona: los trabajadores abortan en su siguiente chequeo
+        # de cancelación. Si ya se consumió, es un no-op.
+        if channels_handle is not None:
+            channels_handle.abandon()

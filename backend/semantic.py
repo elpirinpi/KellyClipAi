@@ -465,6 +465,46 @@ def _load_tokenizer(vocab_path: Path | str) -> _WordPieceTokenizer:
     return tokenizer
 
 
+def _cached_session_and_tokenizer() -> tuple[Any, _WordPieceTokenizer] | None:
+    """Sesión + tokenizador ya cargados (o None si falta alguno).
+
+    ``ensure_minilm_model`` cuesta ~1,5 s aunque el modelo esté en
+    caché (``snapshot_download`` con tqdm); si la sesión y el
+    tokenizador ya están cargados, el modelo existe y no hace falta
+    verificarlo de nuevo. ``embed_texts`` lo consulta antes de asegurar
+    el modelo: el pipeline precalienta con ``preload_minilm_model`` y
+    cada llamada posterior se ahorra la verificación.
+    """
+    with _SESSION_LOCK:
+        cached_session = _SESSION_CACHE
+    with _TOKENIZER_LOCK:
+        cached_tokenizer = _TOKENIZER_CACHE
+    if cached_session is None or cached_tokenizer is None:
+        return None
+    return cached_session[1], cached_tokenizer[1]
+
+
+def preload_minilm_model(
+    on_progress: ProgressCallback | None = None,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    """Asegura el modelo MiniLM y deja cargados sesión y tokenizador.
+
+    Lo que el pipeline llama antes de la selección (en vez de
+    ``ensure_minilm_model``): asegura la descarga (progreso 0-100) y
+    carga la sesión ONNX (~0,6 s) + el tokenizador en las cachés del
+    módulo, para que ``embed_texts`` no repita la verificación ni la
+    carga en cada llamada. Si ya están cargados, la carga es un
+    reencuentro de caché (instantáneo). Lanza SemanticError o
+    SemanticCancelled como ``ensure_minilm_model``.
+    """
+    model_path = ensure_minilm_model(on_progress, should_cancel=should_cancel)
+    load_minilm_session(model_path)
+    _load_tokenizer(_vocab_path_for_model(model_path))
+    return model_path
+
+
 # --- inferencia ---------------------------------------------------------------
 
 
@@ -508,19 +548,31 @@ def embed_texts(
         raise SemanticCancelled("Embeddings semánticos cancelados.")
     try:
         if session is None or tokenizer is None:
-            if on_progress is not None:
-
-                def _download_progress(percent: float) -> None:
-                    if on_progress is not None:
-                        on_progress(percent * 0.5)
-
+            cached = _cached_session_and_tokenizer()
+            if cached is not None:
+                # El pipeline ya precalentó con preload_minilm_model (o
+                # una llamada anterior cargó ambos): se ahorra la
+                # verificación de ensure (~1,5 s) y la carga.
+                if session is None:
+                    session = cached[0]
+                if tokenizer is None:
+                    tokenizer = cached[1]
             else:
-                _download_progress = None
-            model_path = ensure_minilm_model(_download_progress, should_cancel=should_cancel)
-            if session is None:
-                session = load_minilm_session(model_path)
-            if tokenizer is None:
-                tokenizer = _load_tokenizer(_vocab_path_for_model(model_path))
+                if on_progress is not None:
+
+                    def _download_progress(percent: float) -> None:
+                        if on_progress is not None:
+                            on_progress(percent * 0.5)
+
+                else:
+                    _download_progress = None
+                model_path = ensure_minilm_model(
+                    _download_progress, should_cancel=should_cancel
+                )
+                if session is None:
+                    session = load_minilm_session(model_path)
+                if tokenizer is None:
+                    tokenizer = _load_tokenizer(_vocab_path_for_model(model_path))
         input_names = {item.name for item in session.get_inputs()}
         output_name = session.get_outputs()[0].name
         batches: list[np.ndarray] = []
@@ -558,6 +610,65 @@ def embed_texts(
         )
         return None
     return batches[0] if len(batches) == 1 else np.concatenate(batches, axis=0)
+
+
+class LazyEmbeddings:
+    """Embeddings MiniLM por lotes bajo demanda, en el mismo orden que embed_texts.
+
+    ``moments._select_diverse`` solo necesita los embeddings de los
+    candidatos que examina antes de llenar ``max_clips`` (medido en un
+    video real de 320 s: 6 de 323 textos tocados); embebirlos todos por
+    adelantado cuesta ~14 s en esta VM. Esta clase embebe lotes de 32
+    textos en el orden original y solo cuando se piden: los lotes son
+    los mismos que los de ``embed_texts`` sobre la lista completa, así
+    que los vectores son bit-idénticos a los de la llamada directa. El
+    primer lote se embebe al construirla: si el modelo no carga, el
+    fallo se conoce antes del bucle (``available`` False, igual que
+    ``embed_texts`` devolviendo None); un fallo en un lote posterior
+    (prácticamente imposible con la sesión ya cargada) desactiva lo
+    semántico para el resto de la selección. La cancelación del usuario
+    se propaga como SemanticCancelled, igual que en ``embed_texts``.
+    """
+
+    def __init__(
+        self,
+        texts: list[str],
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
+        self._texts = texts
+        self._should_cancel = should_cancel
+        self._batches: dict[int, np.ndarray] = {}
+        self._failed = False
+        if texts:
+            self._embed_batch(0)
+
+    @property
+    def available(self) -> bool:
+        """False si el primer lote falló: lo semántico no está disponible."""
+        return not self._failed
+
+    def get(self, index: int) -> np.ndarray | None:
+        """Embedding del texto ``index`` (None si lo semántico falló)."""
+        if self._failed or index < 0 or index >= len(self._texts):
+            return None
+        batch_number = index // _EMBED_BATCH_SIZE
+        batch = self._batches.get(batch_number)
+        if batch is None:
+            self._embed_batch(batch_number)
+            batch = self._batches.get(batch_number)
+            if batch is None:
+                return None
+        return batch[index % _EMBED_BATCH_SIZE]
+
+    def _embed_batch(self, batch_number: int) -> None:
+        start = batch_number * _EMBED_BATCH_SIZE
+        batch_texts = self._texts[start : start + _EMBED_BATCH_SIZE]
+        result = embed_texts(batch_texts, should_cancel=self._should_cancel)
+        if result is None or result.shape[0] != len(batch_texts):
+            self._failed = True
+            return
+        self._batches[batch_number] = result
 
 
 # --- similitud ----------------------------------------------------------------

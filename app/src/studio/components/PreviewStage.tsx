@@ -4,14 +4,16 @@
 // video original.
 import React, { useRef } from 'react';
 import { AlertCircle, Film, LoaderCircle, Pause, Play, Repeat } from 'lucide-react';
-import { SafeZoneMode } from '../types/editor';
-import { CANVAS_HEIGHT, CANVAS_WIDTH } from '../utils/canvasRenderer';
+import { getCanvasDimensions, SafeZoneMode, TargetRatio } from '../types/editor';
 import { formatTime } from '../utils/srt';
 
 export type SourceState = 'loading' | 'ready' | 'error';
 
 interface PreviewStageProps {
   canvasRef: React.RefObject<HTMLCanvasElement>;
+  // Opcional hasta que StudioPage lo cablee con `ratio={settings.ratio}`:
+  // sin prop, el escenario queda en 9:16 (comportamiento de v1.3.0).
+  ratio?: TargetRatio;
   safeZone: SafeZoneMode;
   onSafeZoneChange: (mode: SafeZoneMode) => void;
   sourceState: SourceState;
@@ -32,6 +34,7 @@ interface PreviewStageProps {
 
 export function PreviewStage({
   canvasRef,
+  ratio = '9:16',
   safeZone,
   onSafeZoneChange,
   sourceState,
@@ -51,6 +54,18 @@ export function PreviewStage({
 }: PreviewStageProps) {
   const dragStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const sourceReady = sourceState === 'ready';
+
+  const dims = getCanvasDimensions(ratio);
+  const aspectClass =
+    ratio === '16:9'
+      ? 'w-full max-w-full aspect-video max-h-full'
+      : ratio === '1:1'
+        ? 'h-full max-h-full aspect-square'
+        : 'h-full max-h-full aspect-[9/16]';
+  // Las zonas seguras de TikTok/Shorts describen la interfaz vertical
+  // (botones laterales, descripción inferior): en 1:1/16:9 no aplican
+  // y se ocultan; la rejilla 3×3 vale para cualquier ratio y se
+  // conserva. La selección se mantiene al volver a 9:16.
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!sourceReady) return;
@@ -85,31 +100,37 @@ export function PreviewStage({
             { id: 'shorts', label: 'YT Shorts' },
             { id: 'grid', label: 'Rejilla 3×3' },
           ] as Array<{ id: SafeZoneMode; label: string }>
-        ).map((sz) => (
-          <button
-            key={sz.id}
-            type="button"
-            onClick={() => onSafeZoneChange(sz.id)}
-            className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
-              safeZone === sz.id
-                ? 'bg-indigo-600 text-white'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            {sz.label}
-          </button>
-        ))}
+        ).map((sz) => {
+          const verticalOnly = sz.id === 'tiktok' || sz.id === 'shorts';
+          const disabled = verticalOnly && ratio !== '9:16';
+          return (
+            <button
+              key={sz.id}
+              type="button"
+              onClick={() => onSafeZoneChange(sz.id)}
+              disabled={disabled}
+              title={disabled ? 'Solo disponible en formato vertical 9:16' : undefined}
+              className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                safeZone === sz.id
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {sz.label}
+            </button>
+          );
+        })}
       </div>
 
-      {/* 9:16 Vertical Viewport */}
+      {/* Responsive Ratio Viewport */}
       <div className="flex-1 min-h-0 w-full flex items-center justify-center py-3">
         <div
-          className="relative h-full max-h-full aspect-[9/16] bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800"
+          className={`relative ${aspectClass} bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800`}
         >
           <canvas
             ref={canvasRef}
-            width={CANVAS_WIDTH}
-            height={CANVAS_HEIGHT}
+            width={dims.width}
+            height={dims.height}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
@@ -164,7 +185,7 @@ export function PreviewStage({
                 </>
               )}
 
-              {safeZone === 'tiktok' && (
+              {safeZone === 'tiktok' && ratio === '9:16' && (
                 <>
                   <div className="absolute top-0 left-0 right-0 h-[11%] bg-rose-500/20 border-b border-dashed border-rose-400/80 flex items-center justify-center text-[10px] font-semibold text-white/90">
                     TikTok Superior
@@ -178,7 +199,7 @@ export function PreviewStage({
                 </>
               )}
 
-              {safeZone === 'shorts' && (
+              {safeZone === 'shorts' && ratio === '9:16' && (
                 <>
                   <div className="absolute top-0 left-0 right-0 h-[9%] bg-rose-500/20 border-b border-dashed border-rose-400/80 flex items-center justify-center text-[10px] font-semibold text-white/90">
                     Shorts Superior

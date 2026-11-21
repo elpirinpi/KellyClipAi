@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { apiFetch } from '../auth';
 import {
-  MOMENT_ENGINE_STORAGE_KEY, SIGNAL_THRESHOLD_STORAGE_KEY,
-  customTemplates, readStoredMomentEngine, readStoredSignalThreshold, templates,
+  FAST_DETECTION_STORAGE_KEY, MOMENT_ENGINE_STORAGE_KEY, SIGNAL_THRESHOLD_STORAGE_KEY,
+  customTemplates, readStoredFastDetection, readStoredMomentEngine, readStoredSignalThreshold, templates,
   type MomentEngine, type Template,
 } from '../context/constants';
 import type { ToastKind } from '../components/Toasts';
@@ -56,6 +56,9 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
   // próximos proyectos. Al cargar un proyecto se restaura su configuración.
   const [momentEngine, setMomentEngineState] = useState<MomentEngine>(() => readStoredMomentEngine());
   const [signalThreshold, setSignalThresholdState] = useState<number>(() => readStoredSignalThreshold());
+  // Detección rápida (v1.3.1): mismo patrón que el motor y el umbral —
+  // preferencia guardada, restaurada al cargar un proyecto.
+  const [fastDetection, setFastDetectionState] = useState<boolean>(() => readStoredFastDetection());
 
   const setMomentEngine = useCallback((value: MomentEngine) => {
     setMomentEngineState(value);
@@ -70,6 +73,15 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setSignalThresholdState(value);
     try {
       window.localStorage.setItem(SIGNAL_THRESHOLD_STORAGE_KEY, String(value));
+    } catch {
+      // Sin almacenamiento disponible: la elección vale para esta sesión.
+    }
+  }, []);
+
+  const setFastDetection = useCallback((value: boolean) => {
+    setFastDetectionState(value);
+    try {
+      window.localStorage.setItem(FAST_DETECTION_STORAGE_KEY, value ? '1' : '0');
     } catch {
       // Sin almacenamiento disponible: la elección vale para esta sesión.
     }
@@ -168,6 +180,7 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
       whisper_language: whisperLanguage,
       moment_engine: momentEngine,
       signal_score_threshold: signalThreshold,
+      fast_detection: fastDetection,
       schedule: schedule
         ? {
             scheduled_at: new Date(scheduleDate).toISOString(),
@@ -198,6 +211,7 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setMoment(loaded.config.moment);
     setMomentEngineState(loaded.config.moment_engine ?? readStoredMomentEngine());
     setSignalThresholdState(loaded.config.signal_score_threshold ?? readStoredSignalThreshold());
+    setFastDetectionState(loaded.config.fast_detection ?? readStoredFastDetection());
     setSchedule(Boolean(loaded.config.schedule));
     if (loaded.config.schedule) {
       const localDate = new Date(loaded.config.schedule.scheduled_at);
@@ -245,6 +259,8 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setMomentEngine,
     signalThreshold,
     setSignalThreshold,
+    fastDetection,
+    setFastDetection,
     subtitleStyle,
     setSubtitleStyle,
     visibleTemplates,

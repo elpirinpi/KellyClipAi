@@ -1,11 +1,30 @@
-// Render del editor en canvas 1080×1920, adaptado de ShortStudio para
+// Render del editor en canvas, adaptado de ShortStudio para
 // kellyClipAi v1.3.0. Cambios respecto al original: se eliminó el modo
 // demo (el Studio siempre edita el video fuente del proyecto).
-import { EditorSettings, SubtitleCue } from '../types/editor';
+// v1.3.1: dimensiones parametrizadas por settings.ratio (9:16, 1:1,
+// 16:9); CANVAS_WIDTH/CANVAS_HEIGHT quedan como los valores por
+// defecto 9:16 para el editor clásico (ClipEditorPage).
+import {
+  EditorSettings,
+  FaceTrack,
+  getCanvasDimensions,
+  SubtitleCue,
+} from '../types/editor';
 import { hexToRgba, isColorBright } from './srt';
 
 export const CANVAS_WIDTH = 1080;
 export const CANVAS_HEIGHT = 1920;
+
+// Constantes fijas del follow-cam (v1.3.1, sin controles en la UI):
+// - ALPHA: media móvil exponencial del suavizado, equivalente al
+//   smoothing 72% de ShortStudio (1 - 0.72 * 0.85 ≈ 0.39).
+// - DEADZONE: saltos menores que este valor (en fracción de
+//   desplazamiento) se ignoran para no temblar en rostros quietos.
+// - CUT_THRESHOLD: un salto mayor que este valor entre dos keyframes
+//   se trata como corte de cámara y se salta de golpe, sin deslizar.
+const FACE_SMOOTHING_ALPHA = 0.39;
+const FACE_DEADZONE = 0.012;
+const FACE_CUT_THRESHOLD = 0.28;
 
 interface RenderFrameParams {
   ctx: CanvasRenderingContext2D;
@@ -16,6 +35,10 @@ interface RenderFrameParams {
   currentTime: number;
   settings: EditorSettings;
   subtitles: SubtitleCue[];
+  // Pista de seguimiento facial (dato calculado por el backend, con
+  // su propia caché en StudioPage; nunca en settings/studio_edit).
+  // Solo se usa en modo cover con settings.faceFollow activo.
+  faceTrack?: FaceTrack | null;
 }
 
 interface ParsedWord {
@@ -137,6 +160,8 @@ function buildBalancedLines(
 
 function drawSubtitles(
   ctx: CanvasRenderingContext2D,
+  cw: number,
+  ch: number,
   t: number,
   settings: EditorSettings,
   subtitles: SubtitleCue[]
@@ -188,8 +213,12 @@ function drawSubtitles(
       ? parsedWords.slice(0, activeWordIdx + 1)
       : parsedWords;
 
+  // El ancho máximo efectivo nunca supera el ancho del canvas menos
+  // 80 px de margen (clamp de ShortStudio): en 1:1 un subMaxWidth de
+  // 960 px rebasaría el borde sin él.
+  const effectiveMaxWidth = Math.min(settings.subMaxWidth, cw - 80);
   const spaceWidth = ctx.measureText(' ').width * 1.18;
-  const lines = buildBalancedLines(visibleWords, settings.subMaxWidth, spaceWidth);
+  const lines = buildBalancedLines(visibleWords, effectiveMaxWidth, spaceWidth);
 
   // Block pop-in animation
   let popScale = 1;
@@ -207,9 +236,9 @@ function drawSubtitles(
   const lineHeight = settings.subSize * 1.26;
   const totalHeight = lines.length * lineHeight;
   const maxContentWidth = Math.max(...lines.map((l) => l.width), 80);
-  const centerY = (settings.subY / 100) * CANVAS_HEIGHT;
+  const centerY = (settings.subY / 100) * ch;
 
-  ctx.translate(CANVAS_WIDTH / 2, centerY);
+  ctx.translate(cw / 2, centerY);
   ctx.scale(popScale, popScale);
 
   // Block-level background container (line-box or glass-card)
@@ -335,6 +364,83 @@ function drawSubtitles(
   ctx.restore();
 }
 
+// Suaviza una pista de seguimiento facial al cargarla, adaptando
+// smoothFaceKeyframes de ShortStudio a la semántica de fracciones
+// de recorte (x/y en [0, 1], sin caja de rostro): media móvil
+// exponencial con zona muerta para no temblar, y salto limpio ante
+// un cambio brusco (corte de cámara) en vez de un barrido lento.
+// El backend no suaviza, así que este es el único suavizado.
+export function smoothFaceTrack(track: FaceTrack): FaceTrack {
+  const raw = track.keyframes;
+  if (raw.length === 0) return track;
+  const smoothed: FaceTrack['keyframes'] = [{ ...raw[0] }];
+  let curX = raw[0].x;
+  let curY = raw[0].y;
+  for (let i = 1; i < raw.length; i++) {
+    const next = raw[i];
+    const dist = Math.hypot(next.x - curX, next.y - curY);
+    if (dist > FACE_CUT_THRESHOLD) {
+      curX = next.x;
+      curY = next.y;
+    } else if (dist > FACE_DEADZONE) {
+      curX = curX + (next.x - curX) * FACE_SMOOTHING_ALPHA;
+      curY = curY + (next.y - curY) * FACE_SMOOTHING_ALPHA;
+    }
+    smoothed.push({
+      time: next.time,
+      x: Number(curX.toFixed(4)),
+      y: Number(curY.toFixed(4)),
+    });
+  }
+  return { ...track, keyframes: smoothed };
+}
+
+// Interpola las fracciones de recorte en un instante, adaptando
+// interpolateFaceAtTime de ShortStudio a fracciones (sin w/h):
+// búsqueda binaria del par que encierra el tiempo, interpolación
+// lineal con suavizado smoothstep y salto en el punto medio ante
+// un corte de cámara. Antes del primer keyframe o después del
+// último mantiene el extremo (hold), nunca salta al centro.
+// Devuelve null sin pista, sin rostro o sin keyframes.
+export function interpolateFaceTrackAt(
+  track: FaceTrack | null | undefined,
+  time: number,
+): { x: number; y: number } | null {
+  if (!track || !track.hasFace) return null;
+  const keyframes = track.keyframes;
+  if (keyframes.length === 0) return null;
+  if (keyframes.length === 1 || time <= keyframes[0].time) {
+    return { x: keyframes[0].x, y: keyframes[0].y };
+  }
+  const last = keyframes[keyframes.length - 1];
+  if (time >= last.time) return { x: last.x, y: last.y };
+
+  let lo = 0;
+  let hi = keyframes.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (keyframes[mid].time <= time) lo = mid;
+    else hi = mid;
+  }
+
+  const a = keyframes[lo];
+  const b = keyframes[hi];
+  const span = Math.max(0.0001, b.time - a.time);
+  const t = Math.max(0, Math.min(1, (time - a.time) / span));
+
+  // Corte de cámara: salto en el punto medio, sin deslizar.
+  if (Math.hypot(b.x - a.x, b.y - a.y) > FACE_CUT_THRESHOLD) {
+    return t < 0.5 ? { x: a.x, y: a.y } : { x: b.x, y: b.y };
+  }
+
+  // Smoothstep para un deslizamiento cinematográfico.
+  const ease = t * t * (3 - 2 * t);
+  return {
+    x: a.x + (b.x - a.x) * ease,
+    y: a.y + (b.y - a.y) * ease,
+  };
+}
+
 export function renderEditorFrame({
   ctx,
   blurCanvas,
@@ -344,9 +450,13 @@ export function renderEditorFrame({
   currentTime,
   settings,
   subtitles,
+  faceTrack,
 }: RenderFrameParams): void {
+  // Dimensiones según el ratio elegido; un ratio ausente o inválido
+  // (p. ej. ajustes viejos sin ratio) cae al 9:16 por defecto.
+  const { width: cw, height: ch } = getCanvasDimensions(settings.ratio);
   ctx.fillStyle = '#000000';
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  ctx.fillRect(0, 0, cw, ch);
 
   if (!hasMedia) return;
 
@@ -371,6 +481,15 @@ export function renderEditorFrame({
   };
 
   if (settings.fitMode === 'blur') {
+    // El buffer de desenfoque sigue la proporción del ratio (como en
+    // ShortStudio): sin esto el fondo saldría estirado en 1:1/16:9.
+    const bwTarget = Math.round(cw / 4);
+    const bhTarget = Math.round(ch / 4);
+    if (blurCanvas.width !== bwTarget || blurCanvas.height !== bhTarget) {
+      blurCanvas.width = bwTarget;
+      blurCanvas.height = bhTarget;
+    }
+
     const bScale = Math.max(blurCanvas.width / sw, blurCanvas.height / sh);
     const bw = sw * bScale;
     const bh = sh * bScale;
@@ -382,27 +501,37 @@ export function renderEditorFrame({
     paintMedia(blurCtx, bx, by, bw, bh);
     blurCtx.restore();
 
-    ctx.drawImage(blurCanvas, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    ctx.drawImage(blurCanvas, 0, 0, cw, ch);
   }
 
   ctx.save();
   ctx.filter = colorFilter;
 
   if (settings.fitMode === 'cover') {
-    const s = Math.max(CANVAS_WIDTH / sw, CANVAS_HEIGHT / sh) * zoom;
+    const s = Math.max(cw / sw, ch / sh) * zoom;
     const dw = sw * s;
     const dh = sh * s;
-    const maxShiftX = Math.max(0, (dw - CANVAS_WIDTH) / 2);
-    const maxShiftY = Math.max(0, (dh - CANVAS_HEIGHT) / 2);
-    const dx = (CANVAS_WIDTH - dw) / 2 + panX * (maxShiftX || CANVAS_WIDTH * 0.15);
-    const dy = (CANVAS_HEIGHT - dh) / 2 + panY * (maxShiftY || CANVAS_HEIGHT * 0.15);
+    const maxShiftX = Math.max(0, (dw - cw) / 2);
+    const maxShiftY = Math.max(0, (dh - ch) / 2);
+    // Follow-cam (v1.3.1): solo en cover. La fracción de la pista
+    // coloca la ventana de recorte: dx = -(dw - cw) * fx (fx = 0.5
+    // es exactamente el centrado actual). Sin recorrido en un eje
+    // (dw <= cw, p. ej. la vertical en 9:16 o casi todo en 16:9) se
+    // centra ese eje. El pan del usuario se suma encima, como hoy.
+    const follow = settings.faceFollow
+      ? interpolateFaceTrackAt(faceTrack, currentTime)
+      : null;
+    const baseX = follow && dw > cw ? -(dw - cw) * follow.x : (cw - dw) / 2;
+    const baseY = follow && dh > ch ? -(dh - ch) * follow.y : (ch - dh) / 2;
+    const dx = baseX + panX * (maxShiftX || cw * 0.15);
+    const dy = baseY + panY * (maxShiftY || ch * 0.15);
     paintMedia(ctx, dx, dy, dw, dh);
   } else {
-    const s = Math.min(CANVAS_WIDTH / sw, CANVAS_HEIGHT / sh) * zoom;
+    const s = Math.min(cw / sw, ch / sh) * zoom;
     const dw = sw * s;
     const dh = sh * s;
-    const dx = (CANVAS_WIDTH - dw) / 2 + panX * CANVAS_WIDTH * 0.25;
-    const dy = (CANVAS_HEIGHT - dh) / 2 + panY * CANVAS_HEIGHT * 0.25;
+    const dx = (cw - dw) / 2 + panX * cw * 0.25;
+    const dy = (ch - dh) / 2 + panY * ch * 0.25;
 
     if (settings.fitMode === 'blur' && settings.rounded) {
       ctx.save();
@@ -429,12 +558,12 @@ export function renderEditorFrame({
     const segDur = Math.max(0.1, settings.trimEnd - settings.trimStart);
     const progress = Math.max(0, Math.min(1, (currentTime - settings.trimStart) / segDur));
     const barH = 14;
-    const barY = settings.progressPos === 'top' ? 0 : CANVAS_HEIGHT - barH;
+    const barY = settings.progressPos === 'top' ? 0 : ch - barH;
     ctx.fillStyle = 'rgba(255,255,255,0.22)';
-    ctx.fillRect(0, barY, CANVAS_WIDTH, barH);
+    ctx.fillRect(0, barY, cw, barH);
     ctx.fillStyle = settings.progressColor;
-    ctx.fillRect(0, barY, CANVAS_WIDTH * progress, barH);
+    ctx.fillRect(0, barY, cw * progress, barH);
   }
 
-  drawSubtitles(ctx, currentTime, settings, subtitles);
+  drawSubtitles(ctx, cw, ch, currentTime, settings, subtitles);
 }

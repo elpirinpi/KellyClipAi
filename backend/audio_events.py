@@ -455,7 +455,15 @@ def detect_audio_events(
         "-",
     ]
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stdin DEVNULL: ffmpeg lee stdin para sus comandos interactivos
+        # y se bloquea para siempre si hereda un pipe abierto sin EOF
+        # (deadlock medido el 21-11-2026 al perfilar).
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
     except OSError as error:
         raise AudioEventError(f"No se pudo ejecutar ffmpeg para el Tier 1: {error}") from error
     assert process.stdout is not None

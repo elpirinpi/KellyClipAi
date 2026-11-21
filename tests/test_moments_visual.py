@@ -949,3 +949,50 @@ def test_realistic_video_finds_clips_with_visual_channels() -> None:
     )
     assert len(clips_visual) >= 2
     assert all(clip.puntuacion >= 5.0 for clip in clips_visual)
+
+
+# --- fusión visual (v1.3.1): una decodificación, mismos timelines ------------
+
+
+class _ConstantFaceDetector:
+    """Detector simulado: el mismo rostro en todos los frames (valor 0.9)."""
+
+    def setInputSize(self, _size: tuple[int, int]) -> None:
+        pass
+
+    def detect(self, _frame: Any) -> tuple[int, Any]:
+        face = np.zeros(15, dtype=np.float64)
+        face[0], face[1], face[2], face[3] = 110, 110, 100, 100
+        face[-1] = 0.9
+        return 0, np.array([face])
+
+
+def test_merged_visual_matches_separate_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La ruta fusionada da los 3 timelines bit-idénticos a las 2 pasadas."""
+    video = _cuts_video(
+        tmp_path / "cuts.mp4",
+        [("red", 2), ("blue", 2), ("green", 2), ("black", 2), ("white", 2)],
+    )
+    monkeypatch.setattr(
+        visual_signals,
+        "_create_face_detector",
+        lambda model_path=None: _ConstantFaceDetector(),
+    )
+    merged = visual_signals.extract_visual_timelines(video, "ffmpeg", 10.0)
+    scene, motion, cut_count, mean_raw = visual_signals._extract_scene_and_motion(
+        video, "ffmpeg", 10.0
+    )
+    face = visual_signals.extract_face_timeline(
+        video, "ffmpeg", 10.0, detector=_ConstantFaceDetector()
+    )
+    assert merged.scene_cuts is not None and scene is not None
+    assert np.array_equal(merged.scene_cuts, scene)
+    assert merged.motion is not None and motion is not None
+    assert np.array_equal(merged.motion, motion)
+    assert merged.cut_count == cut_count
+    assert merged.mean_motion_raw == pytest.approx(mean_raw)
+    assert merged.face is not None and face is not None
+    assert np.array_equal(merged.face, face)
+    assert float(np.max(merged.face)) == pytest.approx(0.9)
