@@ -911,7 +911,12 @@ def _complete_clip_ends(
             if proposal.inicio < word.end and word.start < end_limit
         ]
         words_before_end = [word for word in relevant if word.start < proposal.fin]
-        if words_before_end and _ends_sentence(words_before_end[-1].text):
+        # El clip se da por bueno solo si el fin NO corta ninguna palabra
+        # (los timestamps de Whisper pueden solaparse: el fin puede caer
+        # dentro de una palabra aunque la última palabra "termine en
+        # frase") y la última palabra cierra una oración (v1.2.1).
+        cuts_word = any(word.start < proposal.fin < word.end for word in relevant)
+        if not cuts_word and words_before_end and _ends_sentence(words_before_end[-1].text):
             completed.append(proposal)
             continue
 
@@ -944,7 +949,15 @@ def _complete_clip_ends(
             completed.append(proposal)
             continue
 
-        completed_end = min(end_limit, boundary + 0.25)
+        # La cola de +0.25 s no debe entrar en la palabra siguiente
+        # (v1.2.1: en el video de Kelly, 33.36 + 0.25 = 33.61 caía dentro
+        # de "truquito"): se acota al inicio de cualquier palabra que el
+        # tramo de cola alcanzaría.
+        tail_end = boundary + 0.25
+        for word in relevant:
+            if word.start < tail_end and word.end > boundary:
+                tail_end = min(tail_end, word.start)
+        completed_end = min(end_limit, tail_end)
         if completed_end <= proposal.fin:
             completed.append(proposal)
             continue

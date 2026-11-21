@@ -19,7 +19,13 @@ np = pytest.importorskip("numpy")
 
 from backend import database, moments, pipeline  # noqa: E402
 from backend.llm import ResolvedLLM  # noqa: E402
-from backend.moments import MomentScorer, build_phrases  # noqa: E402
+from backend.moments import (  # noqa: E402
+    MomentScorer,
+    _default_separation,
+    _ScoredCandidate,
+    _select_diverse,
+    build_phrases,
+)
 from backend.schemas import (  # noqa: E402
     ClipProposal,
     ProjectConfig,
@@ -849,3 +855,197 @@ def test_process_project_llm_records_engine(
     assert stored["status"] == "completed"
     assert stored["metadata"]["moment_engine"] == "llm"
     assert stored["clips"][0]["title"] == "Clip LLM"
+
+
+# ---------------------------------------------------------------------------
+# Calibración v1.2.1 (video real de Kelly: 2 clips en vez de 6, y finales
+# que cortaban palabras). Los canales opcionales son bonificación, no
+# componentes de la media; el fin del clip se ajusta a la palabra.
+# ---------------------------------------------------------------------------
+
+
+def test_events_timeline_all_zeros_does_not_drag_score() -> None:
+    # Regresión v1.2.1: en el video de Kelly el timeline de eventos
+    # llegaba en ceros (sin risa ni aplauso) y entraba en la media con
+    # peso 1.5, costando ~1.4 puntos por ventana. Un canal en cero no
+    # debe restar: la puntuación es EXACTA a la base.
+    transcript = _transcript(600, exciting_at=300)
+    audio = _audio(600, peak_at=300)
+    phrases = build_phrases(transcript)
+    exciting_idx = next(
+        idx for idx, phrase in enumerate(phrases) if phrase.text.startswith("¿Sabes")
+    )
+    plain = MomentScorer(phrases, audio, 600)
+    score_plain, _, _ = plain.score_window(exciting_idx, exciting_idx + 3)
+    with_zeros = MomentScorer(phrases, audio, 600, np.zeros(600))
+    score_zeros, breakdown_zeros, _ = with_zeros.score_window(exciting_idx, exciting_idx + 3)
+    assert score_zeros == score_plain
+    assert breakdown_zeros["eventos"] == 0.0
+    # Una ventana plana tampoco pierde puntos por el canal en cero.
+    flat_plain, _, _ = plain.score_window(0, 3)
+    flat_zeros, _, _ = with_zeros.score_window(0, 3)
+    assert flat_zeros == flat_plain
+
+
+def test_quiet_window_with_active_optional_channels_is_unaffected() -> None:
+    # Canales opcionales activos EN OTRA PARTE del video (debate en
+    # 300–320 s): una ventana tranquila sin señal no gana ni pierde
+    # puntos por ellos (la bonificación es por ventana).
+    transcript = _transcript(600, exciting_at=300)
+    audio = _audio(600, peak_at=300)
+    phrases = build_phrases(transcript)
+    speakers = np.zeros(600)
+    speakers[300:320] = 1.0
+    visual = np.zeros(600)
+    visual[300:320] = 0.9
+    plain = MomentScorer(phrases, audio, 600)
+    with_channels = MomentScorer(
+        phrases, audio, 600, speaker_timeline=speakers, visual_timeline=visual
+    )
+    flat_plain, _, _ = plain.score_window(0, 3)
+    flat_channels, breakdown, _ = with_channels.score_window(0, 3)
+    assert flat_channels == flat_plain
+    assert breakdown["hablantes"] == 0.0
+    assert breakdown["visual"] == 0.0
+
+
+def test_default_separation_short_video_is_30_seconds() -> None:
+    # v1.2.1: suelo 30 s (antes 45 s). En un video de 5 min, 45 s de
+    # hueco mínimo suprimían momentos de 7.5 a 11–13 s de otro elegido.
+    assert _default_separation(320) == pytest.approx(30.0)
+    assert _default_separation(600) == pytest.approx(40.0)
+    assert _default_separation(1800) == pytest.approx(90.0)
+
+
+def _candidate(score: float, start: float, end: float, text: str) -> _ScoredCandidate:
+    return _ScoredCandidate(
+        score=score,
+        first_idx=0,
+        last_idx=0,
+        start=start,
+        end=end,
+        breakdown={},
+        labels=[],
+        text=text,
+    )
+
+
+def test_mmr_30s_keeps_nearby_strong_moments_in_short_video() -> None:
+    # Dos momentos de 7.5 a 11 s de distancia en un video de 320 s: con
+    # la separación por defecto (30 s) salen los dos; con 45 s el
+    # segundo quedaba suprimido (7.5 x 0.62 = 4.67 < 5.0).
+    first = _candidate(
+        7.5, 100.0, 120.0, "El chef revela el truco secreto del arroz perfecto en su cocina."
+    )
+    second = _candidate(
+        7.5, 131.0, 151.0, "El estadio entero celebró el gol del delantero en el minuto final."
+    )
+    corpus = [first.text, second.text, "El clima de hoy es templado y sin lluvia."]
+    selected_30 = _select_diverse(
+        [first, second],
+        threshold=5.0,
+        separation_seconds=_default_separation(320),
+        max_clips=10,
+        idf_corpus=corpus,
+    )
+    assert len(selected_30) == 2
+    selected_45 = _select_diverse(
+        [first, second],
+        threshold=5.0,
+        separation_seconds=45.0,
+        max_clips=10,
+        idf_corpus=corpus,
+    )
+    assert len(selected_45) == 1
+
+
+def _overlap_segment() -> TranscriptSegment:
+    # Palabras con timestamps solapados como los de Whisper: "poco"
+    # empieza (33.05) antes de que termine "un" (33.16), así que el fin
+    # de frase 33.16 cae dentro de "poco". Caso real del video de Kelly.
+    return TranscriptSegment(
+        start=30.0,
+        end=40.0,
+        text="una un poco truquito falso",
+        words=[
+            Word(start=30.0, end=31.0, text="una"),
+            Word(start=31.5, end=33.16, text="un"),
+            Word(start=33.05, end=33.45, text="poco"),
+            Word(start=33.6, end=34.0, text="truquito"),
+            Word(start=34.5, end=35.0, text="falso"),
+        ],
+    )
+
+
+def test_snap_end_extends_mid_word_cut() -> None:
+    phrases = build_phrases([_overlap_segment()])
+    scorer = MomentScorer(phrases, np.zeros(60), 60.0)
+    # Fin dentro de "poco" -> fin de "poco" (33.45) + cola acotada al
+    # inicio de "truquito" (33.6): 33.45 + 0.15 = 33.6.
+    assert scorer.snap_end(33.16) == pytest.approx(33.6)
+
+
+def test_snap_end_tail_never_enters_next_word() -> None:
+    segment = TranscriptSegment(
+        start=0.0,
+        end=20.0,
+        text="hola mundo",
+        words=[
+            Word(start=10.0, end=10.5, text="hola"),
+            Word(start=10.6, end=11.0, text="mundo"),
+        ],
+    )
+    phrases = build_phrases([segment])
+    scorer = MomentScorer(phrases, np.zeros(60), 60.0)
+    # Fin exacto en "hola" (10.5) + cola de 0.4, acotada al inicio de
+    # "mundo" (10.6): el fin queda en 10.6, no dentro de "mundo".
+    assert scorer.snap_end(10.5) == pytest.approx(10.6)
+
+
+def test_snap_end_without_word_timestamps_uses_silence() -> None:
+    segment = TranscriptSegment(start=0.0, end=20.0, text="Habla sin marcas de tiempo.")
+    phrases = build_phrases([segment])
+    audio = np.full(60, 0.1)
+    audio[12] = 0.0  # Segundo 12 en silencio.
+    scorer = MomentScorer(phrases, audio, 60.0)
+    assert scorer.snap_end(10.5) == pytest.approx(12.0)
+    # Sin silencio en los 2 s siguientes, el fin no se mueve.
+    scorer2 = MomentScorer(phrases, np.full(60, 0.1), 60.0)
+    assert scorer2.snap_end(10.5) == pytest.approx(10.5)
+
+
+def test_build_proposal_snaps_end_to_word() -> None:
+    phrases = build_phrases([_overlap_segment()])
+    scorer = MomentScorer(phrases, np.zeros(60), 60.0)
+    candidate = _ScoredCandidate(
+        score=8.0,
+        first_idx=0,
+        last_idx=0,
+        start=30.0,
+        end=33.16,
+        breakdown={"audio": 5.0, "texto": 8.0, "ritmo": 5.0, "gancho_inicial": 5.0},
+        labels=[],
+        text="una un poco truquito falso",
+    )
+    proposal = moments._build_proposal(scorer, candidate, ["truquito"])
+    assert proposal.inicio == pytest.approx(30.0)
+    assert proposal.fin == pytest.approx(33.6)
+
+
+def test_detect_moments_clip_ends_do_not_cut_words() -> None:
+    # Invariante de punta a punta: con timestamps solapados (como los de
+    # Whisper), ningún fin de clip debe caer dentro de una palabra.
+    transcript = _transcript(600, exciting_at=300)
+    segments = sorted(transcript, key=lambda item: item.start)
+    for index, segment in enumerate(segments):
+        if segment.start >= 320 and segment.words:
+            previous_end = segments[index - 1].end
+            first = segment.words[0]
+            segment.words[0] = Word(start=previous_end - 0.3, end=first.end, text=first.text)
+            break
+    audio = _audio(600, peak_at=300)
+    clips = moments.detect_moments(transcript, ProjectConfig(), 600, audio_timeline=audio)
+    assert len(clips) >= 1
+    all_words = [word for item in transcript for word in item.words]
+    for clip in clips:
+        assert not any(word.start < clip.fin < word.end for word in all_words)

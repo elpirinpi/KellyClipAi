@@ -92,6 +92,72 @@ def test_clip_end_extends_through_the_last_complete_spoken_sentence() -> None:
     assert completed[0].fin == pytest.approx(3.85)
 
 
+def test_clip_end_does_not_stop_inside_sentence_final_word() -> None:
+    # Regresión v1.2.1: el fin (2.0) corta "final." (1.9–2.4) por la
+    # mitad. La salida temprana ("la última palabra termina en frase")
+    # no debe dispararse si esa palabra no está COMPLETA dentro del clip.
+    proposal = ClipProposal(
+        inicio=0,
+        fin=2,
+        titulo="Idea cortada",
+        puntuacion=8,
+        razon_viral="La frase termina con una conclusión.",
+    )
+    transcript = [
+        TranscriptSegment(
+            start=0,
+            end=4,
+            text="Esta idea llega a su final. Siguiente tema.",
+            words=[
+                Word(start=1.5, end=1.8, text="idea"),
+                Word(start=1.9, end=2.4, text="final."),
+                Word(start=3.0, end=3.4, text="Siguiente"),
+            ],
+        )
+    ]
+
+    completed = _complete_clip_ends([proposal], transcript, 4, "Cualquiera")
+
+    # Fin de "final." (2.4) + cola acotada al inicio de "Siguiente" (3.0).
+    assert completed[0].fin == pytest.approx(2.65)
+
+
+def test_clip_end_tail_does_not_enter_next_word() -> None:
+    # Regresión v1.2.1 (video de Kelly): el fin (33.16) corta "poco"
+    # (33.05–33.36); la extensión caía en 33.36 + 0.25 = 33.61, dentro
+    # de "truquito" (33.45–33.9). La cola se acota al inicio de la
+    # palabra siguiente: el fin queda en 33.45.
+    proposal = ClipProposal(
+        inicio=0,
+        fin=33.16,
+        titulo="Momento cortado",
+        puntuacion=8,
+        razon_viral="La frase sigue después del corte.",
+    )
+    transcript = [
+        TranscriptSegment(
+            start=30,
+            end=40,
+            text="aunque una un poco truquito falso pero",
+            words=[
+                Word(start=30.0, end=31.0, text="aunque"),
+                Word(start=31.5, end=33.16, text="un"),
+                Word(start=33.05, end=33.36, text="poco"),
+                Word(start=33.45, end=33.9, text="truquito"),
+                Word(start=34.0, end=34.4, text="falso"),
+                Word(start=34.5, end=34.9, text="pero"),
+            ],
+        )
+    ]
+
+    completed = _complete_clip_ends([proposal], transcript, 40, "Cualquiera")
+
+    assert completed[0].fin == pytest.approx(33.45)
+    assert not any(
+        word.start < completed[0].fin < word.end for segment in transcript for word in segment.words
+    )
+
+
 def test_clip_prompt_prefers_complete_moments_instead_of_short_fragments() -> None:
     system, user = _prompt([], ProjectConfig(), 120)
 

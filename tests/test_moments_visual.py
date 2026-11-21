@@ -623,10 +623,9 @@ def _exciting_window() -> tuple[list[Any], Any, int]:
 
 
 def test_visual_channel_boosts_window_with_cuts() -> None:
-    # La ventana excitante ya está casi saturada (9.1/10): un canal
-    # visual de 0.83 no puede subirla más (la media ponderada diluye).
-    # La comparación con sentido es una ventana PLANA: ahí los cortes
-    # sí suben la puntuación de forma clara.
+    # La ventana excitante ya está casi saturada (9.1/10): la comparación
+    # con sentido es una ventana PLANA: ahí los cortes sí suben la
+    # puntuación de forma clara (bonificación v1.2.1).
     phrases, audio, exciting_idx = _exciting_window()
     plain = MomentScorer(phrases, audio, 600)
     flat_plain, breakdown_plain, _ = plain.score_window(0, 3)

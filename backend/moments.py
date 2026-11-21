@@ -52,10 +52,33 @@ la calibración con videos reales es la Fase E):
   (~33 MB); sin él, el canal no participa. Como los visuales, un
   timeline sin turnos no entra en la media (un monólogo no debe
   perder puntos por no tener cambios de hablante).
+- Calibración v1.2.1: los canales opcionales (eventos, visual, rostro,
+  hablantes) pasaron de componentes de la media a BONIFICACIÓN ACOTADA
+  sobre la media de los 4 canales base. En el video real de Kelly (GTA 6
+  en PS4, 320 s) la v1.2.0 daba 2 clips en vez de 6 porque el timeline
+  de eventos llegaba en ceros (sin risa ni aplauso en todo el video) y
+  entraba en la media con peso 1.5, y el rostro (bimodal: cara a cámara
+  o pantalla) arrastraba las ventanas sin rostro: quitar solo el canal
+  de eventos multiplicaba por 8 los candidatos sobre el umbral. Un canal
+  opcional que no detecta nada no debe restar: solo suma cuando detecta
+  algo (y solo si está activo: eventos con algún pico, visual con algún
+  segundo notable, rostro con variación, hablantes con algún turno).
+  Sin canales opcionales, la puntuación es idéntica a la v1.1.1.
+  La misma calibración bajó el suelo de separación MMR de 45 s a 30 s:
+  en un video de 5 min, dos momentos de 7.5 a 11–13 s de otro elegido
+  quedaban suprimidos por la penalización (45 s de separación exigen
+  huecos que un video corto no tiene).
+- Fin de clip (v1.2.1): el fin se ajusta (snap) al fin de la última
+  palabra hablada + una cola de ~0.4 s acotada al inicio de la palabra
+  siguiente. Los timestamps por palabra de Whisper pueden solaparse y el
+  fin de frase caía dentro de la palabra siguiente (en el video de Kelly
+  el clip 1 terminaba dentro de "poco"); sin timestamps por palabra, el
+  fin se extiende hasta el siguiente hueco de silencio.
 """
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import math
@@ -144,18 +167,44 @@ _PROFILE_GAMEPLAY_MAX_SPEECH_FRACTION = 0.35
 _PROFILE_GAMEPLAY_MIN_CUT_RATE = 6.0  # Cortes por minuto.
 _PROFILE_GAMEPLAY_MIN_MOTION_RAW = 8.0  # MAD medio en niveles de gris.
 
-# Activación de los canales visuales (Fase C): un canal sin variación no
-# entra en la media. Visual: basta un segundo notable (máximo > 0.1).
-# Rostro: la presencia debe variar (desviación típica > 0.05).
+# Activación de los canales opcionales: un canal sin señal no bonifica
+# (v1.2.1; antes "no entra en la media"). Eventos: basta un segundo con
+# un evento claro (puntuación > 0.5, el mismo umbral que el canal usa
+# para "segundo notable"). Visual: basta un segundo notable (máximo >
+# 0.1). Rostro: la presencia debe variar (desviación típica > 0.05).
 # Hablantes: basta un turno en el video (el timeline vale 0.25 con un
-# solo turno en ±10 s; un monólogo queda en 0 y no entra en la media).
+# solo turno en ±10 s; un monólogo queda en 0 y no bonifica).
+_EVENTS_MIN_PEAK = 0.5
 _VISUAL_MIN_PEAK = 0.1
 _FACE_MIN_STD = 0.05
 _SPEAKER_MIN_PEAK = 0.1
 
+# Bonificación de los canales opcionales (v1.2.1): cada canal activo suma
+# valor × peso × factor, con un tope total. Con factor 1.0, un canal a
+# plena señal suma como máximo su peso en puntos (eventos 1.5, visual
+# 0.5, rostro 0.5, hablantes 0.75) y el tope de 1.5 puntos evita que
+# varias señales coincidentes creen clips de la nada (el video aburrido
+# con canales visuales queda en 3.1/10 como mucho, medido en la
+# calibración v1.2.1).
+_BONUS_FACTOR = 1.0
+_BONUS_MAX_POINTS = 1.5
+
+# Cola tras la última palabra al ajustar el fin del clip (v1.2.1): los
+# timestamps de Whisper pueden cortar el último fonema; 0.4 s de cola,
+# siempre acotada al inicio de la palabra siguiente, lo cubren. Sin
+# timestamps por palabra, el fin se extiende hasta el siguiente hueco de
+# silencio, como máximo 2 s.
+_WORD_END_TAIL_SECONDS = 0.4
+_SILENCE_FALLBACK_SECONDS = 2.0
+
 # Separación MMR por defecto: los clips elegidos tienden a estar al menos
 # a esta distancia entre sí (proporcional a la duración, con topes).
-_MMR_MIN_SECONDS = 45.0
+# Suelo 30 s (v1.2.1, antes 45 s): en un video de 5 min, 45 s de hueco
+# mínimo suprimían momentos de 7.5 a 11–13 s de otro elegido; con 30 s
+# el video de Kelly da 7 clips buenos y repartidos, y el test de
+# supresión de duplicados cercanos (dos momentos a 20 s, umbral 8.0)
+# sigue pasando.
+_MMR_MIN_SECONDS = 30.0
 _MMR_MAX_SECONDS = 90.0
 _MMR_DURATION_DIVISOR = 15.0
 # Similitud coseno TF-IDF por encima de la cual dos clips "dicen lo mismo".
@@ -601,13 +650,19 @@ class MomentScorer:
     Las sumas prefijas hacen que puntuar una ventana sea O(1) (salvo el
     pico de energía, un máximo numpy sobre ~30–180 valores). ``event_timeline``
     es el hook de la Fase B: por segundo, 0–1 de eventos de audio (risa,
-    aplauso, grito); ausente en Tier 0, en cuyo caso el canal no participa
-    en la media ponderada. ``visual_timeline`` (Fase C) es el timeline
-    combinado de cortes + movimiento; si en vez de él llegan los
-    componentes (``scene_cut_timeline`` / ``motion_timeline``), se
-    combinan aquí. ``face_timeline`` (Fase C) es la presencia de rostro
-    0–1 por segundo. ``profile`` elige los pesos (ver
-    ``_PROFILE_WEIGHTS``); un perfil desconocido cae a "mixed".
+    aplauso, grito); ausente en Tier 0, en cuyo caso el canal no bonifica.
+    ``visual_timeline`` (Fase C) es el timeline combinado de cortes +
+    movimiento; si en vez de él llegan los componentes
+    (``scene_cut_timeline`` / ``motion_timeline``), se combinan aquí.
+    ``face_timeline`` (Fase C) es la presencia de rostro 0–1 por segundo.
+    ``profile`` elige los pesos (ver ``_PROFILE_WEIGHTS``); un perfil
+    desconocido cae a "mixed".
+
+    La puntuación es la media ponderada de los 4 canales base (audio,
+    texto, ritmo, gancho inicial) por la completitud, MÁS una
+    bonificación acotada de los canales opcionales activos (eventos,
+    visual, rostro, hablantes; v1.2.1): un canal opcional que no detecta
+    nada no resta, solo suma cuando detecta algo.
     """
 
     def __init__(
@@ -640,13 +695,18 @@ class MomentScorer:
         self.face_timeline = face_timeline
         self.profile = profile if profile in _PROFILE_WEIGHTS else "mixed"
         self._weights = _PROFILE_WEIGHTS[self.profile]
-        # Un canal sin variación no aporta información sobre QUÉ momento
-        # elegir: participa en el desglose pero no en la media (misma
-        # idea que el audio sin audio utilizable, v1.1.1). Visual: basta
-        # un segundo notable. Rostro: la presencia debe variar; un
-        # rostro siempre (o nunca) en cuadro no distingue momentos, y
-        # sin esta guarda un video de cabeza parlante perdería ~0.7
-        # puntos en todas sus ventanas por un canal centrado en 0.
+        # Un canal opcional sin señal no bonifica (v1.2.1; antes "no entra
+        # en la media"). Eventos: basta un segundo con un evento claro;
+        # sin esta guarda, un video sin risa ni aplauso perdería ~1.4
+        # puntos en todas sus ventanas por un canal en cero con peso
+        # 1.5 (el video de Kelly, v1.2.0: 2 clips en vez de 6). Visual:
+        # basta un segundo notable. Rostro: la presencia debe variar;
+        # un rostro siempre (o nunca) en cuadro no distingue momentos.
+        self._events_active = (
+            event_timeline is not None
+            and event_timeline.size > 0
+            and float(np.max(event_timeline)) > _EVENTS_MIN_PEAK
+        )
         self._visual_active = (
             self.visual_timeline is not None
             and self.visual_timeline.size > 0
@@ -667,6 +727,18 @@ class MomentScorer:
             if face_timeline is not None and face_timeline.size
             else 0.0
         )
+        # Índice de palabras ordenado por inicio, para ajustar el fin del
+        # clip a una frontera de palabra (v1.2.1, `snap_end`): los
+        # timestamps de Whisper pueden solaparse, así que el fin de frase
+        # puede caer dentro de la palabra siguiente. Se guardan los
+        # inicios aparte para buscar por bisección.
+        self._words: list[tuple[float, float]] = sorted(
+            (word.start, word.end)
+            for phrase in phrases
+            for word in phrase.words
+            if word.end > word.start
+        )
+        self._word_starts = [start for start, _ in self._words]
         # Audio utilizable: si el timeline es todo ceros (ffmpeg falló o
         # el video no tiene pista de audio), el canal de audio NO entra
         # en la media ponderada (un 0 arrastraría la puntuación) y no se
@@ -934,6 +1006,62 @@ class MomentScorer:
         multiplier = 0.85 if trimmed > 1.0 else 1.0
         return new_start, new_end, multiplier
 
+    def snap_end(self, end: float, *, max_end: float | None = None) -> float:
+        """Ajusta el fin del clip para no cortar una palabra por la mitad.
+
+        Los timestamps por palabra de Whisper pueden solaparse: el fin de
+        frase puede caer dentro de la palabra siguiente (en el video de
+        Kelly el clip 1 terminaba en 33.16, dentro de "poco"). Si ``end``
+        cae dentro de una palabra, se extiende hasta el fin de esa
+        palabra (repitiendo si los solapes encadenan varias); después se
+        añade una cola de hasta 0.4 s, acotada al inicio de la palabra
+        siguiente para no entrar en ella (la cola cubre el último fonema
+        cuando Whisper marca el fin de palabra un poco antes). ``max_end``
+        acota el resultado (duración máxima pedida y clip siguiente):
+        nunca se supera, aunque eso deje una palabra incompleta en el
+        caso límite de un clip ya al máximo de duración.
+        Sin timestamps por palabra, el fin se extiende hasta el siguiente
+        hueco de silencio (máx. 2 s); sin audio utilizable no hay forma
+        de saber dónde hay silencio y el fin se deja como está. Nunca
+        retrocede ni supera la duración del video.
+        """
+        end = min(end, self.duration)
+        limit = self.duration if max_end is None else min(max_end, self.duration)
+        if end >= limit:
+            return min(end, limit)
+        if self._words:
+            starts = self._word_starts
+            candidate = end
+            # Extender mientras el fin caiga dentro de una palabra.
+            for _ in range(5):
+                idx = bisect.bisect_right(starts, candidate) - 1
+                containing_end = 0.0
+                j = idx
+                while j >= 0 and starts[j] > candidate - 5.0:
+                    word_start, word_end = self._words[j]
+                    if word_start <= candidate < word_end:
+                        containing_end = max(containing_end, word_end)
+                    j -= 1
+                if containing_end <= candidate:
+                    break
+                candidate = containing_end
+            # Cola hasta 0.4 s, acotada al inicio de la palabra
+            # siguiente (nunca dentro de ella).
+            tail = _WORD_END_TAIL_SECONDS
+            next_idx = bisect.bisect_left(starts, candidate)
+            if next_idx < len(starts):
+                tail = min(tail, max(0.0, starts[next_idx] - candidate))
+            return min(candidate + tail, limit)
+        if not self._has_audio:
+            return min(end, limit)
+        second = math.floor(end) + 1
+        last = min(self.audio_rms.size, math.ceil(end + _SILENCE_FALLBACK_SECONDS))
+        while second < last:
+            if self.audio_rms[second] < self._silence_threshold:
+                return min(float(second), limit)
+            second += 1
+        return min(end, limit)
+
     # -- puntuación --------------------------------------------------------
     def score_window(
         self, first_idx: int, last_idx: int
@@ -972,23 +1100,35 @@ class MomentScorer:
             channels.append(("hablantes", speaker_score, weights["hablantes"]))
         else:
             speaker_score = 0.0
-        # Sin audio utilizable, el canal de audio (0.0) no entra en la
-        # media: un dato ausente no debe arrastrar la puntuación. Lo
-        # mismo para visual/rostro sin variación y para hablantes sin
-        # turnos (ver __init__). El desglose sigue mostrando todos los
-        # valores (ver breakdown abajo).
+        # Media base: solo los 4 canales principales. Sin audio
+        # utilizable, el canal de audio (0.0) no entra en la media: un
+        # dato ausente no debe arrastrar la puntuación (v1.1.1).
         scoring = [
             (name, value, weight)
-            for name, value, weight in channels
-            if (self._has_audio or name != "audio")
-            and (self._visual_active or name != "visual")
-            and (self._face_active or name != "rostro")
-            and (self._speaker_active or name != "hablantes")
+            for name, value, weight in channels[:4]
+            if self._has_audio or name != "audio"
         ]
         total_weight = sum(weight for _, _, weight in scoring)
         weighted = sum(value * weight for _, value, weight in scoring) / total_weight
         _, _, completeness = self.trim_edges(start, end)
-        score = min(10.0, max(0.0, weighted * 10.0 * completeness))
+        score = weighted * 10.0 * completeness
+        # Bonificación de los canales opcionales (v1.2.1): cada canal
+        # ACTIVO suma valor × peso × factor, con tope total. Un canal
+        # opcional que no detecta nada no resta: en la v1.2.0 el canal
+        # de eventos en cero (sin risa ni aplauso en el video) entraba
+        # en la media con peso 1.5 y costaba ~1.4 puntos por ventana.
+        # El desglose sigue mostrando todos los valores (ver breakdown
+        # abajo), activos o no.
+        bonus = 0.0
+        for name, value, is_active in (
+            ("eventos", events_score, self._events_active),
+            ("visual", visual_score, self._visual_active),
+            ("rostro", face_score, self._face_active),
+            ("hablantes", speaker_score, self._speaker_active),
+        ):
+            if is_active:
+                bonus += value * weights[name] * _BONUS_FACTOR
+        score = min(10.0, max(0.0, score + min(_BONUS_MAX_POINTS, bonus)))
         breakdown = {name: round(value * 10.0, 1) for name, value, _ in channels}
         breakdown["completitud"] = round(completeness, 2)
         scene_peak, motion_peak = self._visual_component_peaks(start, end)
@@ -1304,12 +1444,16 @@ def _build_proposal(
     scorer: MomentScorer,
     candidate: _ScoredCandidate,
     theme_tokens: list[str],
+    max_end: float | None = None,
 ) -> ClipProposal:
     phrases = scorer.phrases
     start, end, _ = scorer.trim_edges(candidate.start, candidate.end)
     if end - start < 3.0:
         # El recorte de silencios no debe dejar un clip inválido.
         start, end = candidate.start, candidate.end
+    # El fin no debe cortar una palabra por la mitad (v1.2.1): se ajusta
+    # al fin de la última palabra + cola, sin superar `max_end`.
+    end = scorer.snap_end(end, max_end=max_end)
     title = _build_title(scorer, candidate.first_idx, candidate.last_idx)
     description = _trim_text(
         " ".join(phrase.text for phrase in phrases[candidate.first_idx : candidate.last_idx + 1])[
@@ -1539,7 +1683,15 @@ def detect_moments(
     theme_tokens = [
         token for token, _ in sorted(theme_counts.items(), key=lambda item: -item[1])[:3]
     ]
-    proposals = [_build_proposal(scorer, candidate, theme_tokens) for candidate in selected]
+    proposals = []
+    for index, candidate in enumerate(selected):
+        # El fin ajustado (snap) no debe superar la duración máxima
+        # pedida ni invadir el clip siguiente (la validación del
+        # pipeline descarta clips fuera de rango o solapados).
+        max_end = candidate.start + maximum
+        if index + 1 < len(selected):
+            max_end = min(max_end, selected[index + 1].start)
+        proposals.append(_build_proposal(scorer, candidate, theme_tokens, max_end=max_end))
     logger.info(
         "El motor de señales eligió %d clip(s) de %d candidato(s) por encima del umbral %.1f.",
         len(proposals),
