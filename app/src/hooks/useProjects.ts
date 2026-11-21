@@ -3,7 +3,7 @@ import { apiFetch, streamApiEvents } from '../auth';
 import type { ProjectResult } from '../types';
 import { responseError } from '../utils';
 
-type ProjectRouteMode = 'configure' | 'processing' | 'edit' | 'results';
+type ProjectRouteMode = 'configure' | 'processing' | 'edit' | 'results' | 'studio';
 
 type UseProjectsOptions = {
   apiBase: string;

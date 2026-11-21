@@ -71,7 +71,7 @@ from .integrations import (
     provider_missing_credentials,
 )
 from .llm import LLMConfigurationError, resolve_llm
-from .media import MediaProcessingError, format_subtitles
+from .media import MediaProcessingError, format_subtitles, probe_media
 from .pipeline import _resolve_llm_for_project, process_project
 from .process_queue import ProjectProcessingQueue, request_project_cancellation
 from .scheduler import schedule_worker
@@ -95,10 +95,18 @@ from .schemas import (
     StagedDownloadRequest,
     StagedProjectRequest,
     StagedUploadRequest,
+    StudioEditRequest,
     TranscriptSegment,
     ZoomImportRequest,
 )
 from .settings import AppSettings, get_settings
+from .studio import (
+    clip_transcript_words,
+    local_transcript_words,
+    project_duration,
+    project_transcript_words,
+    words_to_cues,
+)
 from .updater import UpdateError, UpdateManager
 from .version import APP_VERSION
 
@@ -116,6 +124,18 @@ _ALLOWED_DOWNLOAD_HOSTS = {
 _VIDEO_SUFFIXES = {".3gp", ".avi", ".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_SUFFIXES = {".m4a", ".mp3", ".wav"}
 _STAGED_SUFFIXES = _VIDEO_SUFFIXES | _AUDIO_SUFFIXES
+# Extensión del archivo de un clip manual creado desde el editor visual,
+# según el tipo de contenido que envía el navegador (MediaRecorder suele
+# entregar video/webm). Los tipos video/* sin entrada en la tabla usan
+# .mp4; el reemplazo de un clip existente conserva su nombre de archivo.
+_STUDIO_EXPORT_SUFFIXES = {
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/avi": ".avi",
+    "video/3gpp": ".3gp",
+}
 _STAGED_WRITE_SIZE = 1024 * 1024
 _STAGING_MAX_AGE = timedelta(hours=24)
 logger = logging.getLogger(__name__)
@@ -239,6 +259,37 @@ def _serialize_project(
         serialized_clips.append(serialized)
     project["clips"] = serialized_clips
     return project
+
+
+def _serialize_clip(project_id: str, clip: dict) -> dict:
+    """Un clip con la misma forma que en el detalle de proyecto."""
+    return {
+        **clip,
+        "video_url": (
+            f"/api/projects/{project_id}/clips/{clip['id']}/file"
+            if clip.get("status") != "failed"
+            else None
+        ),
+        "download_url": (
+            f"/api/projects/{project_id}/clips/{clip['id']}/download"
+            if clip.get("status") != "failed"
+            else None
+        ),
+    }
+
+
+def _probe_clip_dimensions(path: Path) -> tuple[int, int] | None:
+    """Dimensiones del video exportado, o None si no se pueden leer.
+
+    El export del editor no debe fallar porque la sonda no pueda leer
+    el archivo: en ese caso el clip conserva sus dimensiones anteriores
+    (reemplazo) o queda en 0x0 (clip manual nuevo).
+    """
+    try:
+        metadata = probe_media(path, shutil.which("ffprobe") or "ffprobe")
+        return int(metadata["width"]), int(metadata["height"])
+    except (KeyError, MediaProcessingError, OSError, TypeError, ValueError):
+        return None
 
 
 def _validate_download_url(value: str) -> str:
@@ -704,12 +755,8 @@ def create_app(
         if request.method != "GET":
             return False
         path = request.url.path
-        return (
-            path.endswith(("/file", "/download", "/thumbnail", "/edit/preview"))
-            or (
-                path.startswith("/api/scheduled-jobs/")
-                and path.endswith("/download")
-            )
+        return path.endswith(("/file", "/download", "/thumbnail", "/edit/preview", "/source")) or (
+            path.startswith("/api/scheduled-jobs/") and path.endswith("/download")
         )
 
     @application.get("/api/health")
@@ -2693,6 +2740,237 @@ def create_app(
             media_type="video/mp4",
             filename=f"{clip_id}.mp4",
         )
+
+    # --- Editor visual ShortStudio (v1.3.0) ---------------------------------
+    # El editor reproduce siempre el video fuente (GET /source) y edita
+    # sobre él en el navegador (los cues van en tiempo absoluto del
+    # fuente); el backend solo sirve el video, los cues de subtítulos y
+    # guarda la especificación y el video exportado. La
+    # autenticación y la propiedad del proyecto las verifica el middleware
+    # (404 si el proyecto no existe o es de otro usuario), igual que en
+    # el resto de rutas /api/projects/{project_id}/...; el clip se
+    # resuelve aquí con 404 propio.
+
+    def studio_project_clip(project_id: str, clip_id: str) -> tuple[dict, dict]:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        clip = find_clip(project, clip_id)
+        if clip is None:
+            raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        return project, clip
+
+    @application.get("/api/projects/{project_id}/source")
+    def stream_project_source(project_id: str) -> FileResponse:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        source_path = app_settings.data_dir / "projects" / project_id / "source"
+        if not source_path.is_file():
+            raise HTTPException(status_code=404, detail="El video original ya no está disponible.")
+        # FileResponse de Starlette resuelve las peticiones Range (206)
+        # que el elemento <video> usa para buscar. El archivo "source"
+        # no tiene extensión, así que se sirve como video/mp4 (la gran
+        # mayoría de las fuentes lo son: yt-dlp fusiona a mp4) y el
+        # navegador detecta el contenedor real.
+        return FileResponse(source_path, media_type="video/mp4")
+
+    @application.get("/api/projects/{project_id}/clips/{clip_id}/cues")
+    def clip_cues(project_id: str, clip_id: str) -> dict:
+        _, clip = studio_project_clip(project_id, clip_id)
+        return {"cues": words_to_cues(clip_transcript_words(clip))}
+
+    @application.get("/api/projects/{project_id}/cues")
+    def project_cues(
+        project_id: str,
+        start: float = Query(...),
+        end: float = Query(...),
+    ) -> dict:
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if start < 0 or end <= start:
+            raise HTTPException(
+                status_code=400,
+                detail="El rango no es válido: el inicio debe ser mayor o igual que cero y el fin posterior al inicio.",
+            )
+        duration = project_duration(project)
+        if duration is not None and end > duration:
+            raise HTTPException(
+                status_code=400,
+                detail="El fin del rango supera la duración del video.",
+            )
+        words = project_transcript_words(project.get("transcript"), start, end)
+        return {"cues": words_to_cues(words)}
+
+    @application.put("/api/projects/{project_id}/clips/{clip_id}/studio")
+    def save_clip_studio_edit(
+        project_id: str,
+        clip_id: str,
+        payload: StudioEditRequest,
+    ) -> dict:
+        project, clip = studio_project_clip(project_id, clip_id)
+        clip["studio_edit"] = payload.studio_edit
+        database.update_project(
+            app_settings.database_path,
+            project_id,
+            clips=project.get("clips") or [],
+        )
+        return _serialize_clip(project_id, clip)
+
+    @application.post("/api/projects/{project_id}/studio/export")
+    async def export_studio_clip(
+        project_id: str,
+        response: Response,
+        file: Annotated[UploadFile, File(...)],
+        clip_id: str | None = Form(default=None),
+        start: float = Form(...),
+        end: float = Form(...),
+        title: str | None = Form(default=None),
+        studio_edit: str | None = Form(default=None),
+    ) -> dict:
+        """Guarda el video exportado por el editor visual.
+
+        Con ``clip_id`` reemplaza el archivo de ese clip (mismo nombre,
+        sustitución atómica, sin huérfanos) y actualiza sus datos; sin
+        él crea un clip manual nuevo. El transcript del clip resultante
+        se reconstruye desde la transcripción del proyecto en el rango
+        [start, end) para que los cues sigan siendo válidos (tiempos
+        absolutos + locales, misma forma que ``render_clip``); si el
+        proyecto no tiene transcripción en ese rango, queda vacío.
+        """
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if start < 0 or end <= start:
+            raise HTTPException(
+                status_code=400,
+                detail="El rango no es válido: el inicio debe ser mayor o igual que cero y el fin posterior al inicio.",
+            )
+        parsed_studio_edit: dict[str, Any] | None = None
+        if studio_edit is not None and studio_edit.strip():
+            try:
+                parsed = json.loads(studio_edit)
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=422, detail="studio_edit debe ser un objeto JSON válido."
+                ) from error
+            if not isinstance(parsed, dict):
+                raise HTTPException(status_code=422, detail="studio_edit debe ser un objeto JSON.")
+            parsed_studio_edit = parsed
+        existing_clip: dict[str, Any] | None = None
+        if clip_id:
+            existing_clip = find_clip(project, clip_id)
+            if existing_clip is None:
+                raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        content_type = (file.content_type or "").lower().split(";")[0].strip()
+        if content_type.startswith("video/"):
+            suffix = _STUDIO_EXPORT_SUFFIXES.get(content_type, ".mp4")
+        else:
+            # Sin tipo de contenido video/* (algunos clientes no lo
+            # envían), se acepta por la extensión del nombre subido.
+            fallback = Path(file.filename or "").suffix.lower()
+            suffix = fallback if fallback in _VIDEO_SUFFIXES else None
+        if suffix is None:
+            raise HTTPException(status_code=415, detail="Solo se admiten archivos de video.")
+
+        clips_dir = app_settings.data_dir / "projects" / project_id / "clips"
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        clips_root = clips_dir.resolve()
+        if existing_clip is not None:
+            filename = str(existing_clip.get("filename") or f"{clip_id}.mp4")
+            target = (clips_dir / Path(filename).name).resolve()
+            if not target.is_relative_to(clips_root):
+                raise HTTPException(
+                    status_code=422,
+                    detail="El nombre de archivo guardado del clip no es válido.",
+                )
+            created = False
+        else:
+            new_clip_id = str(uuid.uuid4())
+            filename = f"{new_clip_id}{suffix}"
+            target = clips_dir / filename
+            created = True
+
+        # Escritura en streaming a un temporal y sustitución atómica: el
+        # archivo viejo solo se reemplaza cuando el nuevo está completo
+        # y dentro del tope (el mismo MAX_UPLOAD_BYTES de las subidas).
+        temp_path = clips_dir / f".studio-{uuid.uuid4().hex}.tmp"
+        written = 0
+        try:
+            with temp_path.open("wb") as target_file:
+                while True:
+                    chunk = await file.read(_STAGED_WRITE_SIZE)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                "El video exportado supera el límite de "
+                                f"{MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)} GB por proyecto."
+                            ),
+                        )
+                    target_file.write(chunk)
+            if written == 0:
+                raise HTTPException(status_code=400, detail="El archivo de video está vacío.")
+            temp_path.replace(target)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+        dimensions = _probe_clip_dimensions(target)
+        transcript = local_transcript_words(
+            project_transcript_words(project.get("transcript"), start, end),
+            start,
+            end,
+        )
+        clean_title = title.strip()[:200] if title and title.strip() else None
+        clips = project.get("clips") or []
+        if existing_clip is not None:
+            existing_clip.update(
+                {
+                    "start": start,
+                    "end": end,
+                    "duration": end - start,
+                    "status": "ready",
+                    "transcript": transcript,
+                }
+            )
+            existing_clip.pop("error", None)
+            if clean_title is not None:
+                existing_clip["title"] = clean_title
+            if parsed_studio_edit is not None:
+                existing_clip["studio_edit"] = parsed_studio_edit
+            if dimensions is not None:
+                existing_clip["width"], existing_clip["height"] = dimensions
+            clip = existing_clip
+        else:
+            clip = {
+                "id": new_clip_id,
+                "title": clean_title or f"Clip manual {start:.1f}s - {end:.1f}s",
+                "start": start,
+                "end": end,
+                "duration": end - start,
+                "score": None,
+                "viral_reason": "",
+                "description": "",
+                "hashtags": [],
+                "keywords": [],
+                "emojis": [],
+                "resolution": 720,
+                "filename": filename,
+                "transcript": transcript,
+                "width": dimensions[0] if dimensions else 0,
+                "height": dimensions[1] if dimensions else 0,
+                "status": "ready",
+                "studio_edit": parsed_studio_edit,
+                "manual": True,
+            }
+            clips.append(clip)
+        database.update_project(app_settings.database_path, project_id, clips=clips)
+        response.status_code = 201 if created else 200
+        return _serialize_clip(project_id, clip)
 
     if web_dir is not None:
         application.mount("/", SPAStaticFiles(directory=web_dir, html=True), name="frontend")

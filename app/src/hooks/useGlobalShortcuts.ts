@@ -15,7 +15,7 @@ type UseGlobalShortcutsOptions = {
   recording: boolean;
   zoomLoading: boolean;
   route: string;
-  projectRouteMode: 'configure' | 'processing' | 'edit' | 'results';
+  projectRouteMode: 'configure' | 'processing' | 'edit' | 'results' | 'studio';
   isSubmitting: boolean;
   linkProject: ProjectResult | null;
   progress: number | null;
@@ -55,6 +55,10 @@ export function useGlobalShortcuts({
         return;
       }
       if (event.key !== ' ') return;
+      // En el Studio, Espacio lo gestiona el propio editor (play/pausa
+      // con sincronización de BGM y recorte); el atajo global pausaría
+      // el <video> oculto por su cuenta y lo desincronizaría.
+      if (projectRouteMode === 'studio') return;
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName.toLowerCase();
       const editable = tag === 'input' || tag === 'textarea' || tag === 'select' || Boolean(target?.isContentEditable);

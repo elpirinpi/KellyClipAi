@@ -8,6 +8,7 @@ import { ProjectsPage } from './ProjectsPage';
 import { RecordModal } from './RecordModal';
 import { ResultsPage } from './ResultsPage';
 import { SettingsPage } from './SettingsPage';
+import { StudioPage } from '../studio/StudioPage';
 import { ToastStack } from './Toasts';
 import { TopBar } from './TopBar';
 import { UpdateBanner } from './UpdateBanner';
@@ -29,6 +30,7 @@ export function AppShell() {
     projectRouteId,
     projectRouteMode,
     editClipId,
+    studioClipId,
     project,
     setProject,
     projectError,
@@ -99,14 +101,25 @@ export function AppShell() {
               savedTemplates={config.savedTemplates}
               onBack={() => navigate(`/p/${projectRouteId}`)}
             />
-            : <ResultsPage
-              project={project}
-              error={projectError}
-              onRetry={() => void retryProject()}
-              onProjectUpdated={refreshProject}
-              onProjectDeleted={() => navigate('/')}
-              onEdit={(clipId) => navigate(`/p/${projectRouteId}/edit/${clipId}`)}
-            />
+            : projectRouteMode === 'studio'
+              ? <StudioPage
+                projectId={projectRouteId}
+                clipId={studioClipId}
+                project={project}
+                error={projectError}
+                onBack={() => navigate(`/p/${projectRouteId}`)}
+                onProjectUpdated={refreshProject}
+              />
+              : <ResultsPage
+                project={project}
+                error={projectError}
+                onRetry={() => void retryProject()}
+                onProjectUpdated={refreshProject}
+                onProjectDeleted={() => navigate('/')}
+                onEdit={(clipId) => navigate(`/p/${projectRouteId}/edit/${clipId}`)}
+                onStudio={(clipId) => navigate(`/projects/${projectRouteId}/studio/${clipId}`)}
+                onStudioNew={() => navigate(`/projects/${projectRouteId}/studio/new`)}
+              />
       ) : (
         <HomePage />
       )}

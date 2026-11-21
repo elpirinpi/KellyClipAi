@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -293,6 +293,19 @@ class ClipEditRequest(BaseModel):
                 raise ValueError("Las frases del editor no pueden solaparse.")
             previous_end = phrase.end
         return self
+
+
+class StudioEditRequest(BaseModel):
+    """Especificación de edición del editor visual (ShortStudio, v1.3.0).
+
+    El contenido es opaco para el backend: el editor lo guarda y lo
+    relee tal cual en ``clip["studio_edit"]``. Solo se exige que sea un
+    objeto JSON (no una lista, cadena o null).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    studio_edit: dict[str, Any]
 
 
 class ClipArchiveRequest(BaseModel):

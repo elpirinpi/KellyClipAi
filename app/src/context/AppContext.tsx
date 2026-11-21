@@ -25,7 +25,7 @@ import { API_BASE } from './constants';
 // comportamiento: ejecuta los mismos hooks en el mismo orden relativo y
 // con las mismas dependencias que el App original.
 
-export type ProjectRouteMode = 'configure' | 'processing' | 'edit' | 'results';
+export type ProjectRouteMode = 'configure' | 'processing' | 'edit' | 'results' | 'studio';
 
 export type AppContextValue = {
   apiBase: string;
@@ -37,6 +37,7 @@ export type AppContextValue = {
   projectRouteId: string;
   projectRouteMode: ProjectRouteMode;
   editClipId: string;
+  studioClipId: string;
   theme: ReturnType<typeof useTheme>;
   notify: (message: string, kind?: ToastKind) => void;
   toasts: Toast[];
@@ -124,10 +125,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const configureMatch = useMatch('/p/:projectId/configure');
   const processingMatch = useMatch('/p/:projectId/processing');
   const editMatch = useMatch('/p/:projectId/edit/:clipId');
+  // Editor visual (Studio, v1.3.0): /projects/:id/studio/:clipId para un
+  // clip existente y /projects/:id/studio/new para un clip manual nuevo.
+  const studioMatch = useMatch('/projects/:projectId/studio/:clipId');
   const resultsMatch = useMatch('/p/:projectId');
   const projectRouteId = configureMatch?.params.projectId
     ?? processingMatch?.params.projectId
     ?? editMatch?.params.projectId
+    ?? studioMatch?.params.projectId
     ?? resultsMatch?.params.projectId
     ?? '';
   const projectRouteMode: ProjectRouteMode = configureMatch
@@ -136,8 +141,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
       ? 'processing'
       : editMatch
         ? 'edit'
-        : 'results';
+        : studioMatch
+          ? 'studio'
+          : 'results';
   const editClipId = editMatch?.params.clipId ?? '';
+  const studioClipId = studioMatch?.params.clipId ?? '';
 
   const {
     project,
@@ -267,6 +275,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     projectRouteId,
     projectRouteMode,
     editClipId,
+    studioClipId,
     theme,
     notify,
     toasts,

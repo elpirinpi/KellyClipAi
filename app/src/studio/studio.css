@@ -1,0 +1,158 @@
+/* Estilos del editor visual (Studio), adaptados del index.css de
+   ShortStudio. Todo va acotado a .studio-root para no afectar al resto
+   de kellyClipAi: el Studio es oscuro mientras la app es clara. */
+
+.studio-page {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.studio-root {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: #0b0d11;
+  color: #f1f5f9;
+  user-select: none;
+}
+
+.studio-root input,
+.studio-root textarea,
+.studio-root select {
+  user-select: text;
+}
+
+/* Números tabulares (tiempos de la línea de tiempo y del transporte). */
+.font-mono-tabular {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Barras de desplazamiento del Studio. */
+.studio-root ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.studio-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.studio-root ::-webkit-scrollbar-thumb {
+  background: #2b3242;
+  border-radius: 99px;
+}
+
+.studio-root ::-webkit-scrollbar-thumb:hover {
+  background: #3f485e;
+}
+
+/* Deslizadores del Studio. */
+.studio-root input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: #232938;
+  outline: none;
+  cursor: pointer;
+}
+
+.studio-root input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #6366f1;
+  border: 2px solid #e0e7ff;
+  cursor: pointer;
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+
+.studio-root input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.12);
+  background: #818cf8;
+}
+
+.studio-root input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #6366f1;
+  border: 2px solid #e0e7ff;
+  cursor: pointer;
+}
+
+/* Aviso de error persistente bajo la cabecera del Studio. */
+.studio-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #3f1d26;
+  border-bottom: 1px solid #7f2d3d;
+  color: #fecdd3;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.studio-error-banner > span {
+  flex: 1;
+  min-width: 0;
+}
+
+.studio-error-banner button {
+  flex-shrink: 0;
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+/* Estado de carga / error a pantalla completa (proyecto o clip ausente). */
+.studio-fallback {
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  gap: 16px;
+}
+
+.studio-fallback-card {
+  width: min(480px, 100%);
+  padding: 28px;
+  border: 1px solid #e9eaf0;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 12px 36px #1f24300b;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.studio-fallback-card h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.studio-fallback-card p {
+  margin: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #5f6b80;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.studio-fallback-card .create-button {
+  align-self: flex-start;
+}

@@ -1,3 +1,5 @@
+import type { StudioEditSpec } from './studio/types/editor';
+
 export type UploadInfo = {
   id: string;
   name: string;
@@ -83,6 +85,9 @@ export type ClipResult = {
   filename: string;
   video_url: string | null;
   download_url: string | null;
+  // Especificación guardada del editor visual (Studio, v1.3.0): ajustes
+  // y cues de subtítulos; ausente en los clips sin edición visual.
+  studio_edit?: StudioEditSpec | null;
   broll_provider?: string;
   broll_creator?: string;
   broll_attribution_url?: string;

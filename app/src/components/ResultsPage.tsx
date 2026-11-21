@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertCircle, ArrowRight, Download, FileText, FileVideo2, LoaderCircle, Scissors, Search, Share2, Sparkles, Trash2, WandSparkles,
+  AlertCircle, ArrowRight, Clapperboard, Download, FileText, FileVideo2, Film, LoaderCircle, Scissors, Search, Share2, Sparkles, Trash2, WandSparkles,
 } from 'lucide-react';
 import { apiFetch } from '../auth';
 import { API_BASE, CONTENT_PROFILE_LABELS, MOMENT_ENGINE_LABELS, formatBytes, type ContentProfile, type MomentEngine } from '../context/constants';
@@ -59,6 +59,8 @@ export function ResultsPage({
   error,
   onRetry,
   onEdit,
+  onStudio,
+  onStudioNew,
   onProjectUpdated,
   onProjectDeleted,
 }: {
@@ -66,6 +68,8 @@ export function ResultsPage({
   error: string;
   onRetry: () => void;
   onEdit: (clipId: string) => void;
+  onStudio: (clipId: string) => void;
+  onStudioNew: () => void;
   onProjectUpdated: (projectId: string) => Promise<void>;
   onProjectDeleted: () => void;
 }) {
@@ -484,6 +488,7 @@ export function ResultsPage({
             Guardar video original
           </button>
           <button type="button" onClick={editSelected}><Scissors size={15} /> Editar clips</button>
+          <button type="button" onClick={onStudioNew}><Clapperboard size={15} /> Nuevo clip manual</button>
           <button type="button" onClick={() => void improveTitles()} disabled={!clips.length || busyAction === 'improve-titles' || project?.status === 'processing' || project?.status === 'queued'}>
             {busyAction === 'improve-titles' ? <LoaderCircle size={15} className="spin" /> : <Sparkles size={15} />}
             {busyAction === 'improve-titles' ? 'Mejorando títulos…' : 'Mejorar títulos con IA'}
@@ -648,7 +653,14 @@ export function ResultsPage({
             <div className="clip-content">
               <h2>#{index + 1} {clip.title}</h2>
               {clip.status === 'failed'
-                ? <p className="error-message" role="alert">{clip.error ?? 'No se pudo renderizar este clip.'}</p>
+                ? <>
+                  <p className="error-message" role="alert">{clip.error ?? 'No se pudo renderizar este clip.'}</p>
+                  <div className="clip-score-actions">
+                    <div className="clip-actions">
+                      <button type="button" className="clip-action" onClick={() => onStudio(clip.id)} title="El editor visual trabaja con el video fuente, así que un clip con el render fallido se puede reconstruir desde aquí"><Film size={15} /> Editar en Studio</button>
+                    </div>
+                  </div>
+                </>
                 : <div className="clip-score-actions">
                 <div className="clip-score"><strong>{clip.score.toFixed(1)}</strong><span>VIRALIDAD</span></div>
                 <div className="clip-actions">
@@ -684,6 +696,7 @@ export function ResultsPage({
                   </button>
                   <button type="button" className="clip-action icon-only" aria-label="Cambiar plantilla" onClick={() => onEdit(clip.id)}><FileVideo2 size={16} /></button>
                   <button type="button" className="clip-action icon-only" aria-label="Editar transcripción" onClick={() => onEdit(clip.id)}><Scissors size={16} /></button>
+                  <button type="button" className="clip-action" onClick={() => onStudio(clip.id)} title="Abrir el editor visual con el video fuente de este clip"><Film size={15} /> Editar en Studio</button>
                 </div>
               </div>}
               {clip.status !== 'failed' && (

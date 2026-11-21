@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertCircle, ArrowLeft, Check, LoaderCircle, Redo2, Scissors, Undo2, Video, X,
+  AlertCircle, ArrowLeft, Check, LoaderCircle, Pause, Play, Redo2, RotateCcw, Scissors, Undo2, X,
 } from 'lucide-react';
 import { apiFetch } from '../auth';
 import { API_BASE, customTemplates, templates, type Template } from '../context/constants';
 import { SubtitleStyleControls } from './SubtitleStyleControls';
 import type { ClipEditorState, EditablePhrase, ProjectResult } from '../types';
 import { formatDuration, responseError } from '../utils';
+import { useCanvasPreview } from '../studio/hooks/useCanvasPreview';
+import { DEFAULT_SETTINGS } from '../studio/types/editor';
+import { CANVAS_HEIGHT, CANVAS_WIDTH } from '../studio/utils/canvasRenderer';
+import {
+  mapClipEditorToSettings,
+  mapPhrasesToCues,
+  removedRangesAbsolute,
+} from '../studio/utils/clipEditorMapping';
 
 // Fase 2 (ítem 16): constantes del autoguardado y del historial del editor.
 const EDITOR_AUTOSAVE_DELAY_MS = 2000;
@@ -27,10 +35,8 @@ export function ClipEditorPage({
   onBack: () => void;
 }) {
   const [editor, setEditor] = useState<ClipEditorState | null>(null);
-  const [previewUrl, setPreviewUrl] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [previewing, setPreviewing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -42,9 +48,43 @@ export function ClipEditorPage({
   const [future, setFuture] = useState<ClipEditorState[]>([]);
   const editorRef = useRef<ClipEditorState | null>(null);
   const lastHistoryPushRef = useRef<{ phraseId: string; at: number }>({ phraseId: '', at: 0 });
-  const player = useRef<HTMLVideoElement>(null);
   const clip = project?.clips.find((item) => item.id === clipId);
   const endpoint = `${API_BASE}/api/projects/${projectId}/clips/${clipId}/edit`;
+
+  // Vista previa en vivo (v1.3.0): el estado del editor se traduce a los
+  // ajustes del renderizador canvas de ShortStudio y las frases a cues en
+  // tiempo absoluto del video fuente (ver clipEditorMapping.ts); el
+  // canvas se redibuja en cada frame y con cada cambio, sin re-render del
+  // backend. El endpoint POST .../edit/preview ya no se llama desde esta
+  // página (el backend lo conserva; ver el informe de la vista previa).
+  const allTemplates = useMemo(
+    () => [...templates, ...customTemplates, ...savedTemplates],
+    [savedTemplates],
+  );
+  const liveSettings = useMemo(
+    () => (editor && clip ? mapClipEditorToSettings(editor, clip, allTemplates) : DEFAULT_SETTINGS),
+    [editor, clip, allTemplates],
+  );
+  const liveCues = useMemo(
+    () => (editor && clip ? mapPhrasesToCues(editor.phrases, clip.start) : []),
+    [editor, clip],
+  );
+  const liveSkipRanges = useMemo(
+    () => (editor && clip ? removedRangesAbsolute(editor.phrases, clip.start) : []),
+    [editor, clip],
+  );
+  const preview = useCanvasPreview({
+    enabled: Boolean(editor && clip),
+    settings: liveSettings,
+    cues: liveCues,
+    skipRanges: liveSkipRanges,
+    resetKey: clipId,
+  });
+  // Rango recortado de la vista previa: el clip dentro del video fuente.
+  const trimStart = clip?.start ?? 0;
+  const trimEnd = clip?.end ?? 0;
+  const trimDuration = Math.max(0, trimEnd - trimStart);
+  const previewProgress = Math.max(0, Math.min(trimDuration, preview.currentTime - trimStart));
 
   const isDirty = useMemo(() => {
     if (!editor || !savedEditor) return false;
@@ -90,7 +130,6 @@ export function ClipEditorPage({
     setFuture([]);
     editorRef.current = next;
     setEditor(next);
-    setPreviewUrl('');
     setMessage('');
   }, []);
 
@@ -120,7 +159,6 @@ export function ClipEditorPage({
     setPast(past.slice(0, -1));
     editorRef.current = previous;
     setEditor(previous);
-    setPreviewUrl('');
     setMessage('');
   }, [past]);
 
@@ -132,7 +170,6 @@ export function ClipEditorPage({
     setFuture(rest);
     editorRef.current = next;
     setEditor(next);
-    setPreviewUrl('');
     setMessage('');
   }, [future]);
 
@@ -177,7 +214,7 @@ export function ClipEditorPage({
   // con el guardado explícito: comparte la misma persistencia y no toca
   // los mensajes del usuario.
   useEffect(() => {
-    if (!editor || !isDirty || saving || previewing || exporting) return;
+    if (!editor || !isDirty || saving || exporting) return;
     const timer = window.setTimeout(() => {
       const state = editorRef.current;
       if (!state) return;
@@ -188,7 +225,7 @@ export function ClipEditorPage({
       });
     }, EDITOR_AUTOSAVE_DELAY_MS);
     return () => window.clearTimeout(timer);
-  }, [editor, isDirty, saving, previewing, exporting]);
+  }, [editor, isDirty, saving, exporting]);
 
   // Aviso al cerrar o recargar la pestaña con cambios sin guardar.
   useEffect(() => {
@@ -230,28 +267,6 @@ export function ClipEditorPage({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  const createPreview = async () => {
-    if (!editor) return;
-    setPreviewing(true);
-    setError('');
-    setMessage('');
-    try {
-      const response = await apiFetch(`${endpoint}/preview`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(editor),
-      });
-      if (!response.ok) throw new Error(await responseError(response));
-      const result = await response.json() as { preview_url: string };
-      setPreviewUrl(`${API_BASE}${result.preview_url}`);
-      setMessage('Vista previa renderizada con tus cambios.');
-    } catch (previewError) {
-      setError(previewError instanceof Error ? previewError.message : 'No se pudo renderizar la vista previa.');
-    } finally {
-      setPreviewing(false);
-    }
-  };
-
   const exportEdit = async () => {
     if (!editor) return;
     setExporting(true);
@@ -272,7 +287,7 @@ export function ClipEditorPage({
     }
   };
 
-  const busy = saving || previewing || exporting;
+  const busy = saving || exporting;
 
   return (
     <main className="editor-page" id="main-content">
@@ -304,18 +319,72 @@ export function ClipEditorPage({
         <>
           <section className="editor-workspace">
             <div className="editor-preview-card">
+              {/* El video fuente se sirve con la cookie de medios; el
+                atributo crossOrigin con credenciales mantiene el canvas
+                sin contaminar (mismo patrón que StudioPage). El <video>
+                queda oculto: solo alimenta el canvas y el audio. */}
+              <video
+                ref={preview.videoRef}
+                src={`${API_BASE}/api/projects/${projectId}/source`}
+                style={{ display: 'none' }}
+                playsInline
+                preload="metadata"
+                crossOrigin="use-credentials"
+                onLoadedMetadata={preview.handleLoadedMetadata}
+                onError={preview.handleVideoError}
+                onSeeked={preview.handleSeeked}
+              />
               <div className="editor-preview-frame">
-                <video
-                  key={previewUrl || clip.video_url || clip.id}
-                  ref={player}
-                  src={previewUrl || (clip.video_url ? `${API_BASE}${clip.video_url}` : undefined)}
-                  controls
-                  playsInline
-                  preload="metadata"
-                  aria-label={`Vista previa de ${clip.title}`}
+                <canvas
+                  ref={preview.canvasRef}
+                  width={CANVAS_WIDTH}
+                  height={CANVAS_HEIGHT}
+                  aria-label={`Vista previa en vivo de ${clip.title}`}
                 />
+                {preview.sourceState !== 'ready' && (
+                  <div className="editor-preview-overlay" role="status">
+                    {preview.sourceState === 'loading'
+                      ? <LoaderCircle size={22} className="spin" />
+                      : <AlertCircle size={22} />}
+                    <p>
+                      {preview.sourceState === 'loading'
+                        ? 'Cargando el video original…'
+                        : 'No se pudo cargar el video original.'}
+                    </p>
+                    {preview.sourceState === 'error' && (
+                      <button type="button" className="editor-preview-retry" onClick={preview.retrySource}>
+                        <RotateCcw size={14} /> Reintentar
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
-              <p>{previewUrl ? 'Vista previa de los cambios' : 'Clip exportado actualmente'}</p>
+              <p className="editor-preview-live">
+                <span className="editor-live-dot" aria-hidden="true" /> Vista previa en vivo
+              </p>
+              <div className="editor-preview-transport">
+                <button
+                  type="button"
+                  className="editor-preview-play"
+                  onClick={preview.togglePlay}
+                  disabled={preview.sourceState !== 'ready'}
+                  aria-label={preview.isPlaying ? 'Pausar vista previa' : 'Reproducir vista previa'}
+                >
+                  {preview.isPlaying ? <Pause size={16} /> : <Play size={16} />}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={trimDuration}
+                  step={0.1}
+                  value={previewProgress}
+                  disabled={preview.sourceState !== 'ready'}
+                  onChange={(event) => preview.seekTo(trimStart + Number(event.target.value))}
+                  aria-label="Posición en la vista previa"
+                />
+                <span>{formatDuration(previewProgress)} / {formatDuration(trimDuration)}</span>
+              </div>
+              <p className="editor-preview-note">Aproximación en vivo: el resultado final se genera al exportar.</p>
             </div>
 
             <div className="editor-settings">
@@ -335,7 +404,7 @@ export function ClipEditorPage({
                 <select value={editor.subtitle_template} onChange={(event) => {
                   applyEditorChange({ ...editor, subtitle_template: event.target.value });
                 }}>
-                  {[...templates, ...customTemplates, ...savedTemplates].map((template) => (
+                  {allTemplates.map((template) => (
                     <option key={template.name} value={template.name}>{template.name}</option>
                   ))}
                 </select>
@@ -366,15 +435,17 @@ export function ClipEditorPage({
                       type="button"
                       className="editor-phrase-time"
                       onClick={() => {
-                        if (!phrase.removed && player.current) {
-                          player.current.currentTime = phrase.preview_start;
-                          void player.current.play();
-                        }
+                        // La vista previa en vivo reproduce el video
+                        // FUENTE: la frase empieza en tiempo absoluto
+                        // (inicio del clip + inicio relativo de la frase).
+                        // Se muestra el inicio relativo, la posición de
+                        // la frase dentro del clip.
+                        if (!phrase.removed) preview.playFrom(clip.start + phrase.start);
                       }}
                       disabled={phrase.removed}
-                      aria-label={`Reproducir frase ${index + 1} desde ${formatDuration(phrase.preview_start)}`}
+                      aria-label={`Reproducir frase ${index + 1} desde ${formatDuration(phrase.start)}`}
                     >
-                      {formatDuration(phrase.preview_start)}
+                      {formatDuration(phrase.start)}
                     </button>
                     <label className="editor-phrase-text">
                       <span className="visually-hidden">Texto del subtítulo {index + 1}</span>
@@ -416,10 +487,6 @@ export function ClipEditorPage({
               </button>
             </div>
             <div>
-              <button type="button" className="outline-action" onClick={() => void createPreview()} disabled={busy}>
-                {previewing ? <LoaderCircle size={16} className="spin" /> : <Video size={16} />}
-                Vista previa
-              </button>
               <button type="button" className="create-button" onClick={() => void exportEdit()} disabled={busy}>
                 {exporting ? <LoaderCircle size={17} className="spin" /> : <Scissors size={17} />}
                 Exportar cambios
