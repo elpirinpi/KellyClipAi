@@ -18,7 +18,7 @@ function defaultModelFor(provider: string): string {
   }[provider] ?? '';
 }
 
-export function SettingsPage({ provider, setProvider, whisper, setWhisper, momentEngine, setMomentEngine, signalThreshold, setSignalThreshold, fastDetection, setFastDetection, theme, setTheme, onBack, onNotice }: {
+export function SettingsPage({ provider, setProvider, whisper, setWhisper, momentEngine, setMomentEngine, signalThreshold, setSignalThreshold, fastDetection, setFastDetection, autoEdit, setAutoEdit, theme, setTheme, onBack, onNotice }: {
   provider: string;
   setProvider: (value: string) => void;
   whisper: string;
@@ -29,6 +29,8 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
   setSignalThreshold: (value: number) => void;
   fastDetection: boolean;
   setFastDetection: (value: boolean) => void;
+  autoEdit: boolean;
+  setAutoEdit: (value: boolean) => void;
   theme: ThemePreference;
   setTheme: (value: ThemePreference) => void;
   onBack: () => void;
@@ -240,6 +242,16 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
             <span><strong>Detección rápida por defecto</strong><small>Solo audio y texto (Tier 0): la búsqueda de clips tarda segundos en vez de minutos, sin análisis de video, hablantes ni semántica. La transcripción tarda lo mismo.</small></span>
           </label>
         )}
+        {/* v1.3.2: edición automática por defecto en los proyectos
+        nuevos — aplica a todos los motores. */}
+        <label className="fast-detection-toggle">
+          <input
+            type="checkbox"
+            checked={autoEdit}
+            onChange={(event) => setAutoEdit(event.target.checked)}
+          />
+          <span><strong>Editar clips automáticamente por defecto</strong><small>Renderiza cada clip con ffmpeg al terminar la detección. Apagado (recomendado): la detección termina en propuestas listas para editar en el Studio, sin esperar renders.</small></span>
+        </label>
         <p className="settings-explainer">El motor de señales mide la energía del audio, el ritmo del habla y los ganchos del texto, y solo convierte en clips los momentos por encima del umbral. Si un video no da clips, baja el umbral y reprocesa. El modo “Solo IA” necesita la clave del proveedor.</p>
       </section>
       {/* Fase 2 (ítem 17): apariencia — modo oscuro con seguimiento del sistema. */}

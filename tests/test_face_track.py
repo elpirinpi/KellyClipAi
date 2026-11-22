@@ -1,4 +1,4 @@
-"""Tests de GET /api/projects/{id}/face-track (Studio, v1.3.1).
+"""Tests de GET /api/projects/{id}/face-track (Studio, v1.3.1; asíncrono v1.3.2).
 
 Cubre: 404 (proyecto inexistente, de otro usuario o sin fuente), 401
 sin autenticación, 400 con ratio inválido, 200 con has_face=false en
@@ -8,12 +8,19 @@ el repo y MediaPipe no está instalado en el venv de tests), la
 selección de dimensiones por ratio, la caché en la segunda llamada,
 503 cuando el seguimiento facial no está disponible o se desconoce la
 duración, y la conversión píxeles → fracciones de
-``analyze_source_face_track``.
+``analyze_source_face_track``. Además, el contrato asíncrono (v1.3.2):
+202 con progreso mientras el trabajo corre, un solo vuelo por
+proyecto+ratio, reintento tras un trabajo fallido, y la degradación
+elegante sin MediaPipe (seguimiento con YuNet solo) más el salto del
+landmarker con un solo rostro.
 """
 
 from __future__ import annotations
 
+import random
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +37,13 @@ from backend.face_tracking import (
     FaceCropKeyframe,
     FaceTrackingError,
     _crop_geometry,
+    _merge_speech_intervals,
+    _speech_active_at,
+    analyze_face_crop_paths,
     analyze_source_face_track,
     clear_face_analysis_cache,
+    clear_face_track_jobs,
+    peek_cached_source_face_track,
 )
 from backend.main import create_app as create_application
 from backend.schemas import ProjectConfig
@@ -147,6 +159,7 @@ def _fake_analysis(
         output_height: int,
         speech_intervals: list[tuple[float, float]] | None = None,
         sample_rate: float = STUDIO_FACE_TRACK_SAMPLE_RATE,
+        on_progress: Any = None,
     ) -> tuple[bool, list[FaceCropKeyframe]]:
         calls.append(
             {
@@ -158,11 +171,41 @@ def _fake_analysis(
                 "sample_rate": sample_rate,
             }
         )
+        if on_progress is not None:
+            on_progress(100.0)
         if points is None:
             return False, []
         return True, points
 
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _clear_face_caches():
+    # La caché de análisis y el registro de trabajos son globales del
+    # módulo: limpiarlos entre tests evita que un trabajo o un
+    # resultado de otro test contamine el siguiente.
+    clear_face_analysis_cache()
+    clear_face_track_jobs()
+    yield
+    clear_face_analysis_cache()
+    clear_face_track_jobs()
+
+
+def _poll_face_track(
+    client: TestClient, url: str, *, timeout: float = 15.0
+):
+    """Sondea GET face-track hasta que no sea 202 (200 o error)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.get(url)
+        if response.status_code != 202:
+            return response
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"face-track siguió en 202 tras {timeout}s: {response.text}"
+            )
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +272,7 @@ def test_face_track_empty_for_video_without_faces(
     settings = _settings(tmp_path / "data")
     _create_project(settings, "project-1", source_path=_video_with_audio)
     with _client(settings) as client:
-        response = client.get("/api/projects/project-1/face-track")
+        response = _poll_face_track(client, "/api/projects/project-1/face-track")
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["project_id"] == "project-1"
@@ -266,7 +309,7 @@ def test_face_track_response_shape_and_fractions(
         main_module, "analyze_source_face_track", _fake_analysis(points, calls)
     )
     with _client(settings) as client:
-        response = client.get("/api/projects/project-1/face-track")
+        response = _poll_face_track(client, "/api/projects/project-1/face-track")
     assert response.status_code == 200, response.text
     body = response.json()
     assert body == {
@@ -318,7 +361,9 @@ def test_face_track_ratio_selects_output_dimensions(
         main_module, "analyze_source_face_track", _fake_analysis(None, calls)
     )
     with _client(settings) as client:
-        response = client.get(f"/api/projects/project-1/face-track?ratio={ratio}")
+        response = _poll_face_track(
+            client, f"/api/projects/project-1/face-track?ratio={ratio}"
+        )
     assert response.status_code == 200, response.text
     assert response.json()["ratio"] == ratio
     assert response.json()["has_face"] is False
@@ -351,9 +396,10 @@ def test_face_track_second_call_uses_cache(
     monkeypatch.setattr(
         face_tracking_module, "_analyze_face_crop_paths_uncached", spy
     )
-    clear_face_analysis_cache()
     with _client(settings) as client:
-        first = client.get("/api/projects/project-1/face-track")
+        first = _poll_face_track(client, "/api/projects/project-1/face-track")
+        # Segunda llamada: 200 inmediata por el peek de caché, sin
+        # pasar por 202 ni lanzar otro trabajo.
         second = client.get("/api/projects/project-1/face-track")
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
@@ -376,7 +422,7 @@ def test_face_track_503_when_face_tracking_fails(
 
     monkeypatch.setattr(main_module, "analyze_source_face_track", failing)
     with _client(settings) as client:
-        response = client.get("/api/projects/project-1/face-track")
+        response = _poll_face_track(client, "/api/projects/project-1/face-track")
     assert response.status_code == 503
     assert "OpenCV" in response.json()["detail"]
 
@@ -397,6 +443,104 @@ def test_face_track_503_when_duration_unknown(
         response = client.get("/api/projects/project-1/face-track")
     assert response.status_code == 503
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Contrato asíncrono (v1.3.2): 202 + sondeo, un solo vuelo, reintento
+# ---------------------------------------------------------------------------
+
+
+def test_face_track_202_while_pending_then_200(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    _create_project(settings, "project-1", metadata={"duration": 2.0})
+    gate = threading.Event()
+    calls: list[int] = []
+
+    def slow(*args: Any, on_progress: Any = None, **kwargs: Any):
+        calls.append(1)
+        gate.wait(timeout=10)
+        return True, [FaceCropKeyframe(0.0, 0.5, 0.5)]
+
+    monkeypatch.setattr(main_module, "analyze_source_face_track", slow)
+    with _client(settings) as client:
+        try:
+            first = client.get("/api/projects/project-1/face-track")
+            assert first.status_code == 202, first.text
+            body = first.json()
+            assert body["status"] == "pending"
+            assert 0.0 <= body["progress"] <= 100.0
+            # Segunda petición mientras el trabajo corre: también 202,
+            # sin lanzar otro análisis (un solo vuelo).
+            second = client.get("/api/projects/project-1/face-track")
+            assert second.status_code == 202, second.text
+        finally:
+            gate.set()
+        done = _poll_face_track(client, "/api/projects/project-1/face-track")
+    assert done.status_code == 200, done.text
+    assert done.json()["has_face"] is True
+    assert len(calls) == 1
+
+
+def test_face_track_reports_progress_while_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    _create_project(settings, "project-1", metadata={"duration": 2.0})
+    gate = threading.Event()
+    reported = threading.Event()
+
+    def slow(*args: Any, on_progress: Any = None, **kwargs: Any):
+        if on_progress is not None:
+            on_progress(42.0)
+        reported.set()
+        gate.wait(timeout=10)
+        return False, []
+
+    monkeypatch.setattr(main_module, "analyze_source_face_track", slow)
+    with _client(settings) as client:
+        try:
+            first = client.get("/api/projects/project-1/face-track")
+            assert first.status_code == 202, first.text
+            assert reported.wait(timeout=5), "El trabajo no reportó progreso."
+            pending = client.get("/api/projects/project-1/face-track")
+            assert pending.status_code == 202, pending.text
+            assert pending.json() == {"status": "pending", "progress": 42.0}
+        finally:
+            gate.set()
+        done = _poll_face_track(client, "/api/projects/project-1/face-track")
+    assert done.status_code == 200, done.text
+    assert done.json()["has_face"] is False
+
+
+def test_face_track_failed_job_retries_on_next_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path / "data")
+    _create_project(settings, "project-1", metadata={"duration": 2.0})
+    state = {"fail": True}
+    calls: list[int] = []
+
+    def flaky(*args: Any, **kwargs: Any):
+        calls.append(1)
+        if state["fail"]:
+            raise FaceTrackingError("El detector facial falló.")
+        return True, [FaceCropKeyframe(0.0, 0.5, 0.5)]
+
+    monkeypatch.setattr(main_module, "analyze_source_face_track", flaky)
+    with _client(settings) as client:
+        failed = _poll_face_track(client, "/api/projects/project-1/face-track")
+        assert failed.status_code == 503
+        assert "detector" in failed.json()["detail"]
+        state["fail"] = False
+        done = _poll_face_track(client, "/api/projects/project-1/face-track")
+    assert done.status_code == 200, done.text
+    assert done.json()["has_face"] is True
+    assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -563,3 +707,173 @@ def test_analyze_face_crop_paths_rejects_non_positive_sample_rate(
         face_tracking_module.analyze_face_crop_paths(
             video, 0.0, [(0.0, 1.0)], 720, 1280, sample_rate=0.0
         )
+
+
+# ---------------------------------------------------------------------------
+# Búsqueda de habla por bisect, progreso y peek de caché (v1.3.2)
+# ---------------------------------------------------------------------------
+
+
+def test_speech_lookup_matches_linear_scan() -> None:
+    rng = random.Random(42)
+    intervals: list[tuple[float, float]] = []
+    for _ in range(200):
+        start = rng.uniform(0, 3600)
+        intervals.append((start, start + rng.uniform(0.05, 2.0)))
+    starts, ends = _merge_speech_intervals(intervals)
+    for _ in range(2000):
+        moment = rng.uniform(-1, 3602)
+        expected = any(start <= moment <= end for start, end in intervals)
+        assert _speech_active_at(starts, ends, moment) == expected
+    assert _merge_speech_intervals(None) == ([], [])
+    assert _merge_speech_intervals([]) == ([], [])
+
+
+def test_analyze_source_face_track_reports_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video-bytes")
+    reported: list[float] = []
+
+    def fake_analyze(*args: Any, on_progress: Any = None, **kwargs: Any):
+        if on_progress is not None:
+            on_progress(25.0)
+            on_progress(100.0)
+        return [[FaceCropKeyframe(0.0, 0.0, 0.0)]]
+
+    monkeypatch.setattr(face_tracking_module, "analyze_face_crop_paths", fake_analyze)
+    monkeypatch.setattr(
+        face_tracking_module, "_probe_video_dimensions", lambda _path: (1920, 1080)
+    )
+    has_face, _keyframes = analyze_source_face_track(
+        video, 2.0, 1080, 1920, on_progress=reported.append
+    )
+    assert has_face is True
+    assert reported == [25.0, 100.0]
+
+
+def test_peek_cached_source_face_track(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video-bytes")
+    calls: list[int] = []
+    _, max_x, _max_y = _crop_geometry(1920, 1080, 1080, 1920)
+    points = [
+        FaceCropKeyframe(0.0, 0.0, 0.0),
+        FaceCropKeyframe(2.0, max_x, 0.0),
+    ]
+
+    def spy(*args: Any, **kwargs: Any):
+        calls.append(1)
+        return [points]
+
+    monkeypatch.setattr(
+        face_tracking_module, "_analyze_face_crop_paths_uncached", spy
+    )
+    monkeypatch.setattr(
+        face_tracking_module, "_probe_video_dimensions", lambda _path: (1920, 1080)
+    )
+    assert peek_cached_source_face_track(video, 2.0, 1080, 1920) is None
+    has_face, keyframes = analyze_source_face_track(video, 2.0, 1080, 1920)
+    assert has_face is True
+    assert len(calls) == 1
+    peeked = peek_cached_source_face_track(video, 2.0, 1080, 1920)
+    assert peeked == (True, keyframes)
+    assert len(calls) == 1  # el peek no re-analiza
+
+
+# ---------------------------------------------------------------------------
+# Degradación sin MediaPipe y salto del landmarker con un solo rostro
+# ---------------------------------------------------------------------------
+
+
+def _fake_face_detector_yn(face_count: int):
+    """Sustituto de cv2.FaceDetectorYN que devuelve rostros fijos."""
+    import numpy as np
+
+    class FakeDetector:
+        def setInputSize(self, _size: tuple[int, int]) -> None:
+            return None
+
+        def detect(self, frame):
+            height, width = frame.shape[:2]
+            detections = np.zeros((face_count, 15), dtype=np.float32)
+            for index in range(face_count):
+                detections[index, 0] = width * (0.15 + 0.5 * index)
+                detections[index, 1] = height * 0.3
+                detections[index, 2] = width * 0.2
+                detections[index, 3] = height * 0.3
+                detections[index, -1] = 0.9
+            return face_count, detections
+
+    class FakeFaceDetectorYN:
+        @staticmethod
+        def create(*_args: Any, **_kwargs: Any) -> FakeDetector:
+            return FakeDetector()
+
+    return FakeFaceDetectorYN
+
+
+def test_face_tracking_skips_lip_analysis_with_single_face(
+    _video_with_audio: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+
+    # Con un solo rostro la selección del orador no cambia nada, así
+    # que el landmarker no debe inicializarse siquiera (en un video de
+    # una sola persona hablando ahorra una inferencia por muestra).
+    monkeypatch.setattr(
+        face_tracking_module,
+        "_get_lip_landmarker",
+        lambda: pytest.fail("Con un solo rostro no debe inicializarse el landmarker."),
+    )
+    monkeypatch.setattr(cv2, "FaceDetectorYN", _fake_face_detector_yn(1))
+    tracks = analyze_face_crop_paths(
+        _video_with_audio,
+        0,
+        [(0.0, 1.0)],
+        1080,
+        1920,
+        speech_intervals=[(0.0, 1.0)],
+    )
+    assert tracks[0] is not None
+    assert len(tracks[0]) > 0
+
+
+def test_face_tracking_degrades_without_lip_model(
+    _video_with_audio: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+
+    attempts: list[int] = []
+
+    def failing_landmarker():
+        attempts.append(1)
+        raise FaceTrackingError(
+            "Falta MediaPipe para estimar al orador activo. Reinstala la aplicación."
+        )
+
+    monkeypatch.setattr(
+        face_tracking_module, "_get_lip_landmarker", failing_landmarker
+    )
+    monkeypatch.setattr(cv2, "FaceDetectorYN", _fake_face_detector_yn(2))
+    tracks = analyze_face_crop_paths(
+        _video_with_audio,
+        0,
+        [(0.0, 1.0)],
+        1080,
+        1920,
+        speech_intervals=[(0.0, 1.0)],
+    )
+    # Sin landmarker el seguimiento sigue con YuNet solo: hay
+    # keyframes en vez de un error, y el landmarker solo se intenta
+    # una vez (tras fallar, se desactiva para el resto del análisis).
+    assert tracks[0] is not None
+    assert len(tracks[0]) > 0
+    assert len(attempts) == 1

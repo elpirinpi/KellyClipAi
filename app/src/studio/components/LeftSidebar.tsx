@@ -20,6 +20,9 @@ interface LeftSidebarProps {
   // Estado de la pista de seguimiento facial (v1.3.1): lo gestiona
   // StudioPage; aquí solo se muestra junto al interruptor.
   faceTrackStatus: FaceTrackStatus;
+  // Progreso del análisis en curso (v1.3.2, 0-100); null cuando no
+  // hay ningún cálculo en marcha.
+  faceTrackProgress: number | null;
   onUpdateSetting: <K extends keyof EditorSettings>(key: K, value: EditorSettings[K]) => void;
   onApplySubtitlePreset: (patch: Partial<EditorSettings>) => void;
   onTrimStartChange: (val: number) => void;
@@ -37,6 +40,7 @@ export function LeftSidebar({
   hasBgm,
   bgmName,
   faceTrackStatus,
+  faceTrackProgress,
   onUpdateSetting,
   onApplySubtitlePreset,
   onTrimStartChange,
@@ -257,7 +261,11 @@ export function LeftSidebar({
                   />
                 </label>
                 {settings.faceFollow && faceTrackStatus === 'loading' && (
-                  <p className="text-[11px] text-slate-500">Calculando…</p>
+                  <p className="text-[11px] text-slate-500">
+                    {faceTrackProgress === null
+                      ? 'Calculando…'
+                      : `Calculando… ${Math.round(faceTrackProgress)}%`}
+                  </p>
                 )}
                 {settings.faceFollow && faceTrackStatus === 'no-face' && (
                   // Texto neutro a propósito: has_face=false también se

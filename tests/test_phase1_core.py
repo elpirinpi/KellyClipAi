@@ -257,6 +257,8 @@ def test_all_clips_failing_keeps_previous_clips(
         project_id,
         metadata={"duration": 100},
         transcript=_transcript_data(),
+        # v1.3.2: este test cubre el camino con render.
+        config=ProjectConfig(auto_edit=True),
     )
     old_clip, old_path = _old_clip(project_dir)
     database.update_project(settings.database_path, project_id, clips=[old_clip])
@@ -288,6 +290,8 @@ def test_successful_reprocess_swaps_old_clips_for_new_ones(
         project_id,
         metadata={"duration": 100},
         transcript=_transcript_data(),
+        # v1.3.2: este test cubre el camino con render.
+        config=ProjectConfig(auto_edit=True),
     )
     old_clip, old_path = _old_clip(project_dir)
     database.update_project(settings.database_path, project_id, clips=[old_clip])
@@ -636,6 +640,8 @@ def test_schedule_failure_completes_project_with_warning(
     database.initialize(settings.database_path)
     project_id = str(uuid.uuid4())
     config = ProjectConfig(
+        # v1.3.2: este test cubre el camino con render.
+        auto_edit=True,
         schedule=ScheduledPublishing(
             scheduled_at=datetime.now(UTC) + timedelta(hours=2),
             platform="youtube",
@@ -1150,6 +1156,8 @@ def test_pipeline_cancels_between_renders_and_keeps_rendered_clips(
         project_id,
         metadata={"duration": 100},
         transcript=_transcript_data(),
+        # v1.3.2: este test cubre el camino con render.
+        config=ProjectConfig(auto_edit=True),
     )
     old_clip, old_path = _old_clip(project_dir)
     database.update_project(settings.database_path, project_id, clips=[old_clip])
@@ -1377,3 +1385,139 @@ def test_process_project_without_fast_starts_overlap_channels(
     assert len(propose_calls) == 1
     assert propose_calls[0]["fast"] is False
     assert len(start_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# v1.3.2: edición automática (auto_edit) — apagada por defecto
+# ---------------------------------------------------------------------------
+
+
+def test_auto_edit_defaults_to_off() -> None:
+    assert ProjectConfig().auto_edit is False
+    assert ProjectConfig(auto_edit=True).auto_edit is True
+
+
+def _run_project_with_auto_edit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    auto_edit: bool,
+) -> tuple[list[str], dict[str, Any], list[dict[str, Any]]]:
+    """Ejecuta process_project con el proposer y el render instrumentados.
+
+    Devuelve (títulos renderizados, proyecto guardado, eventos SSE).
+    El proyecto NO trae transcripción guardada, para pasar por la rama
+    que transcribe como un proyecto nuevo real.
+    """
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    project_id = str(uuid.uuid4())
+    _create_ready_project(
+        settings,
+        project_id,
+        config=ProjectConfig(auto_edit=auto_edit),
+    )
+    _mock_ffmpeg_and_llm(monkeypatch)
+    rendered_titles = _mock_render(monkeypatch)
+    monkeypatch.setattr(
+        pipeline,
+        "probe_media",
+        lambda *_args, **_kwargs: {"width": 720, "height": 1280, "duration": 100},
+    )
+    monkeypatch.setattr(pipeline, "create_thumbnail", lambda *_args, **_kwargs: None)
+    fake_transcript = [
+        TranscriptSegment.model_validate(segment) for segment in _transcript_data()
+    ]
+    monkeypatch.setattr(
+        pipeline, "transcribe", lambda *_args, **_kwargs: (fake_transcript, "es")
+    )
+    monkeypatch.setattr(
+        pipeline, "_propose_valid_clips", lambda *_args, **_kwargs: [_proposal("Nuevo")]
+    )
+    pipeline.process_project(project_id, None, settings)
+    stored = database.get_project(settings.database_path, project_id)
+    assert stored is not None
+    events = database.events_after(settings.database_path, project_id, 0)
+    return rendered_titles, stored, events
+
+
+def test_process_project_without_auto_edit_completes_with_proposals_and_no_render(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Con auto_edit apagado (el predeterminado), el pipeline termina en
+    las propuestas detectadas: estado completed, sin fase de edición ni
+    encodes ffmpeg, y con el evento terminal SSE publicado."""
+    rendered_titles, stored, events = _run_project_with_auto_edit(
+        monkeypatch, tmp_path, auto_edit=False
+    )
+    assert rendered_titles == []
+    assert stored["status"] == "completed"
+    assert stored["step"] == "finalize"
+    assert stored["progress"] == 100
+    assert stored["clips"] == []
+    proposals = (stored.get("metadata") or {}).get("clip_proposals") or []
+    assert len(proposals) == 1
+    assert proposals[0]["proposal"]["titulo"] == "Nuevo"
+    # Sin fase de edición: ningún evento de progreso con step "editing".
+    assert all(event["data"].get("step") != "editing" for event in events)
+    # El evento terminal llegó (publicación atómica estado+evento, BUG 2).
+    terminal = [event for event in events if event["data"].get("status") == "completed"]
+    assert len(terminal) == 1
+    assert terminal[0]["data"]["step"] == "finalize"
+    assert terminal[0]["data"]["progress"] == 100
+
+
+def test_process_project_with_auto_edit_renders_clips_as_before(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Con auto_edit encendido, el camino actual se mantiene: se
+    renderizan los clips y el proyecto completa con clips listos."""
+    rendered_titles, stored, _events = _run_project_with_auto_edit(
+        monkeypatch, tmp_path, auto_edit=True
+    )
+    assert rendered_titles == ["Nuevo"]
+    assert stored["status"] == "completed"
+    assert len(stored["clips"]) == 1
+    assert stored["clips"][0]["status"] == "ready"
+    assert stored["clips"][0]["title"] == "Nuevo"
+
+
+def test_process_project_without_auto_edit_preserves_previous_clips(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Reprocesar con auto_edit apagado no toca clips_json: los clips
+    de un procesamiento anterior se conservan y las propuestas nuevas
+    quedan guardadas para editarlas en el Studio."""
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    project_id = str(uuid.uuid4())
+    project_dir = _create_ready_project(
+        settings, project_id, config=ProjectConfig(auto_edit=False)
+    )
+    old_clip, _old_path = _old_clip(project_dir)
+    database.update_project(settings.database_path, project_id, clips=[old_clip])
+    _mock_ffmpeg_and_llm(monkeypatch)
+    rendered_titles = _mock_render(monkeypatch)
+    monkeypatch.setattr(
+        pipeline,
+        "probe_media",
+        lambda *_args, **_kwargs: {"width": 720, "height": 1280, "duration": 100},
+    )
+    monkeypatch.setattr(pipeline, "create_thumbnail", lambda *_args, **_kwargs: None)
+    fake_transcript = [
+        TranscriptSegment.model_validate(segment) for segment in _transcript_data()
+    ]
+    monkeypatch.setattr(
+        pipeline, "transcribe", lambda *_args, **_kwargs: (fake_transcript, "es")
+    )
+    monkeypatch.setattr(
+        pipeline, "_propose_valid_clips", lambda *_args, **_kwargs: [_proposal("Nuevo")]
+    )
+    pipeline.process_project(project_id, None, settings)
+    stored = database.get_project(settings.database_path, project_id)
+    assert stored is not None
+    assert rendered_titles == []
+    assert stored["status"] == "completed"
+    assert stored["clips"] == [old_clip]
+    proposals = (stored.get("metadata") or {}).get("clip_proposals") or []
+    assert len(proposals) == 1

@@ -182,12 +182,13 @@ _MIN_FREE_DISK_BYTES = 1 * 1024 * 1024 * 1024  # 1 GiB
 _MIN_FREE_DISK_FRACTION = 0.10  # 10 % del total en sistemas pequeños
 
 # Throttle de progreso (Fase 2, B-R3): cada _publish son dos escrituras a
-# SQLite y los callbacks llegan decenas de veces por segundo (ffmpeg, el
-# análisis facial a 4 Hz, la transcripción por segmento). Se publica solo
-# si cambia el % entero o han pasado 500 ms desde la última publicación
-# del proyecto. Los estados terminales (completed/failed/cancelled)
-# siempre se publican y limpian el estado, para que un reproceso del
-# mismo proyecto no herede el throttle del anterior.
+# SQLite en una sola transacción (estado + evento) y los callbacks llegan
+# decenas de veces por segundo (ffmpeg, el análisis facial a 4 Hz, la
+# transcripción por segmento). Se publica solo si cambia el % entero o han
+# pasado 500 ms desde la última publicación del proyecto. Los estados
+# terminales (completed/failed/cancelled) siempre se publican y limpian
+# el estado, para que un reproceso del mismo proyecto no herede el
+# throttle del anterior.
 _PROGRESS_THROTTLE_SECONDS = 0.5
 _last_progress_publish: dict[str, tuple[int | None, str, float]] = {}
 _last_progress_publish_lock = threading.Lock()
@@ -339,19 +340,19 @@ def _publish(
         "progress": progress,
         "message": message,
     }
-    database.update_project(
-        settings.database_path,
-        project_id,
-        status=status,
-        step=step,
-        progress=progress,
-        error=message if status == "failed" else None,
-    )
-    database.publish_event(
+    # Estado y evento en una sola transacción (BUG 2, v1.3.2): el SSE de
+    # progreso cierra el flujo al ver un estado terminal; si el estado se
+    # confirmaba antes que la fila del evento, el flujo podía cerrarse
+    # sin entregar el evento final y el frontend se quedaba en 98 %.
+    database.update_project_with_event(
         settings.database_path,
         project_id,
         "failed" if status == "failed" else "progress",
         payload,
+        status=status,
+        step=step,
+        progress=progress,
+        error=message if status == "failed" else None,
     )
 
 
@@ -1943,6 +1944,26 @@ def process_project(
                     "finalize",
                     100,
                     empty_message,
+                )
+                return
+            if not project_config.auto_edit:
+                # Edición automática apagada (v1.3.2): el pipeline
+                # termina en las propuestas detectadas, ya guardadas en
+                # metadata["clip_proposals"]. Sin fase de edición ni
+                # encodes ffmpeg: el usuario abre cada propuesta en el
+                # Studio, que edita el video fuente. No se toca
+                # clips_json: los clips de un procesamiento anterior se
+                # conservan. Publicación terminal con el mismo _publish
+                # atómico (estado + evento SSE en una sola transacción,
+                # BUG 2) que el resto de caminos de finalización.
+                _publish(
+                    settings,
+                    project_id,
+                    "completed",
+                    "finalize",
+                    100,
+                    f"Detección terminada: {len(proposals)} propuesta(s) "
+                    "lista(s) para editar en el Studio.",
                 )
                 return
 

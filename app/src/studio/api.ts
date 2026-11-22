@@ -125,20 +125,56 @@ function parseFaceTrack(value: unknown, projectId: string, ratio: TargetRatio): 
   };
 }
 
-// Pista de seguimiento facial del video fuente (v1.3.1). La primera
-// llamada recorre el video entero en el backend y tarda; las
-// siguientes, mismo proyecto y ratio, son instantáneas por la caché
-// del servidor. Sin rostro devuelve hasFace=false y keyframes=[]
-// (no es error). Proyecto inexistente: 404; video sin duración o
-// fallo del detector: 503 — ambos se propagan como Error.
+// Intervalo de sondeo de face-track mientras el backend analiza el
+// video en segundo plano (v1.3.2): cada GET es barato (solo lee el
+// estado del trabajo), así que 1 s da un progreso fluido sin cargar
+// el servidor local.
+const FACE_TRACK_POLL_MS = 1000;
+
+// Pista de seguimiento facial del video fuente (v1.3.1; sondeo con
+// progreso desde v1.3.2). La primera llamada recorre el video entero
+// en el backend y tarda minutos en videos largos: el servidor
+// responde 202 mientras el trabajo corre y 200 cuando está lista, así
+// que esta función sondea el mismo endpoint cada segundo e informa
+// del progreso con onProgress. Las siguientes llamadas, mismo
+// proyecto y ratio, son 200 inmediatas por la caché del servidor. Sin
+// rostro devuelve hasFace=false y keyframes=[] (no es error).
+// Proyecto inexistente: 404; video sin duración o fallo del detector:
+// 503 — ambos se propagan como Error. signal cancela el sondeo (al
+// desmontar el Studio o al desactivar el seguimiento, p. ej.); el
+// trabajo del servidor sigue y la próxima llamada lo reutiliza.
 export async function fetchFaceTrack(
   projectId: string,
   ratio: TargetRatio,
+  options: {
+    onProgress?: (progress: number) => void;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<FaceTrack> {
   const params = new URLSearchParams({ ratio });
-  const response = await apiFetch(`${API_BASE}/api/projects/${projectId}/face-track?${params}`);
-  if (!response.ok) throw new Error(await responseError(response));
-  return parseFaceTrack(await response.json() as unknown, projectId, ratio);
+  const url = `${API_BASE}/api/projects/${projectId}/face-track?${params}`;
+  for (;;) {
+    options.signal?.throwIfAborted();
+    const response = await apiFetch(url, { signal: options.signal });
+    if (response.status === 202) {
+      const pending = (await response.json().catch(() => null)) as {
+        progress?: unknown;
+      } | null;
+      if (typeof pending?.progress === 'number' && Number.isFinite(pending.progress)) {
+        options.onProgress?.(Math.max(0, Math.min(100, pending.progress)));
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, FACE_TRACK_POLL_MS);
+        options.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('Petición cancelada.'));
+        }, { once: true });
+      });
+      continue;
+    }
+    if (!response.ok) throw new Error(await responseError(response));
+    return parseFaceTrack(await response.json() as unknown, projectId, ratio);
+  }
 }
 
 export async function saveStudioEdit(

@@ -760,7 +760,8 @@ def test_process_project_signals_records_engine(
     _create_ready_project(
         settings,
         project_id,
-        config=ProjectConfig(signal_score_threshold=5.0),
+        # v1.3.2: este test cubre el camino con render.
+        config=ProjectConfig(signal_score_threshold=5.0, auto_edit=True),
         transcript=_transcript(600, exciting_at=300),
         duration=600,
     )
@@ -824,7 +825,8 @@ def test_process_project_llm_records_engine(
     _create_ready_project(
         settings,
         project_id,
-        config=ProjectConfig(moment_engine="llm"),
+        # v1.3.2: este test cubre el camino con render.
+        config=ProjectConfig(moment_engine="llm", auto_edit=True),
         transcript=_transcript(60),
         duration=60,
     )

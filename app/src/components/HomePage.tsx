@@ -31,6 +31,7 @@ export function HomePage() {
       whisperLanguage, setWhisperLanguage, subtitleStyle, setSubtitleStyle,
       momentEngine, setMomentEngine, signalThreshold, setSignalThreshold,
       fastDetection, setFastDetection,
+      autoEdit, setAutoEdit,
       visibleTemplates, saveCurrentTemplate, onTemplateTabKeyDown,
     },
     importer: {
@@ -201,6 +202,17 @@ export function HomePage() {
                 <span><strong>Detección rápida</strong><small>Solo audio y texto (Tier 0): la búsqueda de clips tarda segundos en vez de minutos, sin análisis de video, hablantes ni semántica. La transcripción tarda lo mismo.</small></span>
               </label>
             )}
+            {/* v1.3.2: edición automática — aplica a todos los motores.
+            Apagada, la detección termina en propuestas y cada una se
+            edita en el Studio sobre el video fuente, sin renders. */}
+            <label className="fast-detection-toggle">
+              <input
+                type="checkbox"
+                checked={autoEdit}
+                onChange={(event) => setAutoEdit(event.target.checked)}
+              />
+              <span><strong>Editar clips automáticamente</strong><small>Renderiza cada clip con ffmpeg al terminar la detección. Apagado (recomendado): la detección termina en propuestas listas para editar en el Studio, sin esperar renders.</small></span>
+            </label>
             <p className="settings-explainer">
               {momentEngine === 'signals'
                 ? 'El motor local mide la energía del audio, el ritmo del habla y los ganchos del texto. Funciona sin conexión y sin clave de IA.'

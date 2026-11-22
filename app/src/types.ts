@@ -94,6 +94,28 @@ export type ClipResult = {
   transcript: ClipWord[];
 };
 
+// Propuesta de clip detectada por el pipeline (backend/schemas.py:
+// ClipProposal), guardada en metadata["clip_proposals"] con su id.
+// Con la edición automática apagada (v1.3.2), el proyecto completa
+// con estas propuestas y sin clips renderizados; cada una se abre en
+// el Studio, que edita el video fuente con trim inicio/fin y los cues
+// de la transcripción en ese rango.
+export type ClipProposal = {
+  inicio: number;
+  fin: number;
+  titulo: string;
+  puntuacion: number;
+  razon_viral: string;
+  descripcion?: string;
+  palabras_clave?: string[];
+  signal_breakdown?: Record<string, number> | null;
+};
+
+export type ClipProposalRecord = {
+  id: string;
+  proposal: ClipProposal;
+};
+
 export type ProjectResult = {
   id: string;
   title: string;
@@ -137,9 +159,13 @@ export type ProjectResult = {
     // Detección rápida (v1.3.1): solo Tier 0 (audio + texto). Opcional:
     // los proyectos anteriores a v1.3.1 no la traen (motor completo).
     fast_detection?: boolean;
+    // Edición automática (v1.3.2): renderizar los clips con ffmpeg al
+    // terminar la detección. Opcional: los proyectos anteriores a
+    // v1.3.2 no la traen (apagada por defecto).
+    auto_edit?: boolean;
     schedule?: { scheduled_at: string; platform: string; visibility: string } | null;
   };
-  metadata: { duration: number; width: number; height: number; language?: string; moment_engine?: string; signal_score_threshold?: number; content_profile?: string } | null;
+  metadata: { duration: number; width: number; height: number; language?: string; moment_engine?: string; signal_score_threshold?: number; content_profile?: string; clip_proposals?: ClipProposalRecord[] } | null;
   transcript: Array<{ start: number; end: number; text: string; words: Array<{ start: number; end: number; text: string }> }> | null;
   clips: ClipResult[];
   thumbnail_url: string | null;

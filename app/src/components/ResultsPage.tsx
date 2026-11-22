@@ -5,7 +5,7 @@ import {
 import { apiFetch } from '../auth';
 import { API_BASE, CONTENT_PROFILE_LABELS, MOMENT_ENGINE_LABELS, formatBytes, type ContentProfile, type MomentEngine } from '../context/constants';
 import { ToastStack, useToasts, type ToastKind } from './Toasts';
-import type { ClipResult, ProjectResult, ScheduleJob } from '../types';
+import type { ClipProposalRecord, ClipResult, ProjectResult, ScheduleJob } from '../types';
 import { formatDuration, responseError } from '../utils';
 
 declare global {
@@ -61,6 +61,7 @@ export function ResultsPage({
   onEdit,
   onStudio,
   onStudioNew,
+  onStudioProposal,
   onProjectUpdated,
   onProjectDeleted,
 }: {
@@ -70,6 +71,7 @@ export function ResultsPage({
   onEdit: (clipId: string) => void;
   onStudio: (clipId: string) => void;
   onStudioNew: () => void;
+  onStudioProposal: (proposal: ClipProposalRecord) => void;
   onProjectUpdated: (projectId: string) => Promise<void>;
   onProjectDeleted: () => void;
 }) {
@@ -122,6 +124,29 @@ export function ResultsPage({
   };
   const readyClips = clips.filter((clip) => clip.status !== 'failed');
   const failedClips = clips.filter((clip) => clip.status === 'failed');
+  // Propuestas sin render (v1.3.2): con la edición automática apagada,
+  // el proyecto completa con las propuestas en los metadatos y sin
+  // clips renderizados. Se validan antes de mostrarlas: los metadatos
+  // de proyectos viejos pueden traer otra forma.
+  const proposals = useMemo<ClipProposalRecord[]>(() => {
+    const records = project?.metadata?.clip_proposals;
+    if (!Array.isArray(records)) return [];
+    return records.filter((record) => {
+      const proposal = (record as Partial<ClipProposalRecord> | null)?.proposal;
+      return typeof record?.id === 'string'
+        && proposal !== undefined
+        && Number.isFinite(proposal.inicio)
+        && Number.isFinite(proposal.fin)
+        && proposal.fin > proposal.inicio
+        && typeof proposal.titulo === 'string';
+    });
+  }, [project?.metadata?.clip_proposals]);
+  // Solo se muestran cuando el proyecto completó con la edición
+  // automática apagada (false explícito): con ella encendida, las
+  // propuestas ya están renderizadas como clips.
+  const showProposals = project?.status === 'completed'
+    && project?.config.auto_edit === false
+    && proposals.length > 0;
   const visibleReadyClips = visibleClips.filter((clip) => clip.status !== 'failed');
   // Motor efectivo que eligió los clips (registrado en metadatos).
   const engine = resolveEngine(project);
@@ -613,7 +638,7 @@ export function ResultsPage({
         </p>
       )}
       {!project && error && <button type="button" className="retry-button" onClick={() => window.location.reload()}>Volver a cargar el proyecto</button>}
-      {project?.status === 'completed' && clips.length === 0 && (
+      {project?.status === 'completed' && clips.length === 0 && !showProposals && (
         <section className="empty-clips"><WandSparkles size={23} /><h2>No se encontraron clips</h2><p>El análisis real no identificó momentos que cumplieran la duración y el criterio solicitados.{engine === 'signals' ? ' Puedes bajar el umbral de puntuación en la configuración del proyecto y reprocesar.' : ''}</p></section>
       )}
       {project?.status === 'completed' && clips.length > 0 && visibleClips.length === 0 && (
@@ -749,6 +774,55 @@ export function ResultsPage({
           </article>
         ))}
       </div>
+      {showProposals && (
+        <section className="proposal-section" aria-label="Propuestas sin editar">
+          <div className="clips-heading">
+            <div><strong>PROPUESTAS SIN EDITAR</strong></div>
+            <span className="clips-count">{proposals.length} propuesta{proposals.length === 1 ? '' : 's'}</span>
+          </div>
+          <p className="proposal-explainer">La edición automática está apagada: estos momentos se detectaron pero no se renderizaron. Abre cada uno en el Studio para editarlo sobre el video fuente.</p>
+          <div className="proposal-list">
+            {proposals.map((record, index) => {
+              const proposal = record.proposal;
+              return (
+                <article className="proposal-card" key={record.id}>
+                  <div className="proposal-time">
+                    <strong>{formatDuration(proposal.inicio)} – {formatDuration(proposal.fin)}</strong>
+                    <span>{formatDuration(proposal.fin - proposal.inicio)}</span>
+                  </div>
+                  <div className="clip-content">
+                    <h2>#{index + 1} {proposal.titulo}</h2>
+                    <div className="clip-score-actions">
+                      <div className="clip-score"><strong>{proposal.puntuacion.toFixed(1)}</strong><span>VIRALIDAD</span></div>
+                      <div className="clip-actions">
+                        <button type="button" className="clip-action" onClick={() => onStudioProposal(record)} title="Abrir el editor visual con el video fuente de esta propuesta"><Film size={15} /> Editar en Studio</button>
+                      </div>
+                    </div>
+                    <section className="viral-reason"><strong>Razón viral</strong><p>{proposal.razon_viral}</p></section>
+                    {proposal.signal_breakdown && (
+                      <section className="signal-breakdown" aria-label={`Por qué se eligió la propuesta ${index + 1}`}>
+                        <strong>Por qué este clip</strong>
+                        <ul>
+                          {Object.entries(proposal.signal_breakdown)
+                            .filter(([channel, value]) => channel !== 'completitud' && value > 0)
+                            .sort((a, b) => b[1] - a[1])
+                            .map(([channel, value]) => (
+                              <li key={channel}>
+                                <span className="signal-channel">{SIGNAL_CHANNEL_LABELS[channel] ?? channel}</span>
+                                <span className="signal-bar" aria-hidden="true"><span style={{ width: `${Math.min(100, value * 10)}%` }} /></span>
+                                <span className="signal-value">{value.toFixed(1)}</span>
+                              </li>
+                            ))}
+                        </ul>
+                      </section>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
       {project?.status !== 'completed' && project?.status !== 'failed' && project?.status !== 'cancelled' && !error && <p className="results-loading"><LoaderCircle size={17} className="spin" /> Cargando el estado real del proyecto…</p>}
       <a className="back-button results-back" href="/">Volver al inicio</a>
     </main>

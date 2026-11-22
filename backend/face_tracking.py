@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import bisect
+import logging
 import math
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class FaceTrackingError(RuntimeError):
@@ -281,6 +285,41 @@ def _intersection_over_union(left: _Face, right: _Face) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _merge_speech_intervals(
+    intervals: list[tuple[float, float]] | None,
+) -> tuple[list[float], list[float]]:
+    """Intervalos de habla fusionados y ordenados, para búsqueda binaria.
+
+    ``speech_active`` se evalúa en cada muestra; con la transcripción
+    de un video largo (miles de palabras) el escaneo lineal por muestra
+    es O(palabras × muestras). Fusionar intervalos solapados o
+    adyacentes no cambia el resultado booleano y deja la consulta en
+    O(log n) con ``bisect`` (ver ``_speech_active_at``).
+    """
+    if not intervals:
+        return [], []
+    starts: list[float] = []
+    ends: list[float] = []
+    for start, end in sorted(intervals):
+        if ends and start <= ends[-1]:
+            ends[-1] = max(ends[-1], end)
+        else:
+            starts.append(start)
+            ends.append(end)
+    return starts, ends
+
+
+def _speech_active_at(starts: list[float], ends: list[float], moment: float) -> bool:
+    """True si `moment` cae dentro de algún intervalo fusionado.
+
+    Los intervalos fusionados son disjuntos y están ordenados, así que
+    basta con el último que empieza en o antes de `moment`: si
+    `moment` supera su fin, tampoco está dentro de ningún anterior.
+    """
+    index = bisect.bisect_right(starts, moment) - 1
+    return index >= 0 and moment <= ends[index]
+
+
 class _SubjectTracker:
     def __init__(self, width: int, height: int, crop_width: float | None = None) -> None:
         self.width = width
@@ -490,6 +529,27 @@ def _probe_video_dimensions(input_path: Path) -> tuple[int, int]:
     return width, height
 
 
+def _points_to_keyframes(
+    points: list[FaceCropKeyframe],
+    input_path: Path,
+    output_width: int,
+    output_height: int,
+) -> list[FaceCropKeyframe]:
+    """Posiciones de recorte en píxeles → fracciones del desplazamiento máximo."""
+    source_width, source_height = _probe_video_dimensions(input_path)
+    _, max_x, max_y = _crop_geometry(
+        source_width, source_height, output_width, output_height
+    )
+    return [
+        FaceCropKeyframe(
+            point.time,
+            _crop_fraction(point.x, max_x),
+            _crop_fraction(point.y, max_y),
+        )
+        for point in points
+    ]
+
+
 def analyze_source_face_track(
     input_path: Path,
     duration: float,
@@ -497,6 +557,7 @@ def analyze_source_face_track(
     output_height: int,
     speech_intervals: list[tuple[float, float]] | None = None,
     sample_rate: float = STUDIO_FACE_TRACK_SAMPLE_RATE,
+    on_progress: Callable[[float], None] | None = None,
 ) -> tuple[bool, list[FaceCropKeyframe]]:
     """Pista de seguimiento facial del video fuente completo (Studio, v1.3.1).
 
@@ -517,15 +578,15 @@ def analyze_source_face_track(
     tiene su propia entrada y la segunda llamada es instantánea. La
     caché se pierde al reiniciar el backend, igual que en el render.
 
-    Latencia (estimación a partir del muestreo, sin mediciones en este
-    entorno): a 2 fps, un video de 1 h son 7.200 muestras (una
-    detección YuNet por muestra, más FaceLandmarker en las muestras
-    con voz y rostro), y el muestreo secuencial decodifica
-    prácticamente todos los fotogramas del video entre muestras
-    (~108.000 a 30 fps). En una CPU modesta, del orden de 10–20 min
-    para 1 h a 1080p, escalando linealmente con la duración (un video
-    de 10 min, unos 2–4 min). La primera llamada es lenta; las
-    siguientes, con la caché caliente, son instantáneas.
+    Latencia (medida en este entorno, VM de 1,5 CPU): a 2 fps, un
+    video de 1 min a 1080p tarda ~17 s (el muestreo secuencial
+    decodifica prácticamente todos los fotogramas entre muestras);
+    escala linealmente con la duración, así que 1 h son del orden de
+    15–20 min. Por eso el endpoint no la ejecuta en la petición: la
+    lanza en un trabajo en segundo plano con progreso (ver
+    ``start_face_track_job``) y el frontend sondea hasta que está
+    lista. ``on_progress`` recibe el porcentaje (0–100) y alimenta
+    ese progreso; en un acierto de caché se notifica el 100 %.
     """
     if duration <= 0:
         raise ValueError("La duración del video debe ser positiva.")
@@ -536,24 +597,189 @@ def analyze_source_face_track(
         output_width,
         output_height,
         speech_intervals=speech_intervals,
+        on_progress=on_progress,
         sample_rate=sample_rate,
     )
     points = paths[0] if paths else None
     if not points:
         return False, []
-    source_width, source_height = _probe_video_dimensions(input_path)
-    _, max_x, max_y = _crop_geometry(
-        source_width, source_height, output_width, output_height
+    return True, _points_to_keyframes(points, input_path, output_width, output_height)
+
+
+def peek_cached_source_face_track(
+    input_path: Path,
+    duration: float,
+    output_width: int,
+    output_height: int,
+    speech_intervals: list[tuple[float, float]] | None = None,
+    sample_rate: float = STUDIO_FACE_TRACK_SAMPLE_RATE,
+) -> tuple[bool, list[FaceCropKeyframe]] | None:
+    """Resultado cacheado de la pista del Studio, sin analizar.
+
+    Devuelve None si no está en caché: el llamador debe iniciar el
+    análisis en segundo plano. Falla abierto: cualquier error al
+    convertir el resultado cacheado devuelve None en vez de
+    propagarse, para que el análisis real informe del fallo con su
+    propio error (503 en el endpoint).
+    """
+    if duration <= 0:
+        return None
+    cache_key = _face_cache_key(
+        input_path,
+        0.0,
+        [(0.0, duration)],
+        output_width,
+        output_height,
+        speech_intervals,
+        sample_rate,
     )
-    keyframes = [
-        FaceCropKeyframe(
-            point.time,
-            _crop_fraction(point.x, max_x),
-            _crop_fraction(point.y, max_y),
-        )
-        for point in points
-    ]
-    return True, keyframes
+    if cache_key is None:
+        return None
+    with _FACE_ANALYSIS_CACHE_LOCK:
+        cached = _FACE_ANALYSIS_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    points = cached[0] if cached else None
+    if not points:
+        return False, []
+    try:
+        return True, _points_to_keyframes(points, input_path, output_width, output_height)
+    except Exception:  # noqa: BLE001 - el peek nunca debe tumbar la petición
+        logger.debug("No se pudo leer la pista facial cacheada.", exc_info=True)
+        return None
+
+
+# --- Trabajos de seguimiento facial del Studio (v1.3.2) ---------------------
+# La pista cubre el video fuente entero (minutos en videos largos), así
+# que el endpoint la calcula en un hilo en segundo plano y el frontend
+# sondea con GET hasta que está lista. Un solo vuelo por clave: varias
+# peticiones del mismo proyecto+ratio comparten el mismo trabajo en vez
+# de lanzar análisis duplicados que se pelean por la CPU. La clave la
+# construye el endpoint e incluye la identidad del archivo fuente, así
+# que reemplazar el video invalida el trabajo anterior. Los trabajos
+# terminados se conservan (acotado) para que un GET posterior devuelva
+# el resultado sin re-analizar; los fallidos se olvidan al entregarse
+# el error, para que el siguiente GET reintente.
+FaceTrackJobKey = tuple[Any, ...]
+
+
+@dataclass
+class FaceTrackJob:
+    """Estado de un trabajo de seguimiento facial (hilo en segundo plano)."""
+
+    status: str = "pending"  # "pending" | "done" | "failed"
+    progress: float = 0.0
+    result: tuple[bool, list[FaceCropKeyframe]] | None = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def snapshot(self) -> FaceTrackJob:
+        """Copia del estado actual (lectura segura desde otro hilo)."""
+        with self._lock:
+            return FaceTrackJob(
+                status=self.status,
+                progress=self.progress,
+                result=self.result,
+                error=self.error,
+            )
+
+    def update_progress(self, value: float) -> None:
+        with self._lock:
+            self.progress = min(100.0, max(0.0, float(value)))
+
+    def complete(self, result: tuple[bool, list[FaceCropKeyframe]]) -> None:
+        with self._lock:
+            self.result = result
+            self.progress = 100.0
+            self.status = "done"
+
+    def fail(self, error: str) -> None:
+        with self._lock:
+            self.error = error
+            self.status = "failed"
+
+
+_FACE_TRACK_JOBS: dict[FaceTrackJobKey, FaceTrackJob] = {}
+_FACE_TRACK_JOBS_LOCK = threading.Lock()
+_FACE_TRACK_JOBS_MAX_ENTRIES = 32
+
+
+def _prune_face_track_jobs_locked() -> None:
+    """Acota el registro (solo se expulsan trabajos terminados)."""
+    while len(_FACE_TRACK_JOBS) > _FACE_TRACK_JOBS_MAX_ENTRIES:
+        for key, job in _FACE_TRACK_JOBS.items():
+            if job.snapshot().status != "pending":
+                del _FACE_TRACK_JOBS[key]
+                break
+        else:
+            break
+
+
+def _run_face_track_job(
+    job: FaceTrackJob,
+    runner: Callable[
+        [Callable[[float], None]], tuple[bool, list[FaceCropKeyframe]]
+    ],
+) -> None:
+    try:
+        result = runner(job.update_progress)
+    except FaceTrackingError as error:
+        job.fail(str(error))
+    except Exception:  # noqa: BLE001 - un fallo inesperado no debe dejar el trabajo colgado
+        logger.exception("El seguimiento facial terminó con un error inesperado.")
+        job.fail("No se pudo calcular el seguimiento facial.")
+    else:
+        job.complete(result)
+
+
+def get_face_track_job(key: FaceTrackJobKey) -> FaceTrackJob | None:
+    """Trabajo existente para la clave, o None (sin crearlo)."""
+    with _FACE_TRACK_JOBS_LOCK:
+        job = _FACE_TRACK_JOBS.get(key)
+    return job.snapshot() if job is not None else None
+
+
+def start_face_track_job(
+    key: FaceTrackJobKey,
+    runner: Callable[
+        [Callable[[float], None]], tuple[bool, list[FaceCropKeyframe]]
+    ],
+) -> FaceTrackJob:
+    """Inicia (o reutiliza) el trabajo de seguimiento para `key`.
+
+    Un solo vuelo: si ya hay un trabajo para la clave (pendiente,
+    terminado o fallido), se devuelve su estado en vez de lanzar otro
+    análisis. El trabajo nuevo corre en un hilo demonio; el llamador
+    sondea con ``get_face_track_job`` (o repitiendo esta llamada).
+    """
+    with _FACE_TRACK_JOBS_LOCK:
+        existing = _FACE_TRACK_JOBS.get(key)
+        if existing is not None:
+            return existing.snapshot()
+        job = FaceTrackJob()
+        _FACE_TRACK_JOBS[key] = job
+        _prune_face_track_jobs_locked()
+    threading.Thread(
+        target=_run_face_track_job,
+        args=(job, runner),
+        name="face-track",
+        daemon=True,
+    ).start()
+    return job.snapshot()
+
+
+def forget_face_track_job(key: FaceTrackJobKey) -> None:
+    """Olvida un trabajo (tras entregar su error, para que el siguiente GET reintente)."""
+    with _FACE_TRACK_JOBS_LOCK:
+        _FACE_TRACK_JOBS.pop(key, None)
+
+
+def clear_face_track_jobs() -> None:
+    """Vacía el registro de trabajos (tests)."""
+    with _FACE_TRACK_JOBS_LOCK:
+        _FACE_TRACK_JOBS.clear()
 
 
 def _analyze_face_crop_paths_uncached(
@@ -609,6 +835,13 @@ def _analyze_face_crop_paths_uncached(
         )
         media_pipe = None
         landmarker = None
+        # Detección de orador por labios (MediaPipe): solo un extra
+        # para elegir entre varios rostros. Si el modelo o MediaPipe
+        # no están disponibles, el seguimiento sigue con YuNet solo
+        # (sin abortar el análisis con un error): un rostro único se
+        # sigue igual, y con varios se elige el de mayor área y
+        # confianza, como sin orador preferido.
+        lip_tracking_available = True
         tracker = _SubjectTracker(
             source_width,
             source_height,
@@ -629,6 +862,10 @@ def _analyze_face_crop_paths_uncached(
         completed_samples = 0
         if on_progress is not None:
             on_progress(0.0)
+        # Intervalos de habla fusionados para la consulta por muestra
+        # (O(log n) con bisect en vez de O(n) por muestra; ver
+        # _merge_speech_intervals).
+        speech_starts, speech_ends = _merge_speech_intervals(speech_intervals)
 
         for interval_start, interval_end in intervals:
             interval_duration = interval_end - interval_start
@@ -714,34 +951,42 @@ def _analyze_face_crop_paths_uncached(
                 )
                 any_face_detected |= bool(faces)
                 preferred_face = None
-                speech_active = any(
-                    start <= absolute_time <= end
-                    for start, end in speech_intervals or []
+                speech_active = _speech_active_at(
+                    speech_starts, speech_ends, absolute_time
                 )
                 if scene_changed:
                     speaker_tracker.reset()
                 measurements: list[tuple[_Face, float]] = []
-                if speech_active and faces and speech_intervals:
+                # Con menos de dos rostros la selección del orador no
+                # cambia nada (el único rostro se sigue igualmente), así
+                # que se omite el landmarker: en un video de una sola
+                # persona hablando ahorra una inferencia por muestra.
+                if speech_active and len(faces) >= 2 and lip_tracking_available:
                     if landmarker is None:
-                        media_pipe, landmarker = _get_lip_landmarker()
-                    if media_pipe is None:
-                        raise FaceTrackingError(
-                            "No se pudo inicializar el análisis del orador."
+                        try:
+                            media_pipe, landmarker = _get_lip_landmarker()
+                        except FaceTrackingError as error:
+                            lip_tracking_available = False
+                            logger.warning(
+                                "Seguimiento facial sin detección de orador "
+                                "(se sigue con YuNet solo): %s",
+                                error,
+                            )
+                    if landmarker is not None and media_pipe is not None:
+                        rgb_frame = cv2.cvtColor(detector_frame, cv2.COLOR_BGR2RGB)
+                        image = media_pipe.Image(
+                            image_format=media_pipe.ImageFormat.SRGB,
+                            data=rgb_frame,
                         )
-                    rgb_frame = cv2.cvtColor(detector_frame, cv2.COLOR_BGR2RGB)
-                    image = media_pipe.Image(
-                        image_format=media_pipe.ImageFormat.SRGB,
-                        data=rgb_frame,
-                    )
-                    with _LIP_LANDMARKER_LOCK:
-                        result = landmarker.detect(image)
-                    landmarks_by_face = result.face_landmarks or []
-                    measurements = _lip_measurements(
-                        landmarks_by_face,
-                        faces,
-                        frame_width,
-                        frame_height,
-                    )
+                        with _LIP_LANDMARKER_LOCK:
+                            result = landmarker.detect(image)
+                        landmarks_by_face = result.face_landmarks or []
+                        measurements = _lip_measurements(
+                            landmarks_by_face,
+                            faces,
+                            frame_width,
+                            frame_height,
+                        )
                 preferred_face = speaker_tracker.update(
                     measurements,
                     absolute_time,

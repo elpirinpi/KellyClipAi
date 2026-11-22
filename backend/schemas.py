@@ -124,6 +124,15 @@ class ProjectConfig(BaseModel):
     # completo sigue siendo el predeterminado. Solo aplica a los motores
     # de señales; el modo "llm" lo ignora.
     fast_detection: bool = False
+    # Edición automática (v1.3.2): al terminar la detección, renderizar
+    # todos los clips con ffmpeg (fase de edición). APAGADA por defecto:
+    # el Studio edita el video fuente (trim + cues de la transcripción),
+    # no el clip renderizado, así que renderizar antes es trabajo y
+    # tiempo perdido. Con el ajuste apagado, el pipeline termina en las
+    # propuestas detectadas (metadata["clip_proposals"]) con estado
+    # completed y sin encodes; el usuario abre cada propuesta en el
+    # Studio desde la página de resultados.
+    auto_edit: bool = False
     schedule: ScheduledPublishing | None = None
 
 
@@ -348,6 +357,22 @@ class FaceTrackResponse(BaseModel):
     sample_fps: float = Field(gt=0)
     has_face: bool
     keyframes: list[FaceTrackKeyframe] = Field(default_factory=list)
+
+
+class FaceTrackPendingResponse(BaseModel):
+    """Respuesta 202 de GET /api/projects/{id}/face-track (Studio, v1.3.2).
+
+    El análisis del video entero tarda minutos en videos largos, así
+    que corre en segundo plano y el frontend sondea el mismo endpoint
+    hasta recibir 200 (FaceTrackResponse) o 503 (fallo, con reintento
+    en el siguiente GET). ``progress`` es el porcentaje del análisis
+    (0–100).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["pending"] = "pending"
+    progress: float = Field(ge=0, le=100)
 
 
 class ClipArchiveRequest(BaseModel):

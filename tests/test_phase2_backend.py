@@ -553,12 +553,24 @@ def test_periodic_backup_skipped_when_fresh_and_created_when_stale(
 def _counting_update_project(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     original = database.update_project
+    original_with_event = database.update_project_with_event
 
     def wrapper(database_path: Path, project_id: str, **kwargs: Any) -> None:
         calls.append(dict(kwargs))
         return original(database_path, project_id, **kwargs)
 
+    def wrapper_with_event(
+        database_path: Path,
+        project_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        **kwargs: Any,
+    ) -> int:
+        calls.append(dict(kwargs))
+        return original_with_event(database_path, project_id, event_type, payload, **kwargs)
+
     monkeypatch.setattr(database, "update_project", wrapper)
+    monkeypatch.setattr(database, "update_project_with_event", wrapper_with_event)
     return calls
 
 
@@ -597,6 +609,117 @@ def test_publish_terminal_always_writes_and_clears_throttle(
     # (un reproceso no hereda el throttle del anterior).
     pipeline._publish(settings, "project-th2", "processing", "editing", 50, "A")
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# BUG 2 (v1.3.2): el frontend se quedaba en 98 % al terminar el último clip
+# ---------------------------------------------------------------------------
+# Causa raíz: _publish confirmaba el estado terminal en una transacción y
+# el evento final en otra posterior; el SSE cerraba el flujo al ver el
+# estado terminal y podía cerrarlo entre ambas escrituras, sin entregar
+# el evento. El frontend, además, no hacía nada al cerrarse limpio el
+# flujo (sin .then), así que la vista se quedaba en 98 % hasta remontar.
+
+
+def test_publish_terminal_event_is_atomic_with_status(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    _create_listed_project(settings, "project-atomic")
+    pipeline._reset_progress_throttle()
+    pipeline._publish(
+        settings, "project-atomic", "processing", "editing", 98, "Editando clip 10 de 10…"
+    )
+    pipeline._publish(
+        settings,
+        "project-atomic",
+        "completed",
+        "finalize",
+        100,
+        "Procesamiento terminado: 10 clips reales listos.",
+    )
+    assert database.get_project_status(settings.database_path, "project-atomic") == "completed"
+    events = database.events_after(settings.database_path, "project-atomic", 0)
+    terminal = [event for event in events if event["data"].get("status") == "completed"]
+    assert len(terminal) == 1
+    assert terminal[0]["data"]["progress"] == 100
+    assert terminal[0]["data"]["step"] == "finalize"
+
+
+def test_update_project_with_event_rolls_back_both_writes(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    _create_listed_project(settings, "project-rollback")
+    status_before = database.get_project_status(settings.database_path, "project-rollback")
+    events_before = database.events_after(settings.database_path, "project-rollback", 0)
+    # La carga no serializable rompe el INSERT del evento: el UPDATE del
+    # estado debe revertirse con él (una sola transacción).
+    with pytest.raises(TypeError):
+        database.update_project_with_event(
+            settings.database_path,
+            "project-rollback",
+            "progress",
+            {"status": "completed", "bad": object()},
+            status="completed",
+        )
+    assert database.get_project_status(settings.database_path, "project-rollback") == status_before
+    assert database.events_after(settings.database_path, "project-rollback", 0) == events_before
+
+
+def test_project_events_stream_delivers_terminal_event_after_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El drenaje final del SSE entrega el evento terminal aunque la
+    lectura del estado lo vea antes que la lectura de eventos (la
+    intercalación que dejaba el frontend en 98 %)."""
+    settings = _settings(tmp_path / "data")
+    database.initialize(settings.database_path)
+    _create_listed_project(settings, "project-sse-race")
+    progress_event = {
+        "id": 1,
+        "event": "progress",
+        "data": {
+            "status": "processing",
+            "step": "editing",
+            "progress": 98,
+            "message": "Editando clip 10 de 10…",
+        },
+    }
+    terminal_event = {
+        "id": 2,
+        "event": "progress",
+        "data": {
+            "status": "completed",
+            "step": "finalize",
+            "progress": 100,
+            "message": "Procesamiento terminado: 10 clips reales listos.",
+        },
+    }
+    scripted_events = [[progress_event], [], [terminal_event]]
+    scripted_statuses = ["processing", "completed"]
+    events_calls = {"count": 0}
+    status_calls = {"count": 0}
+
+    def fake_events_after(*_args: Any) -> list[dict[str, Any]]:
+        index = events_calls["count"]
+        events_calls["count"] += 1
+        return scripted_events[index] if index < len(scripted_events) else []
+
+    def fake_get_project_status(*_args: Any) -> str:
+        index = status_calls["count"]
+        status_calls["count"] += 1
+        return scripted_statuses[index] if index < len(scripted_statuses) else "completed"
+
+    monkeypatch.setattr(database, "events_after", fake_events_after)
+    monkeypatch.setattr(database, "get_project_status", fake_get_project_status)
+    with TestClient(create_app(settings)) as client:
+        with client.stream("GET", "/api/projects/project-sse-race/events") as response:
+            assert response.status_code == 200
+            text = response.read().decode("utf-8")
+    assert "Editando clip 10 de 10" in text
+    assert '"status": "completed"' in text
+    assert '"progress": 100' in text
+    # El bucle drenó dos veces y el drenaje final una más.
+    assert events_calls["count"] == 3
 
 
 def _render_setup(

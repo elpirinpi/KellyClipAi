@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { apiFetch } from '../auth';
 import {
-  FAST_DETECTION_STORAGE_KEY, MOMENT_ENGINE_STORAGE_KEY, SIGNAL_THRESHOLD_STORAGE_KEY,
-  customTemplates, readStoredFastDetection, readStoredMomentEngine, readStoredSignalThreshold, templates,
+  AUTO_EDIT_STORAGE_KEY, FAST_DETECTION_STORAGE_KEY, MOMENT_ENGINE_STORAGE_KEY, SIGNAL_THRESHOLD_STORAGE_KEY,
+  customTemplates, readStoredAutoEdit, readStoredFastDetection, readStoredMomentEngine, readStoredSignalThreshold, templates,
   type MomentEngine, type Template,
 } from '../context/constants';
 import type { ToastKind } from '../components/Toasts';
@@ -59,6 +59,8 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
   // Detección rápida (v1.3.1): mismo patrón que el motor y el umbral —
   // preferencia guardada, restaurada al cargar un proyecto.
   const [fastDetection, setFastDetectionState] = useState<boolean>(() => readStoredFastDetection());
+  // Edición automática (v1.3.2): mismo patrón — apagada por defecto.
+  const [autoEdit, setAutoEditState] = useState<boolean>(() => readStoredAutoEdit());
 
   const setMomentEngine = useCallback((value: MomentEngine) => {
     setMomentEngineState(value);
@@ -82,6 +84,15 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setFastDetectionState(value);
     try {
       window.localStorage.setItem(FAST_DETECTION_STORAGE_KEY, value ? '1' : '0');
+    } catch {
+      // Sin almacenamiento disponible: la elección vale para esta sesión.
+    }
+  }, []);
+
+  const setAutoEdit = useCallback((value: boolean) => {
+    setAutoEditState(value);
+    try {
+      window.localStorage.setItem(AUTO_EDIT_STORAGE_KEY, value ? '1' : '0');
     } catch {
       // Sin almacenamiento disponible: la elección vale para esta sesión.
     }
@@ -181,6 +192,7 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
       moment_engine: momentEngine,
       signal_score_threshold: signalThreshold,
       fast_detection: fastDetection,
+      auto_edit: autoEdit,
       schedule: schedule
         ? {
             scheduled_at: new Date(scheduleDate).toISOString(),
@@ -212,6 +224,7 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setMomentEngineState(loaded.config.moment_engine ?? readStoredMomentEngine());
     setSignalThresholdState(loaded.config.signal_score_threshold ?? readStoredSignalThreshold());
     setFastDetectionState(loaded.config.fast_detection ?? readStoredFastDetection());
+    setAutoEditState(loaded.config.auto_edit ?? readStoredAutoEdit());
     setSchedule(Boolean(loaded.config.schedule));
     if (loaded.config.schedule) {
       const localDate = new Date(loaded.config.schedule.scheduled_at);
@@ -261,6 +274,8 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     setSignalThreshold,
     fastDetection,
     setFastDetection,
+    autoEdit,
+    setAutoEdit,
     subtitleStyle,
     setSubtitleStyle,
     visibleTemplates,

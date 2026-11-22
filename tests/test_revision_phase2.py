@@ -279,7 +279,9 @@ def test_failed_clip_can_retry_without_regenerating_proposals(
     project_dir.mkdir(parents=True)
     input_path = project_dir / "source"
     input_path.write_bytes(b"video source")
-    config = ProjectConfig()
+    # v1.3.2: este test cubre el camino con render (primer pase con un
+    # clip fallido y reintento posterior).
+    config = ProjectConfig(auto_edit=True)
     database.create_project(
         settings.database_path,
         project_id,

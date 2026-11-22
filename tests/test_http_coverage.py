@@ -597,7 +597,9 @@ def test_process_project_runs_llm_http_and_persists_real_pipeline_result(
     input_path = project_dir / "source"
     input_path.parent.mkdir(parents=True)
     input_path.write_bytes(b"video")
-    config = ProjectConfig(moment_engine="llm")
+    # v1.3.2: este test cubre el camino con render; la edición
+    # automática está apagada por defecto y hay que encenderla.
+    config = ProjectConfig(moment_engine="llm", auto_edit=True)
     database.create_project(
         settings.database_path,
         project_id,

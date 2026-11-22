@@ -64,8 +64,11 @@ from .editor import (
 from .face_tracking import (
     STUDIO_FACE_TRACK_SAMPLE_RATE,
     STUDIO_FACE_TRACK_SIZES,
-    FaceTrackingError,
+    FaceCropKeyframe,
     analyze_source_face_track,
+    forget_face_track_job,
+    peek_cached_source_face_track,
+    start_face_track_job,
 )
 from .integrations import (
     IntegrationError,
@@ -92,6 +95,7 @@ from .schemas import (
     CustomTemplateRequest,
     EditorRenderJobResponse,
     FaceTrackKeyframe,
+    FaceTrackPendingResponse,
     FaceTrackResponse,
     LLMConfig,
     LLMSettingsRequest,
@@ -2175,6 +2179,23 @@ def create_app(
                     app_settings.database_path, project_id
                 )
                 if status is None or status in {"completed", "failed", "cancelled"}:
+                    # BUG 2 (v1.3.2): el estado terminal y su evento se
+                    # confirman en una sola transacción, pero esta
+                    # iteración pudo drenar los eventos justo antes de
+                    # esa confirmación y leer el estado terminal
+                    # después. Drenaje final antes de cerrar: si el
+                    # evento terminal llegó entre ambas lecturas, se
+                    # entrega en vez de perderse (el frontend se
+                    # quedaba en 98 %).
+                    for event in database.events_after(
+                        app_settings.database_path, project_id, after_id
+                    ):
+                        after_id = event["id"]
+                        yield {
+                            "id": str(event["id"]),
+                            "event": event["event"],
+                            "data": json.dumps(event["data"], ensure_ascii=False),
+                        }
                     break
                 if await request.is_disconnected():
                     break
@@ -2829,21 +2850,30 @@ def create_app(
     @application.get(
         "/api/projects/{project_id}/face-track",
         response_model=FaceTrackResponse,
+        responses={202: {"model": FaceTrackPendingResponse}},
     )
     def project_face_track(
         project_id: str,
         ratio: str = Query(default="9:16"),
-    ) -> FaceTrackResponse:
+    ) -> FaceTrackResponse | JSONResponse:
         """Pista de seguimiento facial del video fuente (Studio, v1.3.1).
 
         Cubre el video fuente completo a 2 fps (el Studio reproduce el
         fuente). Los keyframes llevan tiempos absolutos y x/y como
         fracción del desplazamiento máximo de recorte en cada eje. Sin
         rostro en todo el video devuelve has_face=false y keyframes=[]
-        (no es un error). Primera llamada lenta (el análisis recorre
-        el video entero; ver ``analyze_source_face_track``); las
-        siguientes, mismo proyecto y ratio, son instantáneas por la
-        caché en memoria, que se pierde al reiniciar el backend.
+        (no es un error).
+
+        Asíncrono (v1.3.2): el análisis recorre el video entero y
+        tarda minutos en videos largos, así que la primera llamada
+        lanza un trabajo en segundo plano y responde 202 con el
+        progreso; el frontend sondea el mismo endpoint hasta recibir
+        200 (o 503 si el análisis falla, con reintento en el siguiente
+        GET). Varias peticiones del mismo proyecto y ratio comparten
+        un solo trabajo (sin análisis duplicados). Con la caché
+        caliente (mismo proyecto y ratio) la respuesta es 200
+        inmediata. La caché en memoria se pierde al reiniciar el
+        backend.
         """
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
@@ -2862,34 +2892,80 @@ def create_app(
                 status_code=503,
                 detail="No se pudo determinar la duración del video original.",
             )
+        video_duration = duration
         output_width, output_height = STUDIO_FACE_TRACK_SIZES[ratio]
         # Intervalos de habla de la transcripción del proyecto (espejo
         # de render_clip, media.py): activan la selección del orador
         # por apertura de labios. Sin transcripción, None.
-        words = project_transcript_words(project.get("transcript"), 0.0, duration)
+        words = project_transcript_words(project.get("transcript"), 0.0, video_duration)
         speech_intervals = (
             [(float(word["start"]), float(word["end"])) for word in words] or None
         )
+
+        def _response(
+            has_face: bool, keyframes: list[FaceCropKeyframe]
+        ) -> FaceTrackResponse:
+            return FaceTrackResponse(
+                project_id=project_id,
+                ratio=ratio,  # type: ignore[arg-type]  # validado arriba
+                duration=video_duration,
+                sample_fps=STUDIO_FACE_TRACK_SAMPLE_RATE,
+                has_face=has_face,
+                keyframes=[
+                    FaceTrackKeyframe(time=point.time, x=point.x, y=point.y)
+                    for point in keyframes
+                ],
+            )
+
+        # Caché caliente: respuesta inmediata sin lanzar ningún trabajo.
+        cached = peek_cached_source_face_track(
+            source_path,
+            video_duration,
+            output_width,
+            output_height,
+            speech_intervals=speech_intervals,
+        )
+        if cached is not None:
+            has_face, keyframes = cached
+            return _response(has_face, keyframes)
         try:
-            has_face, keyframes = analyze_source_face_track(
+            stat = source_path.stat()
+        except OSError:
+            raise HTTPException(
+                status_code=404, detail="El video original ya no está disponible."
+            ) from None
+        # La clave incluye la identidad del archivo fuente: reemplazar
+        # el video invalida el trabajo anterior.
+        job_key = (project_id, ratio, stat.st_size, stat.st_mtime_ns)
+
+        def _run(
+            on_progress: Callable[[float], None],
+        ) -> tuple[bool, list[FaceCropKeyframe]]:
+            return analyze_source_face_track(
                 source_path,
-                duration,
+                video_duration,
                 output_width,
                 output_height,
                 speech_intervals=speech_intervals,
+                on_progress=on_progress,
             )
-        except FaceTrackingError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
-        return FaceTrackResponse(
-            project_id=project_id,
-            ratio=ratio,  # type: ignore[arg-type]  # validado arriba
-            duration=duration,
-            sample_fps=STUDIO_FACE_TRACK_SAMPLE_RATE,
-            has_face=has_face,
-            keyframes=[
-                FaceTrackKeyframe(time=point.time, x=point.x, y=point.y)
-                for point in keyframes
-            ],
+
+        job = start_face_track_job(job_key, _run)
+        if job.status == "done" and job.result is not None:
+            has_face, keyframes = job.result
+            return _response(has_face, keyframes)
+        if job.status == "failed":
+            # Se olvida el trabajo para que el siguiente GET reintente.
+            forget_face_track_job(job_key)
+            raise HTTPException(
+                status_code=503,
+                detail=job.error or "No se pudo calcular el seguimiento facial.",
+            )
+        return JSONResponse(
+            status_code=202,
+            content=FaceTrackPendingResponse(progress=job.progress).model_dump(
+                mode="json"
+            ),
         )
 
     @application.put("/api/projects/{project_id}/clips/{clip_id}/studio")

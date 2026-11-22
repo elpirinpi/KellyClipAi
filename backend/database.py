@@ -1029,7 +1029,9 @@ def project_from_row(
     return item
 
 
-def update_project(database_path: Path, project_id: str, **values: Any) -> None:
+def _update_project_conn(
+    conn: sqlite3.Connection, project_id: str, **values: Any
+) -> None:
     updates = {key: value for key, value in values.items() if key in _PROJECT_COLUMNS}
     if not updates:
         return
@@ -1041,11 +1043,35 @@ def update_project(database_path: Path, project_id: str, **values: Any) -> None:
         parameters.append(json.dumps(value, ensure_ascii=False) if key in _JSON_COLUMNS else value)
     assignments.append("updated_at = ?")
     parameters.extend([utc_now(), project_id])
+    conn.execute(
+        f"UPDATE projects SET {', '.join(assignments)} WHERE id = ?",
+        parameters,
+    )
+
+
+def update_project(database_path: Path, project_id: str, **values: Any) -> None:
     with _lock, connection(database_path) as conn:
-        conn.execute(
-            f"UPDATE projects SET {', '.join(assignments)} WHERE id = ?",
-            parameters,
-        )
+        _update_project_conn(conn, project_id, **values)
+
+
+def update_project_with_event(
+    database_path: Path,
+    project_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    **values: Any,
+) -> int:
+    """Actualiza el proyecto y publica su evento en UNA transacción.
+
+    BUG 2 (v1.3.2): el SSE de progreso cierra el flujo al ver un estado
+    terminal; si el estado se confirmaba en una transacción y el evento
+    en otra posterior, el flujo podía cerrarse entre ambas sin entregar
+    el evento final y el frontend se quedaba en 98 %. Con una sola
+    transacción, quien ve el estado terminal ve también su evento.
+    """
+    with _lock, connection(database_path) as conn:
+        _update_project_conn(conn, project_id, **values)
+        return append_event(conn, project_id, event_type, payload)
 
 
 def delete_project(

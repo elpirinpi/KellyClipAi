@@ -9,6 +9,7 @@ import { RecordModal } from './RecordModal';
 import { ResultsPage } from './ResultsPage';
 import { SettingsPage } from './SettingsPage';
 import { StudioPage } from '../studio/StudioPage';
+import type { ClipProposalRecord } from '../types';
 import { ToastStack } from './Toasts';
 import { TopBar } from './TopBar';
 import { UpdateBanner } from './UpdateBanner';
@@ -81,6 +82,8 @@ export function AppShell() {
           setSignalThreshold={config.setSignalThreshold}
           fastDetection={config.fastDetection}
           setFastDetection={config.setFastDetection}
+          autoEdit={config.autoEdit}
+          setAutoEdit={config.setAutoEdit}
           theme={theme.preference}
           setTheme={theme.setPreference}
           onBack={() => navigate(settingsReturnPath)}
@@ -121,6 +124,17 @@ export function AppShell() {
                 onEdit={(clipId) => navigate(`/p/${projectRouteId}/edit/${clipId}`)}
                 onStudio={(clipId) => navigate(`/projects/${projectRouteId}/studio/${clipId}`)}
                 onStudioNew={() => navigate(`/projects/${projectRouteId}/studio/new`)}
+                // v1.3.2: una propuesta sin render abre el modo manual
+                // del Studio con el trim y el título de la propuesta
+                // (el Studio lee start/end/title de la URL).
+                onStudioProposal={(proposal: ClipProposalRecord) => {
+                  const params = new URLSearchParams({
+                    start: String(proposal.proposal.inicio),
+                    end: String(proposal.proposal.fin),
+                    title: proposal.proposal.titulo,
+                  });
+                  navigate(`/projects/${projectRouteId}/studio/new?${params}`);
+                }}
               />
       ) : (
         <HomePage />

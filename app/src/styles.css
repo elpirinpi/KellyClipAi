@@ -391,6 +391,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .sort-control { display: inline-flex; align-items: center; gap: 6px; color: #5f6b80; font-size: 11px; }
 .sort-control select { max-width: 150px; height: 32px; border: 0; background: transparent; color: #3c4659; font-size: 11px; }
 .clip-list { display: flex; flex-direction: column; gap: 14px; }
+/* Propuestas sin editar (v1.3.2): tarjetas sin vista previa de video,
+con el rango de tiempo en la primera columna. */
+.proposal-section { margin: 4px 0 16px; }
+.proposal-explainer { margin: 0 0 12px; color: #5f6b80; font-size: 12px; line-height: 1.55; }
+.proposal-list { display: flex; flex-direction: column; gap: 14px; }
+.proposal-card { min-width: 0; display: grid; grid-template-columns: minmax(120px, 150px) minmax(0, 1fr); align-items: start; gap: 12px; padding: 12px; border: 1px solid #e5e7ee; border-radius: 14px; background: #fff; }
+.proposal-time { display: flex; flex-direction: column; gap: 4px; padding: 10px 4px; color: #5f6b80; font-size: 12px; }
+.proposal-time strong { color: #1f2430; font-size: 13px; font-weight: 600; }
 .clip-card { min-width: 0; display: grid; grid-template-columns: 20px minmax(190px, 240px) minmax(0, 1fr); align-items: start; gap: 12px; padding: 12px; border: 1px solid #e5e7ee; border-radius: 14px; background: #fff; }
 .clip-select { display: inline-flex; align-items: flex-start; padding-top: 8px; }
 .clip-preview { position: relative; width: 100%; aspect-ratio: 9 / 16; overflow: hidden; border-radius: 10px; background: #171b25; }

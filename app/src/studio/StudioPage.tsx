@@ -3,13 +3,18 @@
 // - El video es el FUENTE del proyecto (GET /api/projects/:id/source),
 //   nunca el clip renderizado; sin subida de video ni clip demo.
 // - El recorte inicial es el inicio/fin del clip; en un clip manual
-//   nuevo abarca el video completo.
+//   nuevo abarca el video completo, salvo que venga de una propuesta
+//   sin render (?start=&end= en la URL: v1.3.2).
 // - Los subtítulos vienen del backend (cues de la transcripción);
 //   la edición (ajustes + cues) se guarda en `clip.studio_edit`.
 // - La exportación usa el mismo camino MediaRecorder de ShortStudio,
 //   pero sube el blob al backend en vez de descargarlo; si la subida
 //   falla, descarga el video en el navegador como respaldo.
 // - La música de fondo (BGM) es solo de la sesión: no se persiste.
+// - La exportación se pausa si el video o el dibujo se atascan
+//   (v1.3.2, BUG 3): grabador, video y música se paran juntos y se
+//   reanudan juntos, para que el video no salga lento ni
+//   desincronizado en máquinas que no sostienen el tiempo real.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, ArrowLeft, LoaderCircle, X } from 'lucide-react';
 import { API_BASE } from '../context/constants';
@@ -41,6 +46,13 @@ import {
   type SubtitleCue,
 } from './types/editor';
 import { renderEditorFrame, smoothFaceTrack } from './utils/canvasRenderer';
+import {
+  detectExportStall,
+  isStallAborted,
+  trackVideoClock,
+  type ExportStallReason,
+  type VideoClockState,
+} from './utils/exportSync';
 import { exportSubtitlesToSRT, formatTime, parseSRT, splitScriptToSubtitles } from './utils/srt';
 import './studio.css';
 
@@ -68,6 +80,17 @@ function triggerDownload(blob: Blob, filename: string): void {
   link.click();
   link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Propuesta sin render (v1.3.2): /studio/new?start=&end=&title= abre el
+// modo manual con el trim y el título de la propuesta en vez del video
+// completo. Parámetros inválidos o ausentes: null (manual normal).
+function readProposalParams(): { start: number; end: number; title: string } | null {
+  const params = new URLSearchParams(window.location.search);
+  const start = Number.parseFloat(params.get('start') ?? '');
+  const end = Number.parseFloat(params.get('end') ?? '');
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return null;
+  return { start, end, title: params.get('title') ?? '' };
 }
 
 export function StudioPage({
@@ -131,6 +154,7 @@ export function StudioPage({
   // sigue centrado (el interruptor queda activo pero sin efecto).
   const [faceTrack, setFaceTrack] = useState<FaceTrack | null>(null);
   const [faceTrackStatus, setFaceTrackStatus] = useState<FaceTrackStatus>('idle');
+  const [faceTrackProgress, setFaceTrackProgress] = useState<number | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -169,6 +193,17 @@ export function StudioPage({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const exportWatchdogRef = useRef<number | null>(null);
   const exportCanceledRef = useRef(false);
+  // Sincronía de la exportación (BUG 3, v1.3.2): estado de la pausa
+  // coordinada ante atascos del video o del bucle de dibujo.
+  const exportStalledRef = useRef(false);
+  const exportStallReasonRef = useRef<ExportStallReason | null>(null);
+  const exportStalledSinceRef = useRef(0);
+  const exportAbortedRef = useRef(false);
+  const exportRecorderStartedRef = useRef(false);
+  const exportVideoClockRef = useRef<VideoClockState>({ timeS: 0, advanceAtMs: 0 });
+  const exportLastDrawAtRef = useRef(0);
+  const exportStartFallbackRef = useRef<number | null>(null);
+  const exportStallListenersRef = useRef<(() => void) | null>(null);
   const uploadControllerRef = useRef<AbortController | null>(null);
 
   settingsRef.current = settings;
@@ -228,12 +263,18 @@ export function StudioPage({
     }
     const saved = !isManual ? normalizeStudioEdit(clip?.studio_edit) : null;
     savedSpecRef.current = saved !== null;
+    // Propuesta sin render (v1.3.2): en modo manual, ?start=&end=&title=
+    // abren el Studio con el trim y el título de la propuesta.
+    const proposal = isManual ? readProposalParams() : null;
     let initialSettings: EditorSettings = { ...DEFAULT_SETTINGS };
     if (saved) {
       initialSettings = { ...saved.settings };
     } else if (clip) {
       initialSettings.trimStart = clip.start;
       initialSettings.trimEnd = clip.end;
+    } else if (proposal) {
+      initialSettings.trimStart = proposal.start;
+      initialSettings.trimEnd = proposal.end;
     }
     if (metaDuration > 0) {
       initialSettings.trimEnd = Math.min(initialSettings.trimEnd, metaDuration);
@@ -244,7 +285,7 @@ export function StudioPage({
     }
     setSettings(initialSettings);
     settingsRef.current = initialSettings;
-    setTitle(clip?.title ?? 'Clip manual');
+    setTitle(clip?.title ?? (proposal?.title || 'Clip manual'));
     setCurrentTime(initialSettings.trimStart);
     if (saved) {
       const restored = saved.cues.map((cue) => ({ ...cue, id: nextCueIdRef.current++ }));
@@ -262,8 +303,11 @@ export function StudioPage({
     if (isManual && duration <= 0) return;
     cuesFetchedForRef.current = clipId;
     const controller = new AbortController();
+    // Propuesta sin render (v1.3.2): los cues cubren el rango de la
+    // propuesta, no el video completo.
+    const proposal = isManual ? readProposalParams() : null;
     const load = isManual
-      ? fetchRangeCues(projectId, 0, duration)
+      ? fetchRangeCues(projectId, proposal?.start ?? 0, proposal?.end ?? duration)
       : fetchClipCues(projectId, clipId);
     load
       .then((apiCues) => {
@@ -289,14 +333,18 @@ export function StudioPage({
   // Pista de seguimiento facial al activar "Seguir rostro" (v1.3.1):
   // caché por proyecto+ratio en un ref; si cambia el ratio con el
   // seguimiento activo, se vuelve a pedir. La primera llamada tarda
-  // (el backend recorre el video entero); mientras tanto el render
-  // sigue centrado. Si la petición falla (red, 404, 503), un solo
-  // toast y fallback a centrado: el interruptor queda activo pero sin
-  // efecto visible, y el estado en el LeftSidebar lo refleja.
+  // (el backend recorre el video entero en segundo plano y se sondea
+  // con progreso, v1.3.2); mientras tanto el render sigue centrado.
+  // Si la petición falla (red, 404, 503), un solo toast y fallback a
+  // centrado: el interruptor queda activo pero sin efecto visible, y
+  // el estado en el LeftSidebar lo refleja. Al desmontar o cambiar de
+  // ratio se cancela el sondeo; el trabajo del servidor sigue y la
+  // próxima llamada lo reutiliza.
   useEffect(() => {
     if (!settings.faceFollow) {
       setFaceTrack(null);
       setFaceTrackStatus('idle');
+      setFaceTrackProgress(null);
       return;
     }
     const cacheKey = `${projectId}:${settings.ratio}`;
@@ -304,29 +352,40 @@ export function StudioPage({
     if (cached) {
       setFaceTrack(cached);
       setFaceTrackStatus(cached.hasFace ? 'ready' : 'no-face');
+      setFaceTrackProgress(null);
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
     setFaceTrack(null);
     setFaceTrackStatus('loading');
-    fetchFaceTrack(projectId, settings.ratio)
+    setFaceTrackProgress(null);
+    fetchFaceTrack(projectId, settings.ratio, {
+      signal: controller.signal,
+      onProgress: (progress) => {
+        if (!cancelled) setFaceTrackProgress(progress);
+      },
+    })
       .then((track) => {
         if (cancelled) return;
         const smoothed = smoothFaceTrack(track);
         faceTrackCacheRef.current.set(cacheKey, smoothed);
         setFaceTrack(smoothed);
         setFaceTrackStatus(smoothed.hasFace ? 'ready' : 'no-face');
+        setFaceTrackProgress(null);
       })
       .catch((trackError: unknown) => {
         if (cancelled) return;
         setFaceTrack(null);
         setFaceTrackStatus('error');
+        setFaceTrackProgress(null);
         showToast(trackError instanceof Error
           ? `No se pudo calcular el seguimiento de rostro: ${trackError.message}`
           : 'No se pudo calcular el seguimiento de rostro.');
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [settings.faceFollow, settings.ratio, projectId, showToast]);
 
@@ -447,6 +506,66 @@ export function StudioPage({
 
   const getCurrentPlayTime = useCallback(() => videoRef.current?.currentTime || 0, []);
 
+  // Pausa coordinada de la exportación ante un atasco (BUG 3,
+  // v1.3.2): pausar el MediaRecorder congela su reloj, así que al
+  // reanudar la grabación continúa como si el atasco no hubiera
+  // pasado; sin esto, el grabador seguía en tiempo de reloj mientras
+  // el contenido estaba parado y el video salía alargado y
+  // desincronizado ("lento con retraso"). Con el video atascado NO se
+  // pausa el <video>: el elemento ya está parado esperando datos y
+  // solo él puede reanudar (evento 'playing'); pausarlo aquí rompería
+  // esa reanudación. Con el bucle de dibujo atascado sí hay que
+  // pausarlo, porque el elemento seguiría avanzando mientras el
+  // grabador está parado y se perdería contenido. La música, que es
+  // un elemento independiente, se pausa siempre para que no se
+  // adelante al video.
+  const pauseExportForStall = useCallback((reason: ExportStallReason) => {
+    if (!isExportingRef.current || exportStalledRef.current) return;
+    exportStalledRef.current = true;
+    exportStallReasonRef.current = reason;
+    exportStalledSinceRef.current = performance.now();
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state === 'recording') {
+      recorder.pause();
+    }
+    if (reason === 'draw' && videoRef.current) {
+      videoRef.current.pause();
+    }
+    if (hasBgmRef.current && bgmRef.current) {
+      bgmRef.current.pause();
+    }
+    setExportStatus(
+      reason === 'video'
+        ? 'Pausado: esperando a que el video original siga cargando…'
+        : 'Pausado: vuelve a esta ventana para continuar la exportación…'
+    );
+  }, []);
+
+  // Reanudación tras un atasco de dibujo (la llama el bucle rAF o el
+  // cambio de visibilidad): reproducir el video y la música; el
+  // grabador se reanuda con el evento 'playing' del video, así que
+  // nunca graba antes de que el contenido esté realmente avanzando.
+  // Los relojes del detector se reinician para dar al video un margen
+  // limpio antes de volver a detectar un atasco.
+  const resumeExportAfterStall = useCallback(() => {
+    if (!isExportingRef.current || !exportStalledRef.current) return;
+    exportStalledRef.current = false;
+    exportStallReasonRef.current = null;
+    const now = performance.now();
+    exportVideoClockRef.current = {
+      timeS: videoRef.current?.currentTime ?? 0,
+      advanceAtMs: now,
+    };
+    exportLastDrawAtRef.current = now;
+    if (videoRef.current) {
+      videoRef.current.play().catch(() => {});
+    }
+    if (hasBgmRef.current && bgmRef.current) {
+      bgmRef.current.play().catch(() => {});
+    }
+    setExportStatus('Renderizando…');
+  }, []);
+
   const seekTo = useCallback(
     (time: number) => {
       const clamped = Math.max(0, Math.min(durationRef.current, time));
@@ -520,6 +639,13 @@ export function StudioPage({
           drawCurrentFrame(v.currentTime);
         }
       } else if (isExportingRef.current) {
+        exportLastDrawAtRef.current = performance.now();
+        // Si la exportación se pausó porque el bucle de dibujo se
+        // quedó sin frames, el propio rAF es la señal de que ya se
+        // puede reanudar.
+        if (exportStalledRef.current && exportStallReasonRef.current === 'draw') {
+          resumeExportAfterStall();
+        }
         drawCurrentFrame();
       }
 
@@ -528,7 +654,7 @@ export function StudioPage({
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [drawCurrentFrame, togglePlay]);
+  }, [drawCurrentFrame, resumeExportAfterStall, togglePlay]);
 
   useEffect(() => {
     if (!isPlaying && !isExporting) {
@@ -892,6 +1018,19 @@ export function StudioPage({
       window.clearInterval(exportWatchdogRef.current);
       exportWatchdogRef.current = null;
     }
+    if (exportStartFallbackRef.current) {
+      window.clearTimeout(exportStartFallbackRef.current);
+      exportStartFallbackRef.current = null;
+    }
+    if (exportStallListenersRef.current) {
+      exportStallListenersRef.current();
+      exportStallListenersRef.current = null;
+    }
+    exportStalledRef.current = false;
+    exportStallReasonRef.current = null;
+    exportStalledSinceRef.current = 0;
+    exportAbortedRef.current = false;
+    exportRecorderStartedRef.current = false;
     setIsExporting(false);
     isExportingRef.current = false;
     if (speakerGainRef.current && audioCtxRef.current) {
@@ -948,11 +1087,21 @@ export function StudioPage({
     };
 
     exportCanceledRef.current = false;
+    exportAbortedRef.current = false;
+    exportStalledRef.current = false;
+    exportStallReasonRef.current = null;
+    exportStalledSinceRef.current = 0;
+    exportRecorderStartedRef.current = false;
+    exportVideoClockRef.current = {
+      timeS: videoRef.current?.currentTime ?? 0,
+      advanceAtMs: performance.now(),
+    };
+    exportLastDrawAtRef.current = performance.now();
     setIsExporting(true);
     isExportingRef.current = true;
     setExportProgress(0);
     const exportDims = getCanvasDimensions(spec.settings.ratio);
-    setExportStatus(`Renderizando en ${exportDims.width}×${exportDims.height} (30fps)... No minimices esta pestaña.`);
+    setExportStatus(`Renderizando en ${exportDims.width}×${exportDims.height} (30fps)... Si cambias de ventana, la exportación se pausa y continúa al volver.`);
     setBannerError('');
 
     if (speakerGainRef.current && audioCtxRef.current) {
@@ -976,7 +1125,8 @@ export function StudioPage({
 
     recorder.onstop = () => {
       if (exportCanceledRef.current) {
-        showToast('Exportación cancelada');
+        // En un aborto por atasco el banner ya explica el motivo.
+        if (!exportAbortedRef.current) showToast('Exportación cancelada');
         cleanupAfterExport();
         return;
       }
@@ -1028,6 +1178,61 @@ export function StudioPage({
         });
     };
 
+    // Sincronía de la exportación (BUG 3, v1.3.2): el grabador solo
+    // avanza mientras el video avanza. Si el <video> se atasca
+    // ('waiting': decodificación o buffering del fuente), todo se
+    // pausa a la vez — grabador y música — y se reanuda con
+    // 'playing'; si la pestaña se oculta, se pausa también el video y
+    // se reanuda al volver. El watchdog de abajo es el respaldo por
+    // si el elemento no dispara los eventos. Los listeners se quitan
+    // en cleanupAfterExport.
+    const videoEl = videoRef.current;
+    const handleVideoWaiting = () => pauseExportForStall('video');
+    const handleVideoPlaying = () => {
+      if (!isExportingRef.current || exportCanceledRef.current) return;
+      const now = performance.now();
+      exportVideoClockRef.current = {
+        timeS: videoRef.current?.currentTime ?? 0,
+        advanceAtMs: now,
+      };
+      exportLastDrawAtRef.current = now;
+      const wasStalled = exportStalledRef.current;
+      exportStalledRef.current = false;
+      exportStallReasonRef.current = null;
+      if (wasStalled && hasBgmRef.current && bgmRef.current) {
+        bgmRef.current.play().catch(() => {});
+      }
+      if (!exportRecorderStartedRef.current) {
+        // El grabador se inicia aquí, cuando el video realmente
+        // empieza a avanzar, no antes: así no graba un arranque de
+        // frames congelados con silencio.
+        if (recorder.state === 'inactive') {
+          recorder.start(250);
+          exportRecorderStartedRef.current = true;
+        }
+        return;
+      }
+      if (recorder.state === 'paused') {
+        recorder.resume();
+      }
+    };
+    const handleVisibility = () => {
+      if (!isExportingRef.current || exportCanceledRef.current) return;
+      if (document.hidden) {
+        pauseExportForStall('draw');
+      } else if (exportStalledRef.current && exportStallReasonRef.current === 'draw') {
+        resumeExportAfterStall();
+      }
+    };
+    videoEl?.addEventListener('waiting', handleVideoWaiting);
+    videoEl?.addEventListener('playing', handleVideoPlaying);
+    document.addEventListener('visibilitychange', handleVisibility);
+    exportStallListenersRef.current = () => {
+      videoEl?.removeEventListener('waiting', handleVideoWaiting);
+      videoEl?.removeEventListener('playing', handleVideoPlaying);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+
     const s = settingsRef.current;
     const segDur = Math.max(0.1, s.trimEnd - s.trimStart);
 
@@ -1042,15 +1247,100 @@ export function StudioPage({
     const beginRecording = () => {
       if (exportCanceledRef.current) return;
       drawCurrentFrame();
-      recorder.start(250);
+      const startNow = performance.now();
+      exportVideoClockRef.current = {
+        timeS: videoRef.current?.currentTime ?? s.trimStart,
+        advanceAtMs: startNow,
+      };
+      exportLastDrawAtRef.current = startNow;
 
-      if (videoRef.current) videoRef.current.play().catch(() => {});
+      // El grabador se inicia con el evento 'playing' del video (ver
+      // handleVideoPlaying). Respaldo por si el evento no llega: al
+      // cabo de 1.5 s se inicia igualmente, salvo que la exportación
+      // ya esté pausada por un atasco (entonces la inicia 'playing'
+      // cuando el video se recupere).
+      exportStartFallbackRef.current = window.setTimeout(() => {
+        if (!isExportingRef.current || exportCanceledRef.current || exportStalledRef.current) return;
+        if (!exportRecorderStartedRef.current && recorder.state === 'inactive') {
+          recorder.start(250);
+          exportRecorderStartedRef.current = true;
+        }
+      }, 1500);
+
+      if (videoRef.current) {
+        videoRef.current.play().catch(() => {
+          if (exportStartFallbackRef.current) {
+            window.clearTimeout(exportStartFallbackRef.current);
+            exportStartFallbackRef.current = null;
+          }
+          if (!isExportingRef.current || exportCanceledRef.current) return;
+          setBannerError('No se pudo reproducir el video original para exportarlo. Inténtalo de nuevo.');
+          exportCanceledRef.current = true;
+          finishExport();
+        });
+      }
       if (hasBgmRef.current && bgmRef.current) bgmRef.current.play().catch(() => {});
 
       exportWatchdogRef.current = window.setInterval(() => {
         if (!isExportingRef.current || exportCanceledRef.current) return;
 
+        const video = videoRef.current;
+        const now = performance.now();
+
+        if (exportStalledRef.current) {
+          if (video?.ended) {
+            setExportProgress(100);
+            finishExport();
+            return;
+          }
+          // Válvula de seguridad: un atasco que dura más de un minuto
+          // es un fallo real; abortar con error en vez de dejar la
+          // exportación colgada (el blob parcial se descarta).
+          if (isStallAborted(exportStalledSinceRef.current, now)) {
+            exportAbortedRef.current = true;
+            setBannerError('La exportación se detuvo: el video original dejó de avanzar durante más de un minuto. Inténtalo de nuevo.');
+            exportCanceledRef.current = true;
+            finishExport();
+            return;
+          }
+          // Respaldo del evento 'playing': si el reloj del video
+          // vuelve a avanzar, reanudar aunque el evento no haya
+          // llegado.
+          const stalledCur = getCurrentPlayTime();
+          const stalledClock = trackVideoClock(exportVideoClockRef.current, stalledCur, now);
+          if (stalledClock.advanceAtMs !== exportVideoClockRef.current.advanceAtMs) {
+            exportVideoClockRef.current = stalledClock;
+            exportLastDrawAtRef.current = now;
+            exportStalledRef.current = false;
+            exportStallReasonRef.current = null;
+            if (hasBgmRef.current && bgmRef.current) bgmRef.current.play().catch(() => {});
+            const stalledRecorder = mediaRecorderRef.current;
+            if (exportRecorderStartedRef.current && stalledRecorder?.state === 'paused') {
+              stalledRecorder.resume();
+            }
+          }
+          return;
+        }
+
         const cur = getCurrentPlayTime();
+        // Respaldo de los eventos 'waiting'/'playing': si el reloj
+        // del video no se mueve, el contenido está parado aunque el
+        // grabador siga en tiempo de reloj; lo mismo si el bucle de
+        // dibujo se queda sin frames (sin frames nuevos, captureStream
+        // no emite y el video grabado se alarga).
+        exportVideoClockRef.current = trackVideoClock(exportVideoClockRef.current, cur, now);
+        const stall = detectExportStall({
+          nowMs: now,
+          lastVideoAdvanceAtMs: exportVideoClockRef.current.advanceAtMs,
+          lastDrawAtMs: exportLastDrawAtRef.current,
+          videoPaused: video?.paused ?? true,
+          videoEnded: video?.ended ?? false,
+        });
+        if (stall) {
+          pauseExportForStall(stall);
+          return;
+        }
+
         const elapsed = Math.max(0, cur - s.trimStart);
         const pct = Math.min(100, Math.max(0, (elapsed / segDur) * 100));
         setExportProgress(pct);
@@ -1058,7 +1348,7 @@ export function StudioPage({
           `Renderizando ${exportDims.width}×${exportDims.height} · ${pct.toFixed(0)}% (${formatTime(elapsed)} / ${formatTime(segDur)})`
         );
 
-        if (cur >= s.trimEnd || videoRef.current?.ended) {
+        if (cur >= s.trimEnd || video?.ended) {
           setExportProgress(100);
           finishExport();
         }
@@ -1179,6 +1469,7 @@ export function StudioPage({
             hasBgm={hasBgm}
             bgmName={bgmName}
             faceTrackStatus={faceTrackStatus}
+            faceTrackProgress={faceTrackProgress}
             onUpdateSetting={updateSetting}
             onApplySubtitlePreset={applySubtitlePreset}
             onTrimStartChange={handleTrimStartChange}

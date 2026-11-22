@@ -701,6 +701,8 @@ def test_upload_persists_config_and_blocks_processing_without_llm_key(
             "signal_score_threshold": 5.0,
             # v1.3.1: detección rápida desactivada por defecto.
             "fast_detection": False,
+            # v1.3.2: edición automática desactivada por defecto.
+            "auto_edit": False,
             "subtitle_style": {
                 "font_family": None,
                 "font_size": None,

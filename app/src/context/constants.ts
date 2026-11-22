@@ -40,6 +40,9 @@ export const MOMENT_ENGINE_STORAGE_KEY = 'kellyclipai-moment-engine';
 export const SIGNAL_THRESHOLD_STORAGE_KEY = 'kellyclipai-signal-threshold';
 // v1.3.1: detección rápida (Tier 0) por defecto en los proyectos nuevos.
 export const FAST_DETECTION_STORAGE_KEY = 'kellyclipai-fast-detection';
+// v1.3.2: edición automática por defecto en los proyectos nuevos
+// (apagada: la detección termina en propuestas para el Studio).
+export const AUTO_EDIT_STORAGE_KEY = 'kellyclipai-auto-edit';
 // v1.1.1: 5.0 (antes 8.0). Ver backend/schemas.py: con la calibración
 // original, 8.0 era inalcanzable para contenido conversacional realista.
 export const DEFAULT_SIGNAL_THRESHOLD = 5.0;
@@ -88,6 +91,15 @@ export function readStoredFastDetection(): boolean {
     return window.localStorage.getItem(FAST_DETECTION_STORAGE_KEY) === '1';
   } catch {
     // Sin almacenamiento disponible: el motor completo por defecto.
+  }
+  return false;
+}
+
+export function readStoredAutoEdit(): boolean {
+  try {
+    return window.localStorage.getItem(AUTO_EDIT_STORAGE_KEY) === '1';
+  } catch {
+    // Sin almacenamiento disponible: sin edición automática.
   }
   return false;
 }
