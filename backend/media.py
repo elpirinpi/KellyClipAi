@@ -6,11 +6,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import textwrap
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -50,14 +52,24 @@ _FFMPEG_RENDER_TIMEOUT_SECONDS = 600
 _WHISPER_PIPELINE_LOCK = threading.Lock()
 _WHISPER_PIPELINE_CACHE: tuple[str, Any] | None = None
 
-# --- NVENC (Fase 2, B-R1) ---------------------------------------------------
+# --- Codificadores de video por hardware (Fase 2 B-R1, v1.4.2) -----------
 # Detección en runtime con fallback elegante: la app debe funcionar en
-# CUALQUIER PC (NVIDIA, AMD, Intel, integradas o sin GPU). El resultado se
-# cachea por proceso: la detección ejecuta ffmpeg dos veces y no tiene
-# sentido repetirla en cada clip. KELLYCLIP_NVENC=0 la desactiva (soporte).
-_NVENC_PROBE_TIMEOUT_SECONDS = 15
-_NVENC_CACHE: bool | None = None
-_NVENC_CACHE_LOCK = threading.Lock()
+# CUALQUIER PC (NVIDIA, AMD, Intel, integradas o sin GPU). Orden de
+# preferencia: NVENC (NVIDIA) > QSV (Intel Quick Sync) > AMF (AMD).
+# Cada candidato se comprueba en dos pasos: debe estar compilado en el
+# ffmpeg (`-encoders`) Y un encode de prueba corto debe terminar bien.
+# La segunda es imprescindible: un ffmpeg con el codificador compilado
+# en un equipo sin esa GPU (o sin driver) lo lista pero el encode falla.
+# Los resultados de la sonda se cachean por proceso: la detección
+# ejecuta ffmpeg varias veces y no tiene sentido repetirla en cada clip.
+# La SELECCIÓN, en cambio, se reevalúa en cada llamada a partir de la
+# sonda cacheada, porque depende de las variables de entorno:
+# - KELLYCLIP_NVENC=0 desactiva solo NVENC (retrocompatibilidad).
+# - KELLYCLIP_GPU=0 desactiva TODOS los codificadores por hardware
+#   (útil para depurar: fuerza libx264 sin tocar la sonda).
+_ENCODER_PROBE_TIMEOUT_SECONDS = 15
+_ENCODER_PROBE_CACHE: tuple[_EncoderProbeResult, ...] | None = None
+_ENCODER_PROBE_CACHE_LOCK = threading.Lock()
 
 # --- Renders en curso (Fase 2, B-P14) ---------------------------------------
 # Registro de los ffmpeg hijos de los renders activos, para que el apagado
@@ -97,22 +109,123 @@ def clear_analysis_caches() -> None:
         _SILENCE_CACHE.clear()
 
 
-def is_nvenc_available(ffmpeg_path: str) -> bool:
-    """Indica si este ffmpeg puede codificar con NVENC en este equipo.
+@dataclass(frozen=True)
+class _EncoderCandidate:
+    """Un codificador por hardware: orden de preferencia NVENC > QSV > AMF.
 
-    Dos comprobaciones: el codificador debe estar compilado en el ffmpeg
-    (`-encoders`) Y un encode de prueba corto debe terminar bien. La
-    segunda es imprescindible: un ffmpeg con NVENC compilado en un equipo
-    sin GPU NVIDIA (o sin driver) lista el codificador pero el encode
-    falla. El resultado se cachea por proceso.
+    `args` son los argumentos de render (y del encode de prueba, que
+    usa los mismos parámetros que el render real: si el probe pasa, el
+    render también puede). La calidad es equivalente en los tres
+    (NVENC `-cq 21`, QSV `-global_quality 21`, AMF CQP 21 ≈ CRF 21).
     """
-    if os.environ.get("KELLYCLIP_NVENC", "").strip() == "0":
-        return False
-    global _NVENC_CACHE
-    with _NVENC_CACHE_LOCK:
-        if _NVENC_CACHE is not None:
-            return _NVENC_CACHE
-        available = False
+
+    kind: str  # "nvenc" | "qsv" | "amf"
+    encoder: str  # nombre en ffmpeg, p. ej. "h264_nvenc"
+    label: str  # etiqueta para el frontend, p. ej. "NVENC (GPU NVIDIA)"
+    source: str  # descripción corta para el log, p. ej. "GPU NVIDIA"
+    args: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _EncoderProbeResult:
+    """Resultado de la sonda de un candidato (cacheado por proceso)."""
+
+    candidate: _EncoderCandidate
+    available: bool
+    detail: str  # "probe OK" | "no listado" | "falló el probe" | ...
+
+
+@dataclass(frozen=True)
+class _EncoderSelection:
+    """Codificador elegido para un render, con su motivo legible."""
+
+    encoder: str
+    kind: str  # "nvenc" | "qsv" | "amf" | "cpu"
+    label: str
+    args: tuple[str, ...]
+    reason: str
+
+
+_ENCODER_CANDIDATES: tuple[_EncoderCandidate, ...] = (
+    _EncoderCandidate(
+        kind="nvenc",
+        encoder="h264_nvenc",
+        label="NVENC (GPU NVIDIA)",
+        source="GPU NVIDIA",
+        args=(
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-cq",
+            "21",
+            "-pix_fmt",
+            "yuv420p",
+        ),
+    ),
+    _EncoderCandidate(
+        kind="qsv",
+        encoder="h264_qsv",
+        label="Quick Sync (Intel)",
+        source="Quick Sync (Intel)",
+        args=(
+            "-c:v",
+            "h264_qsv",
+            "-preset",
+            "veryfast",
+            "-global_quality",
+            "21",
+            "-pix_fmt",
+            "yuv420p",
+        ),
+    ),
+    _EncoderCandidate(
+        kind="amf",
+        encoder="h264_amf",
+        label="AMF (AMD)",
+        source="GPU AMD",
+        args=(
+            "-c:v",
+            "h264_amf",
+            "-quality",
+            "balanced",
+            "-rc",
+            "cqp",
+            "-qp_i",
+            "21",
+            "-qp_p",
+            "21",
+            "-pix_fmt",
+            "yuv420p",
+        ),
+    ),
+)
+# Fallback CPU: EXACTAMENTE los mismos argumentos de siempre.
+_CPU_ENCODER_ARGS: tuple[str, ...] = (
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "21",
+)
+
+
+def _probe_encoders(ffmpeg_path: str) -> tuple[_EncoderProbeResult, ...]:
+    """Sonda de los codificadores por hardware (cacheada por proceso).
+
+    Un solo `ffmpeg -encoders` y, por cada candidato listado, un encode
+    de prueba corto con los parámetros del render real. Se sondean
+    TODOS los candidatos listados (no solo hasta el primero que
+    funcione): la caché es independiente de las variables de entorno,
+    así que si KELLYCLIP_NVENC=0 desactiva NVENC, el resultado de QSV
+    y AMF ya está disponible sin volver a ejecutar ffmpeg.
+    """
+    global _ENCODER_PROBE_CACHE
+    with _ENCODER_PROBE_CACHE_LOCK:
+        if _ENCODER_PROBE_CACHE is not None:
+            return _ENCODER_PROBE_CACHE
+        listed: str | None
         try:
             encoders = subprocess.run(
                 [ffmpeg_path, "-hide_banner", "-encoders"],
@@ -121,12 +234,22 @@ def is_nvenc_available(ffmpeg_path: str) -> bool:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=_NVENC_PROBE_TIMEOUT_SECONDS,
+                timeout=_ENCODER_PROBE_TIMEOUT_SECONDS,
                 **_subprocess_options(),
             )
-            if "h264_nvenc" in (encoders.stdout or ""):
-                # Encode de prueba con los mismos parámetros que el render
-                # real: si este pasa, el render con NVENC también puede.
+            listed = encoders.stdout or ""
+        except (OSError, subprocess.TimeoutExpired) as error:
+            logger.debug("La detección de codificadores falló; se usará libx264: %s", error)
+            listed = None
+        results: list[_EncoderProbeResult] = []
+        for candidate in _ENCODER_CANDIDATES:
+            if listed is None:
+                results.append(_EncoderProbeResult(candidate, False, "ffmpeg no disponible"))
+                continue
+            if candidate.encoder not in listed:
+                results.append(_EncoderProbeResult(candidate, False, "no listado"))
+                continue
+            try:
                 probe = subprocess.run(
                     [
                         ffmpeg_path,
@@ -137,14 +260,7 @@ def is_nvenc_available(ffmpeg_path: str) -> bool:
                         "lavfi",
                         "-i",
                         "testsrc=duration=0.2:size=128x128:rate=10",
-                        "-c:v",
-                        "h264_nvenc",
-                        "-preset",
-                        "p4",
-                        "-cq",
-                        "21",
-                        "-pix_fmt",
-                        "yuv420p",
+                        *candidate.args,
                         "-f",
                         "null",
                         "-",
@@ -154,44 +270,130 @@ def is_nvenc_available(ffmpeg_path: str) -> bool:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=_NVENC_PROBE_TIMEOUT_SECONDS,
+                    timeout=_ENCODER_PROBE_TIMEOUT_SECONDS,
                     **_subprocess_options(),
                 )
                 available = probe.returncode == 0
-        except (OSError, subprocess.TimeoutExpired) as error:
-            logger.debug("La detección de NVENC falló; se usará libx264: %s", error)
-            available = False
-        _NVENC_CACHE = available
-        return available
+            except (OSError, subprocess.TimeoutExpired) as error:
+                logger.debug(
+                    "El encode de prueba de %s falló; se probará el siguiente: %s",
+                    candidate.encoder,
+                    error,
+                )
+                available = False
+            results.append(
+                _EncoderProbeResult(
+                    candidate, available, "probe OK" if available else "falló el probe"
+                )
+            )
+        _ENCODER_PROBE_CACHE = tuple(results)
+        return _ENCODER_PROBE_CACHE
+
+
+def _select_encoder(ffmpeg_path: str) -> _EncoderSelection:
+    """Elige el codificador: el primero disponible en orden de preferencia.
+
+    La sonda está cacheada, así que esta selección es barata y se puede
+    reevaluar en cada render: las variables de entorno se leen en cada
+    llamada y tienen efecto inmediato, sin reiniciar la app.
+    """
+    if os.environ.get("KELLYCLIP_GPU", "").strip() == "0":
+        return _EncoderSelection(
+            encoder="libx264",
+            kind="cpu",
+            label="CPU (libx264)",
+            args=_CPU_ENCODER_ARGS,
+            reason="CPU; KELLYCLIP_GPU=0 (codificadores por hardware desactivados)",
+        )
+    nvenc_disabled = os.environ.get("KELLYCLIP_NVENC", "").strip() == "0"
+    results = _probe_encoders(ffmpeg_path)
+    for result in results:
+        if not result.available:
+            continue
+        if nvenc_disabled and result.candidate.kind == "nvenc":
+            continue
+        return _EncoderSelection(
+            encoder=result.candidate.encoder,
+            kind=result.candidate.kind,
+            label=result.candidate.label,
+            args=result.candidate.args,
+            reason=f"{result.candidate.source}, probe OK",
+        )
+    details = [
+        "nvenc desactivado por KELLYCLIP_NVENC=0"
+        if nvenc_disabled and result.candidate.kind == "nvenc" and result.available
+        else f"{result.candidate.kind} {result.detail}"
+        for result in results
+    ]
+    return _EncoderSelection(
+        encoder="libx264",
+        kind="cpu",
+        label="CPU (libx264)",
+        args=_CPU_ENCODER_ARGS,
+        reason="CPU; sin codificador HW disponible: " + ", ".join(details),
+    )
+
+
+def is_nvenc_available(ffmpeg_path: str) -> bool:
+    """Indica si NVENC sería el codificador elegido en este equipo.
+
+    Compatibilidad con la API anterior (Fase 2): True solo si NVENC
+    está compilado en el ffmpeg, el encode de prueba pasa y ninguna
+    variable de entorno lo desactiva (KELLYCLIP_NVENC=0 o
+    KELLYCLIP_GPU=0). Como NVENC es el primer candidato en orden de
+    preferencia, disponible equivale a elegido.
+    """
+    return _select_encoder(ffmpeg_path).kind == "nvenc"
+
+
+def reset_encoder_cache() -> None:
+    """Olvida el resultado cacheado de la sonda de codificadores (tests)."""
+    global _ENCODER_PROBE_CACHE
+    with _ENCODER_PROBE_CACHE_LOCK:
+        _ENCODER_PROBE_CACHE = None
 
 
 def reset_nvenc_cache() -> None:
-    """Olvida el resultado cacheado de la detección de NVENC (tests)."""
-    global _NVENC_CACHE
-    with _NVENC_CACHE_LOCK:
-        _NVENC_CACHE = None
+    """Compatibilidad: alias de reset_encoder_cache (tests antiguos)."""
+    reset_encoder_cache()
+
+
+def get_encoder_info(ffmpeg_path: str | None = None) -> dict[str, str]:
+    """Codificador de video activo, para el frontend (GET /api/encoder).
+
+    `ffmpeg_path` puede omitirse: se resuelve con `shutil.which`. Si
+    no hay ffmpeg, la respuesta es libx264 con el motivo, sin fallar.
+    """
+    if ffmpeg_path is None:
+        ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return {
+            "encoder": "libx264",
+            "kind": "cpu",
+            "label": "CPU (libx264)",
+            "reason": "CPU; ffmpeg no encontrado en el PATH",
+        }
+    selection = _select_encoder(ffmpeg_path)
+    return {
+        "encoder": selection.encoder,
+        "kind": selection.kind,
+        "label": selection.label,
+        "reason": selection.reason,
+    }
 
 
 def _video_encoder_args(ffmpeg_path: str) -> list[str]:
-    """Argumentos del codificador de video: NVENC si está disponible.
+    """Argumentos del codificador de video: el primero disponible.
 
     NVENC usa `-cq` (calidad constante, equivalente al CRF de x264) y
-    presets p1–p7 (p4 ≈ veryfast). Sin NVENC, libx264 exactamente como
-    antes. `-pix_fmt yuv420p` solo se añade con NVENC: el codificador
-    de NVIDIA lo exige y libx264 ya lo usa por defecto.
+    presets p1–p7 (p4 ≈ veryfast); QSV `-global_quality` y AMF CQP 21
+    son sus equivalentes. Sin codificador por hardware, libx264
+    EXACTAMENTE como antes. `-pix_fmt yuv420p` solo se añade con los
+    codificadores por hardware: libx264 ya lo usa por defecto.
     """
-    if is_nvenc_available(ffmpeg_path):
-        return [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p4",
-            "-cq",
-            "21",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]
+    selection = _select_encoder(ffmpeg_path)
+    logger.info("Render encoder: %s (%s)", selection.encoder, selection.reason)
+    return list(selection.args)
 
 
 def _register_render_process(process: subprocess.Popen[str]) -> None:

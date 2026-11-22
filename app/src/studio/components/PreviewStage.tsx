@@ -127,6 +127,9 @@ export function PreviewStage({
         <div
           className={`relative ${aspectClass} bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800`}
         >
+          {/* will-change-transform: el canvas se redibuja en cada
+              frame de la reproducción; su propia capa de composición
+              evita repintar el resto del Studio con cada frame. */}
           <canvas
             ref={canvasRef}
             width={dims.width}
@@ -134,7 +137,7 @@ export function PreviewStage({
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
-            className={`w-full h-full block ${sourceReady ? 'cursor-grab active:cursor-grabbing' : ''}`}
+            className={`w-full h-full block will-change-transform ${sourceReady ? 'cursor-grab active:cursor-grabbing' : ''}`}
           />
 
           {/* Loading / Error Overlay */}

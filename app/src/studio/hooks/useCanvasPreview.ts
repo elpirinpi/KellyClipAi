@@ -95,7 +95,10 @@ export function useCanvasPreview({
       blurCanvas.width = 270;
       blurCanvas.height = 480;
       blurCanvasRef.current = blurCanvas;
-      blurCtxRef.current = blurCanvas.getContext('2d', { alpha: false });
+      // desynchronized: presenta cada frame con menos latencia y deja
+      // que el compositor GPU mueva el lienzo sin esperar al hilo
+      // principal (espejo del bucle propio de StudioPage).
+      blurCtxRef.current = blurCanvas.getContext('2d', { alpha: false, desynchronized: true });
     }
     return { blurCanvas: blurCanvasRef.current, blurCtx: blurCtxRef.current };
   }, []);
@@ -103,7 +106,7 @@ export function useCanvasPreview({
   const drawCurrentFrame = useCallback(
     (explicitTime?: number) => {
       const canvas = canvasRef.current;
-      const ctx = canvas?.getContext('2d', { alpha: false });
+      const ctx = canvas?.getContext('2d', { alpha: false, desynchronized: true });
       const { blurCanvas, blurCtx } = getBlurResources();
       if (!ctx || !blurCtx) return;
       const t = explicitTime !== undefined

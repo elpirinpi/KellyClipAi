@@ -441,7 +441,10 @@ export function StudioPage({
       bc.width = 270;
       bc.height = 480;
       blurCanvasRef.current = bc;
-      blurCtxRef.current = bc.getContext('2d', { alpha: false });
+      // desynchronized: presenta cada frame con menos latencia y deja
+      // que el compositor GPU mueva el lienzo sin esperar al hilo
+      // principal; la exportación (captureStream) no se ve afectada.
+      blurCtxRef.current = bc.getContext('2d', { alpha: false, desynchronized: true });
     }
     return {
       blurCanvas: blurCanvasRef.current,
@@ -452,7 +455,7 @@ export function StudioPage({
   const drawCurrentFrame = useCallback(
     (explicitTime?: number) => {
       const canvas = canvasRef.current;
-      const ctx = canvas?.getContext('2d', { alpha: false });
+      const ctx = canvas?.getContext('2d', { alpha: false, desynchronized: true });
       const { blurCanvas, blurCtx } = getBlurResources();
       if (!ctx || !blurCtx) return;
 

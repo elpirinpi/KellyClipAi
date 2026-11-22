@@ -3,6 +3,7 @@ import { ArrowLeft, ChevronDown, Circle, LoaderCircle, Sparkles } from 'lucide-r
 import { useLocation, useNavigate } from 'react-router-dom';
 import { apiFetch } from '../auth';
 import { DesktopSettingsSection } from './DesktopSettingsSection';
+import { SystemDiagnosticsSection } from './SystemDiagnosticsSection';
 import { API_BASE, type MomentEngine } from '../context/constants';
 import type { ThemePreference } from '../hooks/useTheme';
 import type { ToastKind } from './Toasts';
@@ -331,6 +332,8 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
       </section>
       {/* Fase 3 (ítems 17, 18 y 20): actualizaciones, escritorio y bandeja. */}
       <DesktopSettingsSection onNotice={onNotice} />
+      {/* v1.4.2: aceleración GPU de la interfaz y codificador de video. */}
+      <SystemDiagnosticsSection />
       <section className="config-card integrations-list">
         <div className="card-heading"><div><h2>Cuentas e integraciones</h2><p>Las credenciales se configuran en `.env`; las cuentas se conectan mediante OAuth local.</p></div></div>
         {[

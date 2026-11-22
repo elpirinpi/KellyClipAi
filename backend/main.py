@@ -115,6 +115,7 @@ from .media import (
     MediaProcessingError,
     create_frame_thumbnail,
     format_subtitles,
+    get_encoder_info,
     probe_media,
 )
 from .pipeline import _resolve_llm_for_project, process_project
@@ -882,6 +883,17 @@ def create_app(
     @application.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # --- Codificador de video (v1.4.2) ------------------------------------
+    # El frontend muestra el codificador activo (NVENC / QSV / AMF /
+    # CPU) en Ajustes. La detección vive en backend/media.py y se
+    # cachea por proceso, así que este endpoint no re-ejecuta ffmpeg.
+    # La autenticación la aplica el middleware de /api/* como en los
+    # demás endpoints de estado (solo /api/health es público).
+
+    @application.get("/api/encoder")
+    def get_encoder_status() -> dict[str, str]:
+        return get_encoder_info(shutil.which("ffmpeg"))
 
     def update_status() -> dict[str, Any]:
         if application.state.updater is None:

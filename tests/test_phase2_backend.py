@@ -227,13 +227,24 @@ def test_nvenc_detection_is_cached_per_process(
 def test_nvenc_disabled_by_environment_variable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _fake_run_factory(
+    # v1.4.2: KELLYCLIP_NVENC=0 desactiva solo NVENC, no toda la
+    # detección: QSV y AMF se siguen sondeando (aquí no están listados,
+    # así que el fallback es libx264). La sonda se ejecuta igualmente
+    # porque su caché es independiente de las variables de entorno.
+    _fake_run_factory(
         monkeypatch,
         encoders_stdout=" V..... h264_nvenc  NVIDIA NVENC H.264 encoder\n",
     )
     monkeypatch.setenv("KELLYCLIP_NVENC", "0")
     assert media_module.is_nvenc_available("ffmpeg") is False
-    assert calls == []
+    assert media_module._video_encoder_args("ffmpeg") == [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "21",
+    ]
 
 
 # ---------------------------------------------------------------------------

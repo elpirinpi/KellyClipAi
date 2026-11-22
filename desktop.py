@@ -28,6 +28,37 @@ _PORTABLE_MARKER = "portable.txt"
 # 8000 está ocupado se prueba 8001-8010 en orden (B34).
 _DEFAULT_PORT = 8000
 _MAX_FALLBACK_PORT = 8010
+# Argumentos adicionales del navegador WebView2 (v1.4.2): pywebview
+# 5.4 no expone flags de Chromium en webview.start(), así que la vía
+# oficial es la variable de entorno WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+# (documentación de Microsoft), que WebView2 lee al crear el entorno —
+# por eso se fija antes de webview.create_window(), nunca después.
+#
+# --enable-gpu-rasterization: rasteriza el contenido de la página
+# (incluido el canvas de vista previa del Studio) en la GPU cuando
+# Chromium lo permite para esa GPU; en GPUs en lista de bloqueo sigue
+# cayendo a software, como sin el flag.
+# --enable-zero-copy: sube las texturas rasterizadas a la GPU sin
+# copia intermedia; sin rasterización GPU se ignora.
+# NO se añade --ignore-gpu-blocklist: forzar la GPU en drivers en
+# lista de bloqueo puede colgar o cerrar la ventana, y el fallback a
+# software de WebView2 es el comportamiento seguro en esos equipos.
+_WEBVIEW2_ARGS_ENV_VAR = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+_WEBVIEW2_BROWSER_ARGUMENTS = (
+    "--enable-gpu-rasterization",
+    "--enable-zero-copy",
+)
+# Flags que forzarían render por software: nunca deben aparecer en la
+# lista anterior (los tests de test_webview2_gpu.py lo comprueban).
+_SOFTWARE_RENDER_ARGUMENTS = (
+    "--disable-gpu",
+    "--disable-gpu-compositing",
+    "--disable-gpu-rasterization",
+    "--disable-accelerated-2d-canvas",
+    "--disable-webgl",
+    "--use-gl=swiftshader",
+    "--use-angle=swiftshader",
+)
 _logger = logging.getLogger(__name__)
 
 
@@ -296,6 +327,40 @@ def _configure_uvicorn_logging(log_handler: logging.Handler) -> None:
         logger.propagate = False
 
 
+def _webview2_browser_arguments() -> str:
+    """Argumentos de Chromium que kellyClipAi pasa a WebView2.
+
+    Solo flags seguros de aceleración GPU (ver
+    _WEBVIEW2_BROWSER_ARGUMENTS): ninguno fuerza la GPU en drivers en
+    lista de bloqueo ni desactiva el fallback a software de WebView2.
+    """
+    return " ".join(_WEBVIEW2_BROWSER_ARGUMENTS)
+
+
+def _configure_webview2_arguments() -> None:
+    """Fija WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS antes de crear la ventana.
+
+    Debe llamarse antes de que exista ningún control WebView2 en el
+    proceso: WebView2 lee la variable al crear su entorno y un cambio
+    posterior no tendría efecto.
+
+    Si el usuario (o su sistema) ya definió la variable, se respeta su
+    valor sin tocarlo: puede necesitar forzar software en un equipo con
+    drivers rotos, y pisarlo le quitaría esa salida.
+    """
+    existing = os.environ.get(_WEBVIEW2_ARGS_ENV_VAR, "").strip()
+    if existing:
+        _logger.info(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS ya definido por el "
+            "entorno; se respeta su valor: %s",
+            existing,
+        )
+        return
+    arguments = _webview2_browser_arguments()
+    os.environ[_WEBVIEW2_ARGS_ENV_VAR] = arguments
+    _logger.info("Argumentos adicionales de WebView2: %s", arguments)
+
+
 def _run_server(
     server: object,
     startup_error: dict[str, BaseException | None],
@@ -441,6 +506,9 @@ def _run_app(
                 )
             return
         hidden = _start_hidden(user_dir)
+        # Antes de crear la ventana: WebView2 lee
+        # WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS al crear su entorno.
+        _configure_webview2_arguments()
         window = webview.create_window(
             _WINDOW_TITLE,
             f"http://127.0.0.1:{port}/",
