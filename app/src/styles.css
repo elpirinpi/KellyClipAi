@@ -31,6 +31,14 @@
   --accent-light: #e7e1fb;
   --line: #e9eaf0;
   --surface-muted: #f6f7fb;
+  /* Hotfix v1.4.1: la paleta es el único punto de verdad para los
+     colores (patrón de KellyAiClip: constantes centralizadas, sin
+     hex hardcodeado por pantalla). Estas dos variables solo existían
+     en el bloque oscuro, así que las pantallas nuevas se escribían
+     con hex fijo y se rompían en oscuro; con su valor claro aquí,
+     cualquier regla con var() sigue al tema sin overrides. */
+  --surface: #fff;
+  --text-strong: #1f2430;
 }
 
 * { box-sizing: border-box; }
@@ -99,6 +107,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .authorization-note { text-align: center; margin: 14px 0 0; color: #5f6b80; font-size: 11px; }
 .error-message { margin: 12px 0 0; color: #b42318; background: #fff3f1; border-radius: 8px; padding: 10px 12px; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; line-height: 1.5; }
 .error-message svg { flex: 0 0 auto; margin-top: 1px; }
+/* Hotfix v1.4.1 (bug 1): descartar el aviso de una importación fallida. */
+.message-dismiss { flex: 0 0 auto; margin-left: auto; padding: 0 2px; border: 0; background: none; color: inherit; font: inherit; font-weight: 600; text-decoration: underline; cursor: pointer; }
+.form-message .message-dismiss { margin-left: 8px; }
 
 .upload-progress-card { width: 100%; margin: -86px 0 24px; padding: 12px; border: 1px solid #e9eaf0; border-radius: 12px; background: #fff; box-shadow: 0 5px 22px #151b2a0d; display: flex; align-items: center; gap: 12px; }
 .upload-thumb { width: 76px; height: 52px; border-radius: 7px; flex: 0 0 auto; overflow: hidden; display: grid; place-items: center; background: #f3f1fa; color: #7354dc; }
@@ -389,16 +400,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, [role="button"]
 .clips-count { margin-left: auto; color: #5f6b80; font-size: 12px; }
 .storage-usage { color: #5f6b80; font-size: 10px; white-space: nowrap; }
 .sort-control { display: inline-flex; align-items: center; gap: 6px; color: #5f6b80; font-size: 11px; }
-.sort-control select { max-width: 150px; height: 32px; border: 0; background: transparent; color: #3c4659; font-size: 11px; }
+.sort-control select { max-width: 150px; height: 32px; border: 0; background: transparent; color: var(--text-main); font-size: 11px; }
 .clip-list { display: flex; flex-direction: column; gap: 14px; }
 /* Propuestas sin editar (v1.3.2): tarjetas sin vista previa de video,
 con el rango de tiempo en la primera columna. */
 .proposal-section { margin: 4px 0 16px; }
-.proposal-explainer { margin: 0 0 12px; color: #5f6b80; font-size: 12px; line-height: 1.55; }
+.proposal-explainer { margin: 0 0 12px; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
 .proposal-list { display: flex; flex-direction: column; gap: 14px; }
-.proposal-card { min-width: 0; display: grid; grid-template-columns: minmax(120px, 150px) minmax(0, 1fr); align-items: start; gap: 12px; padding: 12px; border: 1px solid #e5e7ee; border-radius: 14px; background: #fff; }
-.proposal-time { display: flex; flex-direction: column; gap: 4px; padding: 10px 4px; color: #5f6b80; font-size: 12px; }
-.proposal-time strong { color: #1f2430; font-size: 13px; font-weight: 600; }
+.proposal-card { min-width: 0; display: grid; grid-template-columns: minmax(120px, 150px) minmax(0, 1fr); align-items: start; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.proposal-time { display: flex; flex-direction: column; gap: 4px; padding: 10px 4px; color: var(--text-muted); font-size: 12px; }
+.proposal-time strong { color: var(--text-strong); font-size: 13px; font-weight: 600; }
+/* Hotfix v1.4.1 (bug 3): vista previa de la propuesta — el fotograma
+   central del momento, recortado a 9:16 como la vista previa del clip. */
+.proposal-side { display: flex; flex-direction: column; gap: 8px; }
+.proposal-preview { position: relative; width: 100%; aspect-ratio: 9 / 16; overflow: hidden; border-radius: 10px; background: #171b25; }
+.proposal-preview img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.proposal-preview-failed { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #fca5a5; font-size: 12px; }
 .clip-card { min-width: 0; display: grid; grid-template-columns: 20px minmax(190px, 240px) minmax(0, 1fr); align-items: start; gap: 12px; padding: 12px; border: 1px solid #e5e7ee; border-radius: 14px; background: #fff; }
 .clip-select { display: inline-flex; align-items: flex-start; padding-top: 8px; }
 .clip-preview { position: relative; width: 100%; aspect-ratio: 9 / 16; overflow: hidden; border-radius: 10px; background: #171b25; }
@@ -1171,6 +1188,10 @@ html[data-theme="dark"] .clip-version-row .version-meta { color: var(--text-mute
 .pf-project-row-wrap .project-row { flex: 1; min-width: 0; }
 .pf-duplicate-button { flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; width: 40px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--text-muted); cursor: pointer; }
 .pf-duplicate-button:hover { color: var(--accent); border-color: var(--accent); }
+/* Hotfix v1.4.1 (bug 4): eliminar un proyecto desde la lista. */
+.pf-delete-button { flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; width: 40px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--text-muted); cursor: pointer; }
+.pf-delete-button:hover:not(:disabled) { color: #b42318; border-color: #b42318; }
+.pf-delete-button:disabled { opacity: .45; cursor: not-allowed; }
 
 /* Cuentas por plataforma (ítem 10, Ajustes) */
 .pf-accounts-group { margin-top: 12px; }
@@ -1196,3 +1217,4 @@ html[data-theme="dark"] .pf-calendar-day { background: var(--surface); }
 html[data-theme="dark"] .pf-calendar-day.drop-target { background: var(--surface-2); }
 html[data-theme="dark"] .pf-view-switch { background: var(--surface); }
 html[data-theme="dark"] .pf-duplicate-button { background: var(--surface); }
+html[data-theme="dark"] .pf-delete-button { background: var(--surface); }

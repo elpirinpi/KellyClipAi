@@ -111,7 +111,12 @@ from .integrations import (
     search_broll_videos,
 )
 from .llm import LLMConfigurationError, LLMResponseError, resolve_llm
-from .media import MediaProcessingError, format_subtitles, probe_media
+from .media import (
+    MediaProcessingError,
+    create_frame_thumbnail,
+    format_subtitles,
+    probe_media,
+)
 from .pipeline import _resolve_llm_for_project, process_project
 from .process_queue import ProjectProcessingQueue, request_project_cancellation
 from .scheduler import schedule_worker
@@ -2117,6 +2122,71 @@ def create_app(
         thumbnail = project_dir / "thumbnail.jpg"
         if not thumbnail.is_file():
             raise HTTPException(status_code=404, detail="La miniatura aún no está disponible.")
+        return FileResponse(thumbnail, media_type="image/jpeg")
+
+    @application.get("/api/projects/{project_id}/proposals/{proposal_id}/thumbnail")
+    def get_proposal_thumbnail(project_id: str, proposal_id: str) -> FileResponse:
+        """Miniatura de una propuesta sin editar (hotfix v1.4.1).
+
+        Las propuestas (edición automática apagada, v1.3.2) no tienen
+        clip renderizado, así que la pantalla de resultados no tenía
+        ninguna vista previa que mostrar para ellas. El fotograma se
+        extrae del video fuente en el punto medio del momento y se
+        cachea en disco; las siguientes peticiones sirven el archivo
+        guardado. La ruta termina en /thumbnail, así que el middleware
+        la trata como petición de medio y acepta la cookie
+        kellyclip_media (un <img> no puede enviar Authorization).
+        """
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        metadata = project.get("metadata")
+        records = metadata.get("clip_proposals") if isinstance(metadata, dict) else None
+        record = next(
+            (
+                item
+                for item in records or []
+                if isinstance(item, dict) and item.get("id") == proposal_id
+            ),
+            None,
+        )
+        proposal = record.get("proposal") if isinstance(record, dict) else None
+        if not isinstance(proposal, dict):
+            raise HTTPException(status_code=404, detail="No se encontró la propuesta.")
+        try:
+            start = float(proposal["inicio"])
+            end = float(proposal["fin"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=404, detail="No se encontró la propuesta.") from None
+        if not end > start >= 0:
+            raise HTTPException(status_code=404, detail="No se encontró la propuesta.")
+        project_dir = app_settings.data_dir / "projects" / project_id
+        thumbnail_dir = project_dir / "proposal-thumbnails"
+        thumbnail = thumbnail_dir / f"{proposal_id}.jpg"
+        if thumbnail.is_file():
+            # La caché manda: la vista previa sigue disponible aunque
+            # el video fuente ya se haya borrado.
+            return FileResponse(thumbnail, media_type="image/jpeg")
+        source = project_dir / "source"
+        if not source.is_file():
+            raise HTTPException(status_code=404, detail="El video original ya no está disponible.")
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            raise HTTPException(status_code=503, detail="FFmpeg no está disponible.")
+        duration = project_duration(project)
+        timestamp = (start + end) / 2
+        if duration is not None:
+            timestamp = min(timestamp, max(0.0, duration - 0.1))
+        thumbnail_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            create_frame_thumbnail(source, thumbnail, timestamp, ffmpeg_path)
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if not thumbnail.is_file():
+            raise HTTPException(
+                status_code=422,
+                detail="No se pudo extraer el fotograma de la propuesta.",
+            )
         return FileResponse(thumbnail, media_type="image/jpeg")
 
     @application.post("/api/projects/{project_id}/process", status_code=202)

@@ -572,6 +572,8 @@ def test_analyze_source_face_track_converts_pixels_to_fractions(
         speech_intervals: list[tuple[float, float]] | None = None,
         on_progress: Any = None,
         sample_rate: float = 4.0,
+        frame_source: str = "cv2",
+        **_kwargs: Any,
     ):
         captured.update(
             {
@@ -581,6 +583,7 @@ def test_analyze_source_face_track_converts_pixels_to_fractions(
                 "output_height": output_height,
                 "speech_intervals": speech_intervals,
                 "sample_rate": sample_rate,
+                "frame_source": frame_source,
             }
         )
         return [pixel_points]
@@ -598,7 +601,8 @@ def test_analyze_source_face_track_converts_pixels_to_fractions(
         FaceCropKeyframe(1.0, 0.5, 0.5),
         FaceCropKeyframe(2.0, 1.0, 0.5),
     ]
-    # Un solo intervalo (0, duration), clip_start=0, 2 fps.
+    # Un solo intervalo (0, duration), clip_start=0, 2 fps, fuente "auto"
+    # (keyframes por ffmpeg → denso → cv2; hotfix v1.4.1).
     assert captured == {
         "clip_start": 0.0,
         "intervals": [(0.0, 2.0)],
@@ -606,6 +610,7 @@ def test_analyze_source_face_track_converts_pixels_to_fractions(
         "output_height": 1920,
         "speech_intervals": [(0.0, 1.0)],
         "sample_rate": 2.0,
+        "frame_source": "auto",
     }
 
 

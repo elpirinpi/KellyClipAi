@@ -280,6 +280,11 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
   const [thumbnail, setThumbnail] = useState('');
   const [progress, setProgress] = useState<number | null>(null);
   const [uploadError, setUploadError] = useState('');
+  // Hotfix v1.4.1 (bug 1): id de la importación fallida cuyo aviso se está
+  // mostrando, para poder descartarlo borrando su fila staged. Solo se
+  // fija cuando el error viene de una fila staged fallida (restoreUpload
+  // o el polling); los demás errores no tienen nada que descartar.
+  const [failedStagedId, setFailedStagedId] = useState<string | null>(null);
   // Fase 2 (ítem 22): intento actual de subida (null fuera de un reintento).
   const [uploadAttempt, setUploadAttempt] = useState<{ attempt: number; maxAttempts: number } | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -298,6 +303,7 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
         const latest = await response.json() as StagedMedia | null;
         if (!active || !latest) return;
         if (latest.status === 'failed') {
+          setFailedStagedId(latest.id);
           setUploadError(latest.error ?? 'La última carga no se completó. Vuelve a seleccionar el archivo.');
           return;
         }
@@ -320,6 +326,7 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
                   ? Math.min(99, Math.floor((staged.bytes_received / staged.file_size) * 100))
                   : 0);
               if (staged.status === 'failed') {
+                setFailedStagedId(staged.id);
                 setUploadError(staged.error ?? 'La carga se interrumpió. Vuelve a seleccionar el archivo.');
                 setProgress(null);
                 setFileInfo(null);
@@ -340,6 +347,7 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
 
   const importFile = useCallback(async (file: File, fromRecorder = false) => {
     setUploadError('');
+    setFailedStagedId(null);
     onNotice('');
     const extension = extensionOf(file.name);
     if (!fromRecorder && !ALLOWED_EXTENSIONS.has(extension)) {
@@ -500,7 +508,36 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
     setProgress(null);
     setUploadAttempt(null);
     setUploadError('Importación cancelada.');
+    // Hotfix v1.4.1 (bug 1): borrar la carga en el servidor. Antes la
+    // fila quedaba en 'receiving' y en el siguiente arranque se marcaba
+    // como fallida con el aviso "La aplicación se cerró antes de
+    // completar la importación", aunque el usuario solo había cancelado.
+    const stagedId = fileInfo?.id;
+    setFileInfo(null);
+    if (stagedId) {
+      void apiFetch(`${apiBase}/api/staged-media/${stagedId}`, { method: 'DELETE' }).catch(() => {
+        // El borrado es limpieza: si falla, la fila caduca sola a las
+        // 24 h y el aviso no reaparece tras la siguiente importación.
+      });
+    }
   };
+
+  // Hotfix v1.4.1 (bug 1): descartar el aviso de una importación fallida
+  // borra su fila staged. El aviso ya se mostró; sin este borrado
+  // reaparecía en cada arranque hasta que la fila caducara (24 h).
+  const dismissUploadError = useCallback(async () => {
+    const stagedId = failedStagedId;
+    setFailedStagedId(null);
+    setUploadError('');
+    if (!stagedId) return;
+    try {
+      const response = await apiFetch(`${apiBase}/api/staged-media/${stagedId}`, { method: 'DELETE' });
+      // 404: la fila ya no existe; nada más que limpiar.
+      if (!response.ok && response.status !== 404) throw new Error(await responseError(response));
+    } catch {
+      // La fila caduca sola a las 24 h; el aviso ya no se muestra en esta sesión.
+    }
+  }, [apiBase, failedStagedId]);
 
   return {
     fileInfo,
@@ -510,6 +547,8 @@ export function useImport({ apiBase, authReady, userId, onImportStart, onNotice 
     setProgress,
     uploadError,
     setUploadError,
+    failedStagedId,
+    dismissUploadError,
     uploadAttempt,
     dragging,
     setDragging,

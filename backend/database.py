@@ -946,10 +946,18 @@ def latest_staged_media(
     source_type: str,
     owner_id: str | None = None,
 ) -> dict[str, Any] | None:
-    query = """
-        SELECT * FROM staged_media
-        WHERE source_type = ? AND status IN ('receiving', 'downloading', 'ready', 'failed')
+    """Última importación de este tipo, si hay algo que reanudar o avisar.
+
+    Hotfix v1.4.1 (bug 1): antes el filtro de estado se aplicaba ANTES de
+    elegir la más reciente, así que una importación fallida antigua seguía
+    siendo "la última" aunque después hubiera importaciones exitosas (sus
+    filas pasan a 'completed' y el filtro las saltaba): el aviso de la
+    importación fallida aparecía en cada arranque. Ahora se elige primero
+    la fila más reciente y solo se devuelve si su estado es reanudable o
+    informativo; si la más reciente está 'completed', no hay nada que
+    reanudar ni que avisar.
     """
+    query = "SELECT * FROM staged_media WHERE source_type = ?"
     parameters: tuple[Any, ...] = (source_type,)
     if owner_id is not None:
         query += " AND owner_id = ?"
@@ -957,7 +965,12 @@ def latest_staged_media(
     query += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
     with connection(database_path) as conn:
         row = conn.execute(query, parameters).fetchone()
-    return staged_media_from_row(row) if row else None
+    if row is None:
+        return None
+    staged = staged_media_from_row(row)
+    if staged["status"] not in {"receiving", "downloading", "ready", "failed"}:
+        return None
+    return staged
 
 
 def staged_media_from_row(row: sqlite3.Row) -> dict[str, Any]:

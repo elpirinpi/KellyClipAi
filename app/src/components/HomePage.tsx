@@ -37,10 +37,12 @@ export function HomePage() {
     },
     importer: {
       fileInfo, thumbnail, progress, uploadError, uploadAttempt,
+      failedStagedId, dismissUploadError,
       dragging, setDragging, inputRef, chooseFile, onDrop, cancelImport,
     },
     linkImport: {
       link, setLink, linkMessage, setLinkMessage, downloadProgress, handleLink, cancelLinkDownload,
+      failedLinkStagedId, dismissLinkMessage,
     },
     recorder: { setRecordOpen, setRecordError },
     zoom: { openZoomImport },
@@ -79,7 +81,11 @@ export function HomePage() {
           />
           <button type="submit" className="continue-button" disabled={!link.trim() || isSubmitting}>{isSubmitting ? 'Descargando…' : 'Continuar'} <ArrowRight size={16} /></button>
         </form>
-        {linkMessage && <p className="form-message" role="status">{linkMessage}</p>}
+        {linkMessage && <p className="form-message" role="status">{linkMessage}{failedLinkStagedId && (
+          <button type="button" className="message-dismiss" onClick={() => void dismissLinkMessage()}>
+            Descartar
+          </button>
+        )}</p>}
         {downloadProgress?.source_type === 'url' && downloadProgress.status === 'downloading' && (
           <div className="download-progress" aria-live="polite">
             {downloadProgress.total_bytes && downloadProgress.total_bytes > 0 && (
@@ -127,7 +133,11 @@ export function HomePage() {
           <p className="size-note">Tus archivos permanecen en este dispositivo · Tamaño máximo: {MAX_UPLOAD_LABEL}</p>
         </div>
 
-        {uploadError && <p className="error-message" role="alert"><AlertCircle size={16} />{uploadError}</p>}
+        {uploadError && <p className="error-message" role="alert"><AlertCircle size={16} />{uploadError}{failedStagedId && (
+          <button type="button" className="message-dismiss" onClick={() => void dismissUploadError()}>
+            Descartar
+          </button>
+        )}</p>}
 
         <div className="secondary-actions">
           <button type="button" className="outline-action" onClick={() => void openZoomImport()}>

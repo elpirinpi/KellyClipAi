@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ChevronRight, CopyPlus, FileVideo2, FolderOpen, LoaderCircle, Plus, Search } from 'lucide-react';
+import { AlertCircle, ChevronRight, CopyPlus, FileVideo2, FolderOpen, LoaderCircle, Plus, Search, Trash2 } from 'lucide-react';
 import { apiFetch } from '../auth';
 import type { ProjectResult } from '../types';
 import { formatDuration, responseError } from '../utils';
@@ -79,7 +79,29 @@ export function ProjectsPage({
   // Fase 3 (ítem 15): duplicar un proyecto para reprocesarlo con otra
   // configuración, sin volver a subir el video.
   const [duplicatingId, setDuplicatingId] = useState('');
+  // Hotfix v1.4.1 (bug 4): eliminar un proyecto desde la lista, sin
+  // entrar en él. Reutiliza DELETE /api/projects/{id} (el mismo que usa
+  // ResultsPage dentro del proyecto) y su texto de confirmación.
+  const [deletingId, setDeletingId] = useState('');
   const requestRef = useRef(0);
+
+  const deleteProject = async (project: ProjectResult) => {
+    if (!window.confirm(
+      `¿Eliminar “${project.title}” y todos sus archivos, clips, publicaciones programadas y enlaces compartidos? Esta acción no se puede deshacer.`,
+    )) return;
+    setDeletingId(project.id);
+    setError('');
+    try {
+      const response = await apiFetch(`${apiBase}/api/projects/${project.id}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setProjects((current) => current.filter((item) => item.id !== project.id));
+      setTotal((current) => (current === null ? null : Math.max(0, current - 1)));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No se pudo eliminar el proyecto.');
+    } finally {
+      setDeletingId('');
+    }
+  };
 
   const duplicateProject = async (projectId: string) => {
     setDuplicatingId(projectId);
@@ -298,6 +320,22 @@ export function ProjectsPage({
                   title="Duplicar para reprocesar con otra configuración"
                 >
                   {duplicatingId === project.id ? <LoaderCircle size={16} className="spin" /> : <CopyPlus size={16} />}
+                </button>
+                {/* Hotfix v1.4.1 (bug 4): eliminar desde la lista, sin
+                    entrar al proyecto. En curso no se puede borrar
+                    (el backend también lo rechaza con 409): hay que
+                    cancelarlo primero desde dentro del proyecto. */}
+                <button
+                  type="button"
+                  className="pf-delete-button"
+                  onClick={() => void deleteProject(project)}
+                  disabled={deletingId === project.id || project.status === 'processing' || project.status === 'queued'}
+                  aria-label={`Eliminar proyecto ${project.title}`}
+                  title={project.status === 'processing' || project.status === 'queued'
+                    ? 'No se puede eliminar un proyecto mientras se procesa'
+                    : 'Eliminar proyecto'}
+                >
+                  {deletingId === project.id ? <LoaderCircle size={16} className="spin" /> : <Trash2 size={16} />}
                 </button>
               </li>
             );

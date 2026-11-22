@@ -56,6 +56,10 @@ export function useLinkImport({
   const [link, setLink] = useState('');
   const [linkMessage, setLinkMessage] = useState('');
   const [downloadProgress, setDownloadProgress] = useState<StagedMedia | null>(null);
+  // Hotfix v1.4.1 (bug 1): id de la descarga fallida cuyo aviso se está
+  // mostrando, para poder descartarlo borrando su fila staged (igual que
+  // failedStagedId en useImport).
+  const [failedLinkStagedId, setFailedLinkStagedId] = useState<string | null>(null);
   // Controla el polling de la descarga por enlace: se detiene al navegar
   // a otra vista, al desmontar y al pulsar "Cancelar descarga".
   const linkDownloadRef = useRef({ active: false, cancelled: false, stagedId: '' });
@@ -80,6 +84,7 @@ export function useLinkImport({
 
   const handleLink = async (event: FormEvent) => {
     event.preventDefault();
+    setFailedLinkStagedId(null);
     if (!link.trim()) {
       setLinkMessage('Pega un enlace para continuar.');
       return;
@@ -164,6 +169,7 @@ export function useLinkImport({
         if (!active || !latest) return;
         if (wasLinkDownloadCancelled(latest.id)) return;
         if (latest.status === 'failed') {
+          setFailedLinkStagedId(latest.id);
           setLinkMessage(latest.error ?? 'La descarga no se completó. Vuelve a intentarlo.');
           return;
         }
@@ -204,11 +210,29 @@ export function useLinkImport({
     };
   }, [apiBase, authReady, navigate, route, setIsSubmitting, setLinkProject, userId]);
 
+  // Hotfix v1.4.1 (bug 1): descartar el aviso de una descarga fallida
+  // borra su fila staged, como dismissUploadError en useImport.
+  const dismissLinkMessage = async () => {
+    const stagedId = failedLinkStagedId;
+    setFailedLinkStagedId(null);
+    setLinkMessage('');
+    if (!stagedId) return;
+    try {
+      const response = await apiFetch(`${apiBase}/api/staged-media/${stagedId}`, { method: 'DELETE' });
+      // 404: la fila ya no existe; nada más que limpiar.
+      if (!response.ok && response.status !== 404) throw new Error(await responseError(response));
+    } catch {
+      // La fila caduca sola a las 24 h; el aviso ya no se muestra en esta sesión.
+    }
+  };
+
   return {
     link,
     setLink,
     linkMessage,
     setLinkMessage,
+    failedLinkStagedId,
+    dismissLinkMessage,
     downloadProgress,
     handleLink,
     cancelLinkDownload,

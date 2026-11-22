@@ -436,6 +436,44 @@ def create_thumbnail(
     )
 
 
+def create_frame_thumbnail(
+    input_path: Path,
+    output_path: Path,
+    timestamp: float,
+    ffmpeg_path: str,
+) -> None:
+    """Un fotograma del video en `timestamp`, guardado como JPEG.
+
+    Como create_thumbnail pero en un instante elegido: las propuestas
+    sin editar (edición automática apagada, v1.3.2) no tienen clip
+    renderizado, así que su vista previa es el fotograma central del
+    momento detectado (hotfix v1.4.1). El escalado es el mismo
+    (640 px de ancho); el recorte vertical 9:16 lo hace el CSS
+    (object-fit: cover). El directorio de salida debe existir.
+    """
+    _run(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{max(0.0, timestamp):.3f}",
+            "-i",
+            str(input_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=640:-2",
+            "-q:v",
+            "3",
+            "-y",
+            str(output_path),
+        ],
+        "extraer el fotograma de la propuesta",
+    )
+
+
 def transcribe(
     input_path: Path,
     model_name: str,
@@ -1285,6 +1323,13 @@ def _render_clip(
                 for word in segment.words
                 if word.start < proposal.fin and word.end > proposal.inicio
             ]
+            # Hotfix v1.4.1 (bug 5): el render decodificaba con cv2, que
+            # no decodifica AV1 (el video de Kelly) y tumbaba el render
+            # con MediaProcessingError. "ffmpeg-dense" mantiene el
+            # muestreo denso y la detección de orador por labios
+            # (paridad con cv2), cambiando solo el decodificador.
+            # NO "auto": su vía de keyframes desactiva los labios y
+            # el encuadre de orador degradaría a la cara más grande.
             crop_paths = analyze_face_crop_paths(
                 input_path,
                 proposal.inicio,
@@ -1293,6 +1338,7 @@ def _render_clip(
                 height,
                 speech_intervals=speech_intervals,
                 on_progress=on_analysis_progress,
+                frame_source="ffmpeg-dense",
             )
         except FaceTrackingError as error:
             raise MediaProcessingError(str(error)) from error

@@ -58,6 +58,38 @@ async function downloadWithAuth(url: string, filename: string): Promise<void> {
   triggerDownload(await response.blob(), filename);
 }
 
+// Hotfix v1.4.1 (bug 3): las propuestas sin editar no tenían ninguna
+// vista previa — ni <video> ni <img> ni endpoint que las sirviera.
+// El fotograma central del momento lo sirve
+// GET /api/projects/{id}/proposals/{proposalId}/thumbnail (la cookie
+// de medios autentica la petición del <img>); si falla (fuente
+// borrada, FFmpeg ausente), queda un marcador en su lugar.
+function ProposalPreview({ projectId, proposalId, title }: {
+  projectId: string;
+  proposalId: string;
+  title: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return (
+      <div className="proposal-preview proposal-preview-failed" aria-label={`Sin vista previa de ${title}`}>
+        <Film size={22} />
+        <span>Sin vista previa</span>
+      </div>
+    );
+  }
+  return (
+    <div className="proposal-preview">
+      <img
+        src={`${API_BASE}/api/projects/${projectId}/proposals/${proposalId}/thumbnail`}
+        alt={`Vista previa de ${title}`}
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    </div>
+  );
+}
+
 export function ResultsPage({
   project,
   error,
@@ -859,7 +891,7 @@ export function ResultsPage({
           </article>
         ))}
       </div>
-      {showProposals && (
+      {showProposals && project && (
         <section className="proposal-section" aria-label="Propuestas sin editar">
           <div className="clips-heading">
             <div><strong>PROPUESTAS SIN EDITAR</strong></div>
@@ -871,9 +903,12 @@ export function ResultsPage({
               const proposal = record.proposal;
               return (
                 <article className="proposal-card" key={record.id}>
-                  <div className="proposal-time">
-                    <strong>{formatDuration(proposal.inicio)} – {formatDuration(proposal.fin)}</strong>
-                    <span>{formatDuration(proposal.fin - proposal.inicio)}</span>
+                  <div className="proposal-side">
+                    <ProposalPreview projectId={project.id} proposalId={record.id} title={proposal.titulo} />
+                    <div className="proposal-time">
+                      <strong>{formatDuration(proposal.inicio)} – {formatDuration(proposal.fin)}</strong>
+                      <span>{formatDuration(proposal.fin - proposal.inicio)}</span>
+                    </div>
                   </div>
                   <div className="clip-content">
                     <h2>#{index + 1} {proposal.titulo}</h2>
