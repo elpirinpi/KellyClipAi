@@ -349,6 +349,27 @@ def _serialize_clip(project_id: str, clip: dict) -> dict:
     }
 
 
+_CLIENT_ERROR_MAX_CHARS = 4000
+
+
+def _client_error_text(value: object) -> str | None:
+    """Un campo del reporte de error de la interfaz como texto corto.
+
+    Tolerante: cualquier valor no nulo se convierte a texto y se
+    recorta a 4000 caracteres, para que un reporte malformado nunca
+    tumbe el endpoint ni inunde el log. Devuelve None si está vacío.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) > _CLIENT_ERROR_MAX_CHARS:
+        text = text[:_CLIENT_ERROR_MAX_CHARS] + "… (truncado)"
+    return text
+
+
 def _probe_clip_dimensions(path: Path) -> tuple[int, int] | None:
     """Dimensiones del video exportado, o None si no se pueden leer.
 
@@ -779,7 +800,7 @@ def create_app(
         if not path.startswith("/api/") or request.method == "OPTIONS":
             return await call_next(request)
         if (
-            path in {"/api/health", "/api/auth/config"}
+            path in {"/api/health", "/api/auth/config", "/api/client-errors"}
             or path.startswith("/api/shares/")
             or (
                 path.startswith("/api/integrations/")
@@ -894,6 +915,42 @@ def create_app(
     @application.get("/api/encoder")
     def get_encoder_status() -> dict[str, str]:
         return get_encoder_info(shutil.which("ffmpeg"))
+
+    # --- Errores de la interfaz (v1.4.3) ----------------------------------
+    # El ErrorBoundary del frontend envía aquí los errores no controlados
+    # para que queden en desktop.log: en la app empaquetada la consola
+    # del navegador no es visible (WebView2 con debug=False) y sin esto
+    # un crash de la interfaz era indiagnosticable (eso pasó con el
+    # crash del clip manual del 22-11-2026). Endpoint público (como
+    # /api/health): el fallo puede ocurrir antes de iniciar sesión, y
+    # el cuerpo solo alimenta el log — sin acceso a datos y con cada
+    # campo limitado. Responde 204 con cualquier JSON válido; solo un
+    # cuerpo que no sea JSON devuelve 400.
+
+    @application.post("/api/client-errors", status_code=204)
+    async def report_client_error(request: Request) -> Response:
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="El cuerpo debe ser JSON válido."
+            ) from None
+        if not isinstance(payload, dict):
+            payload = {}
+        message = _client_error_text(payload.get("message"))
+        stack = _client_error_text(payload.get("stack"))
+        component_stack = _client_error_text(
+            payload.get("component_stack", payload.get("componentStack"))
+        )
+        url = _client_error_text(payload.get("url"))
+        logger.error(
+            "Error de la interfaz: %s | url=%s | stack=%s | componentStack=%s",
+            message or "(sin mensaje)",
+            url or "-",
+            stack or "-",
+            component_stack or "-",
+        )
+        return Response(status_code=204)
 
     def update_status() -> dict[str, Any]:
         if application.state.updater is None:

@@ -11,6 +11,7 @@ import { SavedMomentsPanel } from './SavedMomentsPanel';
 import { ToastStack, useToasts, type ToastKind } from './Toasts';
 import type { ClipProposalRecord, ClipResult, ProjectResult, ScheduleJob } from '../types';
 import { formatDuration, responseError } from '../utils';
+import { compareClipsByScore, formatClipScore } from '../utils/clipScore';
 
 declare global {
   interface Window {
@@ -142,7 +143,8 @@ export function ResultsPage({
   const players = useRef<Record<string, HTMLVideoElement | null>>({});
   const clips = useMemo(() => {
     const allClips = [...(project?.clips ?? [])];
-    return allClips.sort((a, b) => sort === 'score' ? b.score - a.score : a.start - b.start);
+    // v1.4.3: los clips manuales tienen score null y van al final.
+    return allClips.sort((a, b) => sort === 'score' ? compareClipsByScore(a, b) : a.start - b.start);
   }, [project?.clips, sort]);
   const visibleClips = useMemo(() => {
     const needle = clipQuery.trim().toLocaleLowerCase();
@@ -802,7 +804,7 @@ export function ResultsPage({
                   </div>
                 </>
                 : <div className="clip-score-actions">
-                <div className="clip-score"><strong>{clip.score.toFixed(1)}</strong><span>VIRALIDAD</span></div>
+                <div className="clip-score"><strong>{formatClipScore(clip.score)}</strong><span>VIRALIDAD</span></div>
                 <div className="clip-actions">
                   <button type="button" className="clip-action primary" onClick={() => void saveProjectFiles(false, [clip.id])} disabled={busyAction === 'archive'}>
                     {busyAction === 'archive' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />} Descargar

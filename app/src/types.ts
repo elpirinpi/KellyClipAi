@@ -71,7 +71,12 @@ export type ClipResult = {
   start: number;
   end: number;
   duration: number;
-  score: number;
+  // Puntuación de viralidad (0–10). Los clips manuales (exportados
+  // desde el Studio sin clip_id) no tienen puntuación: el backend
+  // los guarda con score null. Mostrar y ordenar deben tolerarlo
+  // (ver app/src/utils/clipScore.ts); un toFixed sin protección
+  // tumbaba toda la interfaz (crash del 22-11-2026, v1.4.3).
+  score: number | null;
   viral_reason: string;
   keywords: string[];
   emojis: string[];

@@ -589,9 +589,16 @@ con el rango de tiempo en la primera columna. */
 
 /* Error Boundary: pantalla amigable en vez de una página en blanco. */
 .error-boundary-page { min-height: 100vh; display: grid; place-items: center; padding: 32px 18px; background: #f6f7fb; }
-.error-boundary-card { width: min(480px, 100%); padding: 32px 28px; border: 1px solid #e9eaf0; border-radius: 14px; background: #fff; box-shadow: 0 5px 22px #151b2a0d; text-align: center; }
+.error-boundary-card { width: min(560px, 100%); padding: 32px 28px; border: 1px solid #e9eaf0; border-radius: 14px; background: #fff; box-shadow: 0 5px 22px #151b2a0d; text-align: center; }
 .error-boundary-card h1 { margin: 0 0 10px; color: #232836; font-size: 22px; font-weight: 600; }
 .error-boundary-card p { margin: 0 0 22px; color: #5f6b80; font-size: 13px; line-height: 1.6; }
+/* v1.4.3: la pantalla de error muestra el mensaje real y el detalle
+   técnico colapsado, para que un crash sea diagnosticable. */
+.error-boundary-detail { margin: 0 0 14px; padding: 12px 14px; border: 1px solid #f3c2c2; border-radius: 10px; background: #fdf2f2; color: #8a2c2c; font-size: 13px; line-height: 1.5; text-align: left; overflow-wrap: anywhere; }
+.error-boundary-details { margin: 0 0 20px; text-align: left; }
+.error-boundary-details summary { cursor: pointer; color: var(--text-muted); font-size: 12px; font-weight: 600; }
+.error-boundary-stack { max-height: 220px; margin: 10px 0 0; padding: 12px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-muted); color: var(--text-main); font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+html[data-theme="dark"] .error-boundary-detail { background: #3a2323; border-color: #5c3333; color: #f0b8b8; }
 .error-boundary-actions { display: flex; flex-direction: column; align-items: center; gap: 10px; }
 .error-boundary-actions .create-button { width: 100%; }
 .error-boundary-actions .subtle-button { height: 38px; padding: 0 16px; }

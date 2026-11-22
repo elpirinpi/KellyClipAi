@@ -694,6 +694,35 @@ def test_export_creates_manual_clip_without_clip_id(tmp_path: Path) -> None:
     assert stored["clips"][0]["id"] == body["id"]
 
 
+def test_export_manual_clip_has_null_score(tmp_path: Path) -> None:
+    # Contrato v1.4.3 (regresión del crash del 22-11-2026): un clip
+    # manual no tiene puntuación — el backend lo guarda con score None
+    # y el frontend debe mostrar "—" y ordenarlo al final, nunca hacer
+    # clip.score.toFixed(1) sin protección.
+    settings = _settings(tmp_path / "data")
+    _create_project(
+        settings,
+        "project-1",
+        clips=[],
+        transcript=_transcript(),
+        metadata={"duration": 60.0},
+    )
+    with _client(settings) as client:
+        response = client.post(
+            "/api/projects/project-1/studio/export",
+            files={"file": ("manual.webm", b"video-manual", "video/webm")},
+            data={"start": "0", "end": "5", "title": "Manual uno"},
+        )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["manual"] is True
+    assert body["score"] is None
+    stored = database.get_project(settings.database_path, "project-1")
+    assert stored is not None
+    assert len(stored["clips"]) == 1
+    assert stored["clips"][0]["score"] is None
+
+
 def test_export_manual_clip_generates_title_when_missing(tmp_path: Path) -> None:
     settings = _settings(tmp_path / "data")
     _create_project(settings, "project-1", clips=[], metadata={"duration": 60.0})
