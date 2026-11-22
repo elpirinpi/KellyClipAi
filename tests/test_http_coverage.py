@@ -181,9 +181,12 @@ def test_expired_provider_accounts_refresh_and_persist_tokens(
             },
         )
 
+    # Fase 3 (ítem 10): el refresco persiste vía save_account_document
+    # (misma firma posicional) para no desplazar a la cuenta principal
+    # al refrescar una cuenta extra.
     monkeypatch.setattr(
         integrations.database,
-        "save_connected_account",
+        "save_account_document",
         lambda *args: saved.append(args),
     )
     _install_transport(monkeypatch, integrations, handle)

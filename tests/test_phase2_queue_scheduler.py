@@ -387,9 +387,13 @@ def test_scheduler_supervisor_survives_database_error(
     assert len(calls) >= 2
 
 
-def test_scheduler_job_timeout_marks_job_failed(
+def test_scheduler_job_timeout_requeues_with_backoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Fase 3 (ítem 9): un timeout es un fallo transitorio, así que el
+    # primer fallo reencola el job con backoff en vez de marcarlo
+    # fallido de forma terminal (eso ocurre al agotar los 3 intentos;
+    # ver tests/test_phase3_publishing_flow.py).
     settings = _settings(tmp_path / "data")
     database.initialize(settings.database_path)
     project_id = str(uuid.uuid4())
@@ -420,8 +424,11 @@ def test_scheduler_job_timeout_marks_job_failed(
     asyncio.run(run())
     job = database.get_schedule_job(settings.database_path, job_id)
     assert job is not None
-    assert job["status"] == "failed"
+    assert job["status"] == "scheduled"
+    assert job["attempts"] == 1
+    assert job["next_attempt_at"] is not None
     assert "tiempo máximo" in (job["error"] or "")
+    assert "reintentará" in (job["error"] or "")
 
 
 # ---------------------------------------------------------------------------

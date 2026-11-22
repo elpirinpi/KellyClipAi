@@ -222,7 +222,7 @@ export function ProcessingPage({
             <h1>{cancelled ? 'Procesamiento cancelado' : 'Analizando contenido y encontrando clips'}</h1>
             <p>{cancelled
               ? 'Puedes reprocesar el proyecto cuando quieras, con la misma configuración.'
-              : 'Permanece en la página mientras el video se procesa.'}</p>
+              : 'Puedes seguir usando la app o minimizar la ventana mientras el video se procesa; te avisaremos cuando esté listo.'}</p>
           </div>
         </div>
         {error && <p className="error-message" role="alert"><AlertCircle size={16} />{error}</p>}

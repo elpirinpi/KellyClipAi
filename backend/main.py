@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -21,6 +22,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlencode, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import httpx
 import yt_dlp
 from fastapi import (
     BackgroundTasks,
@@ -42,17 +44,35 @@ from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
-from . import database, moments
+from . import (
+    brand,
+    captions,
+    clip_versions,
+    database,
+    moments,
+    project_clone,
+    publish_guide,
+    translate,
+    watch_folder,
+    waveform,
+)
 from .auth import (
     AuthenticationError,
     AuthenticationUnavailable,
     SupabaseAuthVerifier,
+)
+from .autostart import (
+    AutostartError,
+    autostart_supported,
+    is_autostart_enabled,
+    set_autostart,
 )
 from .credential_store import (
     CredentialStoreError,
     decrypt_api_key,
     encrypt_api_key,
 )
+from .desktop_prefs import load_desktop_prefs, save_desktop_prefs, tray_available
 from .editor import (
     EditorRenderJobManager,
     editor_preview_path,
@@ -70,16 +90,27 @@ from .face_tracking import (
     peek_cached_source_face_track,
     start_face_track_job,
 )
+from .first_run import (
+    WHISPER_MODELS,
+    disk_space,
+    downloaded_models,
+    is_setup_complete,
+    mark_setup_complete,
+    needs_setup,
+    whisper_model_from_setup,
+)
 from .integrations import (
     IntegrationError,
     authorization_url,
     complete_oauth,
     download_zoom_recording,
     integration_status,
+    list_account_summaries,
     list_zoom_recordings,
     provider_missing_credentials,
+    search_broll_videos,
 )
-from .llm import LLMConfigurationError, resolve_llm
+from .llm import LLMConfigurationError, LLMResponseError, resolve_llm
 from .media import MediaProcessingError, format_subtitles, probe_media
 from .pipeline import _resolve_llm_for_project, process_project
 from .process_queue import ProjectProcessingQueue, request_project_cancellation
@@ -88,27 +119,49 @@ from .schemas import (
     DEFAULT_PROJECTS_PAGE_SIZE,
     MAX_PROJECTS_PAGE_SIZE,
     MAX_UPLOAD_BYTES,
+    ApplySavedMomentRequest,
+    AutostartRequest,
+    BatchEnqueueRequest,
+    BrandKitRequest,
+    BrollAssignRequest,
+    BrollImportRequest,
+    BrollSearchRequest,
+    BrollUpdateRequest,
+    CaptionApplyRequest,
+    CaptionGenerateRequest,
     ClipArchiveRequest,
     ClipEditRequest,
     ClipProposal,
     ClipResolutionRequest,
+    CrossPublishRequest,
     CustomTemplateRequest,
+    DesktopPreferencesRequest,
+    DuplicateProjectRequest,
     EditorRenderJobResponse,
     FaceTrackKeyframe,
     FaceTrackPendingResponse,
     FaceTrackResponse,
     LLMConfig,
     LLMSettingsRequest,
+    NightWindowRequest,
     OverdueScheduleResolution,
     ProcessRequest,
     ProjectConfig,
     PublishClipsRequest,
+    RescheduleRequest,
+    SavedMomentRequest,
+    SavedMomentUpdateRequest,
     SaveProjectFilesRequest,
+    SetupCompleteRequest,
     StagedDownloadRequest,
     StagedProjectRequest,
     StagedUploadRequest,
     StudioEditRequest,
     TranscriptSegment,
+    TranslateSubtitlesRequest,
+    UpdateChannelRequest,
+    WatchFolderRequest,
+    WatchFolderUpdateRequest,
     ZoomImportRequest,
 )
 from .settings import AppSettings, get_settings
@@ -649,13 +702,48 @@ def create_app(
             # recupera los pendientes. fail_interrupted_projects (arriba)
             # ya no falla los proyectos con trabajo recuperable.
             database_path=app_settings.database_path,
+            # Franja nocturna (Fase 3, ítem 11): fuera de la franja, los
+            # workers esperan en vez de procesar. Apagada por defecto.
+            gate=lambda: watch_folder.night_window_allows(
+                app_settings.database_path
+            ),
         )
         await processing_queue.start()
         application.state.processing_queue = processing_queue
+
+        async def _submit_background_project(project_id: str) -> None:
+            """Encola un proyecto ya creado (carpeta observada, lote)."""
+            project = database.get_project(app_settings.database_path, project_id)
+            if project is None:
+                raise RuntimeError(f"No se encontró el proyecto {project_id}.")
+            if not database.queue_project(
+                app_settings.database_path,
+                project_id,
+                project["config"],
+            ):
+                raise RuntimeError(
+                    f"El proyecto {project_id} ya se está procesando."
+                )
+            await processing_queue.submit(project_id, None)
+
+        application.state.submit_background_project = _submit_background_project
         scheduler_task = asyncio.create_task(schedule_worker(app_settings))
+        # Carpeta observada + barrido de lotes (Fase 3, ítem 11): sin
+        # carpetas ni lotes pendientes, el worker solo duerme.
+        watch_task = asyncio.create_task(
+            watch_folder.watch_folder_worker(
+                app_settings,
+                _submit_background_project,
+            )
+        )
         try:
             yield
         finally:
+            watch_task.cancel()
+            try:
+                await watch_task
+            except asyncio.CancelledError:
+                pass
             await processing_queue.stop()
             scheduler_task.cancel()
             try:
@@ -782,7 +870,7 @@ def create_app(
         if request.method != "GET":
             return False
         path = request.url.path
-        return path.endswith(("/file", "/download", "/thumbnail", "/edit/preview", "/source")) or (
+        return path.endswith(("/file", "/download", "/thumbnail", "/edit/preview", "/source", "/brand-kit/logo")) or (
             path.startswith("/api/scheduled-jobs/") and path.endswith("/download")
         )
 
@@ -800,6 +888,13 @@ def create_app(
                 "state": "unavailable",
                 "progress": 0,
                 "error": None,
+                "channel": "stable",
+                "release_notes": None,
+                "release_url": None,
+                "is_prerelease": False,
+                "rollback": False,
+                "previous_version": None,
+                "rollback_available": False,
             }
         return application.state.updater.status()
 
@@ -837,6 +932,144 @@ def create_app(
         except UpdateError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"status": "installer_opened"}
+
+    # --- Canal beta y rollback (Fase 3, ítems 17 y 20, C.6.37, C.6.40) ---
+
+    @application.post("/api/updates/channel")
+    def set_update_channel(payload: UpdateChannelRequest) -> dict[str, Any]:
+        if application.state.updater is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Las actualizaciones están disponibles solo en la app instalada.",
+            )
+        try:
+            return application.state.updater.set_channel(payload.channel)
+        except UpdateError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @application.get("/api/updates/rollback")
+    def get_rollback_status() -> dict[str, Any]:
+        if application.state.updater is None:
+            return {
+                "available": False,
+                "previous_version": None,
+                "installer_ready": False,
+            }
+        return application.state.updater.rollback_info()
+
+    @application.post("/api/updates/rollback")
+    def start_rollback() -> dict[str, Any]:
+        if application.state.updater is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Las actualizaciones están disponibles solo en la app instalada.",
+            )
+        try:
+            return application.state.updater.start_rollback()
+        except UpdateError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    # --- Escritorio: auto-inicio y bandeja (Fase 3, ítem 18) -------------
+
+    def _application_executable() -> Path | None:
+        updater = application.state.updater
+        return updater.application_path if updater is not None else None
+
+    @application.get("/api/desktop/autostart")
+    def get_autostart_status() -> dict[str, bool]:
+        executable = _application_executable()
+        supported = autostart_supported() and executable is not None
+        return {
+            "supported": supported,
+            "enabled": is_autostart_enabled(executable) if supported else False,
+        }
+
+    @application.post("/api/desktop/autostart")
+    def set_autostart_status(payload: AutostartRequest) -> dict[str, bool]:
+        executable = _application_executable()
+        if executable is None or not autostart_supported():
+            raise HTTPException(
+                status_code=409,
+                detail="El auto-inicio solo está disponible en la app instalada en Windows.",
+            )
+        try:
+            set_autostart(payload.enabled, executable)
+        except AutostartError as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+        return {"enabled": payload.enabled}
+
+    @application.get("/api/desktop/preferences")
+    def get_desktop_preferences() -> dict[str, Any]:
+        available, reason = tray_available()
+        return {
+            **load_desktop_prefs(app_settings.data_dir),
+            "tray_available": available,
+            "tray_reason": reason,
+            "portable": os.getenv("KELLYCLIP_PORTABLE") == "1",
+        }
+
+    @application.post("/api/desktop/preferences")
+    def set_desktop_preferences(
+        payload: DesktopPreferencesRequest,
+    ) -> dict[str, Any]:
+        updates = payload.model_dump(exclude_unset=True, exclude_none=True)
+        available, reason = tray_available()
+        return {
+            **save_desktop_prefs(app_settings.data_dir, updates),
+            "tray_available": available,
+            "tray_reason": reason,
+            "portable": os.getenv("KELLYCLIP_PORTABLE") == "1",
+        }
+
+    # --- Asistente de primer arranque (Fase 3, ítem 19, C.6.42) ----------
+
+    @application.get("/api/setup")
+    def get_setup_status(request: Request) -> dict[str, Any]:
+        user_id = request_user_id(request)
+        credentials = database.get_llm_credentials(app_settings.database_path, user_id)
+        completed = is_setup_complete(app_settings.data_dir)
+        has_projects = database.count_projects(app_settings.database_path) > 0
+        has_llm_key = credentials is not None or bool(app_settings.llm_api_key)
+        saved_whisper_model = credentials.get("whisper_model") if credentials else None
+        space = disk_space(app_settings.data_dir)
+        downloaded = downloaded_models()
+        return {
+            "needs_setup": needs_setup(
+                completed=completed,
+                has_projects=has_projects,
+                has_llm_key=has_llm_key,
+            ),
+            "completed": completed,
+            "has_llm_key": has_llm_key,
+            "has_projects": has_projects,
+            "whisper_model": (
+                saved_whisper_model
+                or whisper_model_from_setup(app_settings.data_dir)
+                or app_settings.whisper_model
+            ),
+            "whisper_models": [
+                {
+                    "name": model.name,
+                    "size_bytes": model.size_bytes,
+                    "label": model.label,
+                    "description": model.description,
+                    "downloaded": model.name in downloaded,
+                }
+                for model in WHISPER_MODELS
+            ],
+            "disk_free_bytes": space["free_bytes"],
+            "disk_total_bytes": space["total_bytes"],
+            "portable": os.getenv("KELLYCLIP_PORTABLE") == "1",
+        }
+
+    @application.post("/api/setup/complete")
+    def complete_setup(payload: SetupCompleteRequest) -> dict[str, bool]:
+        mark_setup_complete(
+            app_settings.data_dir,
+            whisper_model=payload.whisper_model,
+            skipped=payload.skipped,
+        )
+        return {"completed": True}
 
     @application.get("/api/auth/config")
     def auth_config() -> dict[str, str | bool]:
@@ -884,8 +1117,14 @@ def create_app(
             "has_saved_llm_key": credentials is not None,
             "has_env_llm_key": bool(app_settings.llm_api_key),
             # El modelo Whisper guardado en Ajustes manda; si nunca se
-            # guardó, se usa el de entorno (WHISPER_MODEL).
-            "whisper_model": saved_whisper_model or app_settings.whisper_model,
+            # guardó, vale el elegido en el asistente de primer arranque
+            # (Fase 3, ítem 19) y, en último lugar, el de entorno
+            # (WHISPER_MODEL).
+            "whisper_model": (
+                saved_whisper_model
+                or whisper_model_from_setup(app_settings.data_dir)
+                or app_settings.whisper_model
+            ),
             "integrations": integration_status(
                 app_settings,
                 app_settings.database_path,
@@ -986,7 +1225,10 @@ def create_app(
         if saved_state and saved_state["provider"] == provider and not error and code:
             try:
                 account = complete_oauth(app_settings, provider, code)
-                database.save_connected_account(
+                # save_account_document (Fase 3, ítem 10): una segunda
+                # cuenta del mismo proveedor se guarda como extra, sin
+                # desplazar a la predeterminada.
+                database.save_account_document(
                     app_settings.database_path,
                     account["provider"],
                     account["account_id"],
@@ -1170,6 +1412,112 @@ def create_app(
                 status_code=409,
                 detail="Ya existe una plantilla con ese nombre.",
             ) from error
+
+    # --- Plantilla de marca (Fase 3, ítem 5) -------------------------------
+    # Un kit por usuario: colores, fuente y logo. El logo vive en disco
+    # (<data_dir>/brand/<owner>/logo.<ext>); la BD guarda el nombre.
+
+    def _brand_kit_payload(owner_id: str) -> dict[str, Any] | None:
+        kit = database.get_brand_kit(app_settings.database_path, owner_id)
+        if kit is None:
+            return None
+        payload = dict(kit)
+        logo_path = brand.brand_logo_path(
+            app_settings.data_dir, owner_id, kit.get("logo_filename")
+        )
+        payload["logo_url"] = (
+            "/api/brand-kit/logo" if logo_path is not None else None
+        )
+        return payload
+
+    @application.get("/api/brand-kit")
+    def get_brand_kit(request: Request) -> dict[str, Any]:
+        return {"brand_kit": _brand_kit_payload(request_user_id(request))}
+
+    @application.put("/api/brand-kit")
+    def put_brand_kit(kit: BrandKitRequest, request: Request) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        database.save_brand_kit(
+            app_settings.database_path,
+            kit.model_dump(mode="json"),
+            owner_id,
+        )
+        return {"brand_kit": _brand_kit_payload(owner_id)}
+
+    @application.delete("/api/brand-kit", status_code=204)
+    def delete_brand_kit(request: Request) -> None:
+        owner_id = request_user_id(request)
+        database.delete_brand_kit(app_settings.database_path, owner_id)
+        shutil.rmtree(
+            brand.brand_dir(app_settings.data_dir, owner_id),
+            ignore_errors=True,
+        )
+
+    @application.post("/api/brand-kit/logo")
+    async def upload_brand_logo(
+        request: Request, file: Annotated[UploadFile, File(...)]
+    ) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        content_type = (file.content_type or "").lower().split(";")[0].strip()
+        suffix = Path(file.filename or "").suffix.lower()
+        if (
+            content_type not in brand.LOGO_MEDIA_TYPES
+            and suffix not in brand.LOGO_EXTENSIONS
+        ):
+            raise HTTPException(
+                status_code=415,
+                detail="El logo debe ser una imagen PNG, JPG o WebP.",
+            )
+        if suffix not in brand.LOGO_EXTENSIONS:
+            suffix = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+            }[content_type]
+        data = await file.read(brand.MAX_LOGO_BYTES + 1)
+        if len(data) > brand.MAX_LOGO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="El logo supera el límite de 2 MB.",
+            )
+        if not data:
+            raise HTTPException(
+                status_code=400, detail="El archivo del logo está vacío."
+            )
+        directory = brand.brand_dir(app_settings.data_dir, owner_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        for old in directory.iterdir():
+            if old.is_file() and old.suffix.lower() in brand.LOGO_EXTENSIONS:
+                old.unlink(missing_ok=True)
+        filename = f"logo{suffix}"
+        (directory / filename).write_bytes(data)
+        if database.get_brand_kit(app_settings.database_path, owner_id) is None:
+            database.save_brand_kit(app_settings.database_path, {}, owner_id)
+        database.set_brand_kit_logo(
+            app_settings.database_path, filename, owner_id
+        )
+        return {"brand_kit": _brand_kit_payload(owner_id)}
+
+    @application.get("/api/brand-kit/logo")
+    def get_brand_logo(request: Request) -> FileResponse:
+        owner_id = request_user_id(request)
+        kit = database.get_brand_kit(app_settings.database_path, owner_id)
+        logo_path = (
+            brand.brand_logo_path(
+                app_settings.data_dir, owner_id, kit.get("logo_filename")
+            )
+            if kit is not None
+            else None
+        )
+        if logo_path is None:
+            raise HTTPException(status_code=404, detail="No hay logo guardado.")
+        media_type = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }.get(logo_path.suffix.lower(), "image/png")
+        return FileResponse(logo_path, media_type=media_type)
 
     @application.get("/api/projects")
     def projects(
@@ -2454,6 +2802,178 @@ def create_app(
             },
         )
 
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/subtitles/translate"
+    )
+    def translate_clip_subtitles(
+        project_id: str,
+        clip_id: str,
+        body: TranslateSubtitlesRequest,
+    ) -> Response:
+        """Traduce los subtítulos del clip con el LLM y los descarga.
+
+        Sin clave de IA configurada responde 409 con un mensaje claro:
+        la traducción es explícita del usuario, no un pulido opcional.
+        """
+        _, clip = editable_project_clip(project_id, clip_id)
+        if clip.get("status") == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="No se pueden traducir subtítulos de un clip fallido.",
+            )
+        transcript = clip.get("transcript")
+        if not isinstance(transcript, list) or not transcript:
+            raise HTTPException(
+                status_code=409,
+                detail="El clip no tiene una transcripción con marcas de tiempo.",
+            )
+        project = database.get_project(app_settings.database_path, project_id)
+        assert project is not None
+        try:
+            llm = _resolve_llm_for_project(project, None, app_settings)
+        except (LLMConfigurationError, CredentialStoreError, ValidationError) as error:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Configura una clave de IA en Ajustes para traducir "
+                    "subtítulos (la traducción usa tu proveedor de IA)."
+                ),
+            ) from error
+        cues = translate.clip_words_to_cues(transcript)
+        if not cues:
+            raise HTTPException(
+                status_code=409,
+                detail="El clip no tiene subtítulos para traducir.",
+            )
+        try:
+            translated = translate.translate_cues(
+                cues, body.target_language, llm
+            )
+        except (LLMConfigurationError, LLMResponseError) as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"La traducción falló: {error}",
+            ) from error
+        try:
+            content = format_subtitles(
+                translate.translated_words(translated), body.format_name
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=422,
+                detail="La traducción no produjo subtítulos válidos.",
+            ) from error
+        media_type = (
+            "text/vtt; charset=utf-8"
+            if body.format_name == "vtt"
+            else "application/x-subrip; charset=utf-8"
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{clip_id}-{body.target_language}'
+                    f'.{body.format_name}"'
+                )
+            },
+        )
+
+    # --- Versiones de clip (Fase 3, ítem 6) --------------------------------
+    # Cada render del editor y cada exportación del Studio archivan el
+    # archivo vigente antes de sustituirlo; aquí se listan y restauran.
+
+    def _clip_version_paths(
+        project_id: str, clip_id: str
+    ) -> tuple[dict, dict, Path, Path]:
+        project, clip = editable_project_clip(project_id, clip_id)
+        project_dir = app_settings.data_dir / "projects" / project_id
+        clips_dir = project_dir / "clips"
+        return project, clip, project_dir, clips_dir
+
+    @application.get("/api/projects/{project_id}/clips/{clip_id}/versions")
+    def list_clip_versions(project_id: str, clip_id: str) -> dict:
+        _, _, project_dir, _ = _clip_version_paths(project_id, clip_id)
+        return {
+            "versions": clip_versions.list_versions(project_dir, clip_id),
+        }
+
+    @application.post(
+        "/api/projects/{project_id}/clips/{clip_id}/versions/{version}/restore"
+    )
+    def restore_clip_version(
+        project_id: str, clip_id: str, version: int
+    ) -> dict:
+        project, clip, project_dir, clips_dir = _clip_version_paths(
+            project_id, clip_id
+        )
+        filename = Path(str(clip.get("filename", ""))).name
+        if not filename or not filename.lower().endswith(".mp4"):
+            raise HTTPException(
+                status_code=409,
+                detail="El archivo guardado del clip no es válido.",
+            )
+        try:
+            clip_versions.restore_version(
+                project_dir, clips_dir, clip_id, filename, version
+            )
+        except FileNotFoundError as error:
+            raise HTTPException(
+                status_code=404, detail="No existe esa versión del clip."
+            ) from error
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"No se pudo restaurar la versión: {error}",
+            ) from error
+        # La versión restaurada puede tener otra duración o resolución:
+        # se vuelve a sondear el archivo vigente (best-effort).
+        target = clips_dir / filename
+        try:
+            ffprobe_path = shutil.which("ffprobe")
+            if ffprobe_path is not None:
+                metadata = probe_media(target, ffprobe_path)
+                clips = list(project.get("clips") or [])
+                for index, current in enumerate(clips):
+                    if current.get("id") == clip_id:
+                        clips[index] = {
+                            **current,
+                            "duration": metadata["duration"],
+                            "width": metadata["width"],
+                            "height": metadata["height"],
+                        }
+                        break
+                database.update_project(
+                    app_settings.database_path, project_id, clips=clips
+                )
+        except (MediaProcessingError, OSError, KeyError) as error:
+            logger.warning(
+                "No se pudo sondear el clip restaurado (%s).", error
+            )
+        return {
+            "clip_id": clip_id,
+            "restored_version": version,
+            "versions": clip_versions.list_versions(project_dir, clip_id),
+        }
+
+    @application.get(
+        "/api/projects/{project_id}/clips/{clip_id}/versions/{version}/file"
+    )
+    def download_clip_version(
+        project_id: str, clip_id: str, version: int
+    ) -> FileResponse:
+        _, _, project_dir, _ = _clip_version_paths(project_id, clip_id)
+        path = clip_versions.versions_dir(project_dir, clip_id) / f"v{version}.mp4"
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404, detail="No existe esa versión del clip."
+            )
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            filename=f"{clip_id}-v{version}.mp4",
+        )
+
     def clip_file(project_id: str, clip_id: str) -> Path:
         project = database.get_project(app_settings.database_path, project_id)
         if project is None:
@@ -2479,11 +2999,21 @@ def create_app(
                 status_code=422,
                 detail=f"Faltan credenciales en .env: {', '.join(missing)}.",
             )
-        if not database.get_connected_account(
-            app_settings.database_path,
-            request.platform,
-            project["owner_id"],
-        ):
+        account = (
+            database.get_account_by_id(
+                app_settings.database_path,
+                request.platform,
+                request.account_id,
+                project["owner_id"],
+            )
+            if request.account_id
+            else database.get_connected_account(
+                app_settings.database_path,
+                request.platform,
+                project["owner_id"],
+            )
+        )
+        if account is None:
             raise HTTPException(
                 status_code=409,
                 detail=f"Conecta una cuenta de {request.platform} desde Ajustes antes de publicar.",
@@ -2506,6 +3036,7 @@ def create_app(
             request.platform,
             scheduled_at,
             request.visibility,
+            account_id=request.account_id,
         )
         return {
             "published": [],
@@ -2847,6 +3378,54 @@ def create_app(
         words = project_transcript_words(project.get("transcript"), start, end)
         return {"cues": words_to_cues(words)}
 
+    @application.get("/api/projects/{project_id}/waveform")
+    def project_waveform(
+        project_id: str,
+        start: float = Query(0.0, ge=0),
+        end: float | None = Query(None),
+        buckets: int = Query(1200, ge=10, le=4000),
+    ) -> dict:
+        """Picos de la forma de onda del video fuente (Fase 3, ítem 4b).
+
+        El navegador dibuja las barras en la línea de tiempo del Studio
+        sin decodificar el audio de un video largo. Los picos están
+        normalizados a 0–1 por el máximo del rango.
+        """
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        source = app_settings.data_dir / "projects" / project_id / "source"
+        if not source.is_file():
+            raise HTTPException(
+                status_code=404, detail="No se encontró el video original."
+            )
+        duration = project_duration(project)
+        resolved_end = end if end is not None else duration
+        if resolved_end is None or resolved_end <= start:
+            raise HTTPException(
+                status_code=400,
+                detail="El rango no es válido: el fin debe ser posterior al inicio.",
+            )
+        if duration is not None and resolved_end > duration:
+            raise HTTPException(
+                status_code=400,
+                detail="El fin del rango supera la duración del video.",
+            )
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            raise HTTPException(
+                status_code=503, detail="FFmpeg no está disponible."
+            )
+        peaks = waveform.compute_waveform_peaks(
+            source, start, resolved_end - start, ffmpeg_path, buckets=buckets
+        )
+        return {
+            "start": start,
+            "end": resolved_end,
+            "buckets": buckets,
+            "peaks": peaks,
+        }
+
     @application.get(
         "/api/projects/{project_id}/face-track",
         response_model=FaceTrackResponse,
@@ -3080,6 +3659,25 @@ def create_app(
                     target_file.write(chunk)
             if written == 0:
                 raise HTTPException(status_code=400, detail="El archivo de video está vacío.")
+            if existing_clip is not None:
+                # Versiones (Fase 3, ítem 6): el archivo vigente se
+                # archiva antes de sustituirlo. Si el archivado falla,
+                # no se sobrescribe nada (mejor fallar que perderlo).
+                try:
+                    clip_versions.archive_version(
+                        app_settings.data_dir / "projects" / project_id,
+                        clips_dir,
+                        str(clip_id),
+                        filename,
+                    )
+                except OSError as error:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "No se pudo archivar la versión anterior del "
+                            f"clip: {error}"
+                        ),
+                    ) from error
             temp_path.replace(target)
         finally:
             temp_path.unlink(missing_ok=True)
@@ -3136,6 +3734,1006 @@ def create_app(
         database.update_project(app_settings.database_path, project_id, clips=clips)
         response.status_code = 201 if created else 200
         return _serialize_clip(project_id, clip)
+
+    # ------------------------------------------------------------------
+    # Publicación y flujo (Fase 3, ítems 9–15)
+    # ------------------------------------------------------------------
+
+    async def _enqueue_created_project(project_id: str) -> None:
+        """Encola un proyecto ya creado (lote, duplicado, carpeta).
+
+        Usa el mismo camino que el worker de fondo cuando el lifespan ya
+        arrancó; si la app se construyó sin lifespan (tests de endpoints
+        sin contexto), usa la cola directamente si existe.
+        """
+        submit_background = getattr(
+            application.state, "submit_background_project", None
+        )
+        if submit_background is not None:
+            await submit_background(project_id)
+            return
+        processing_queue: ProjectProcessingQueue | None = getattr(
+            application.state, "processing_queue", None
+        )
+        if processing_queue is None:
+            raise RuntimeError("La cola de procesamiento no está disponible.")
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise RuntimeError(f"No se encontró el proyecto {project_id}.")
+        if not database.queue_project(
+            app_settings.database_path,
+            project_id,
+            project["config"],
+        ):
+            raise RuntimeError(f"El proyecto {project_id} ya se está procesando.")
+        await processing_queue.submit(project_id, None)
+
+    @application.get("/api/publish/best-times")
+    def publish_best_times(platform: str | None = None) -> dict[str, Any]:
+        """Guía de mejor hora por plataforma (orientativa, no datos de
+        audiencia) + próximas franjas sugeridas."""
+        if platform is not None and platform not in publish_guide.BEST_TIMES_GUIDE:
+            raise HTTPException(status_code=404, detail="No se reconoce esa plataforma.")
+        guide = publish_guide.best_time_suggestions(platform) if platform else {
+            "platforms": publish_guide.BEST_TIMES_GUIDE,
+            "note": publish_guide.BEST_TIMES_NOTE,
+        }
+        slots = (
+            {platform: publish_guide.next_best_slots(platform)}
+            if platform
+            else {
+                name: publish_guide.next_best_slots(name)
+                for name in publish_guide.BEST_TIMES_GUIDE
+            }
+        )
+        return {**guide, "next_slots": slots}
+
+    @application.get("/api/integrations/accounts")
+    def list_publish_accounts(request: Request) -> dict[str, list[dict[str, Any]]]:
+        return list_account_summaries(
+            app_settings.database_path,
+            request_user_id(request),
+        )
+
+    @application.post("/api/integrations/{provider}/accounts/{account_id}/set-default")
+    def set_default_publish_account(
+        provider: str,
+        account_id: str,
+        request: Request,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if provider not in {"youtube", "tiktok", "instagram"}:
+            raise HTTPException(status_code=404, detail="No se reconoce esa integración.")
+        if not database.set_default_account(
+            app_settings.database_path,
+            provider,
+            account_id,
+            request_user_id(request),
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="No se encontró esa cuenta o ya es la predeterminada.",
+            )
+        return list_publish_accounts(request)
+
+    @application.delete(
+        "/api/integrations/{provider}/accounts/{account_id}",
+        status_code=204,
+    )
+    def delete_publish_account(
+        provider: str,
+        account_id: str,
+        request: Request,
+    ) -> Response:
+        if provider not in {"youtube", "tiktok", "instagram", "zoom"}:
+            raise HTTPException(status_code=404, detail="No se reconoce esa integración.")
+        if not database.delete_account_by_id(
+            app_settings.database_path,
+            provider,
+            account_id,
+            request_user_id(request),
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró esa cuenta.")
+        return Response(status_code=204)
+
+    @application.post("/api/projects/{project_id}/cross-publish", status_code=201)
+    def cross_publish_project_clips(
+        project_id: str,
+        request: CrossPublishRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        """Publicación cruzada (ítem 10): los mismos clips a varias
+        plataformas y cuentas a la vez. Crea un job por destino, todos
+        con el mismo group_id. Sin scheduled_at, el destino se publica
+        cuanto antes."""
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] != "completed":
+            raise HTTPException(status_code=409, detail="El proyecto aún no tiene clips listos para publicar.")
+        clips_by_id = {clip["id"]: clip for clip in project.get("clips") or []}
+        if any(clip_id not in clips_by_id for clip_id in request.clip_ids):
+            raise HTTPException(status_code=404, detail="Uno o más clips seleccionados no existen.")
+        if any(clips_by_id[clip_id].get("status") == "failed" for clip_id in request.clip_ids):
+            raise HTTPException(
+                status_code=422,
+                detail="No se pueden publicar clips cuyo renderizado falló.",
+            )
+        for clip_id in request.clip_ids:
+            clip_file(project_id, clip_id)
+        owner_id = str(project["owner_id"])
+        for target in request.targets:
+            missing = provider_missing_credentials(target.platform, app_settings)
+            if missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Faltan credenciales en .env para {target.platform}: {', '.join(missing)}.",
+                )
+            account = (
+                database.get_account_by_id(
+                    app_settings.database_path,
+                    target.platform,
+                    target.account_id,
+                    owner_id,
+                )
+                if target.account_id
+                else database.get_connected_account(
+                    app_settings.database_path,
+                    target.platform,
+                    owner_id,
+                )
+            )
+            if account is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Conecta una cuenta de {target.platform} desde Ajustes antes de publicar.",
+                )
+            if (
+                target.scheduled_at is not None
+                and target.scheduled_at < datetime.now(UTC) - timedelta(minutes=1)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"La fecha programada para {target.platform} ya pasó.",
+                )
+        group_id = str(uuid.uuid4())
+        jobs: list[dict[str, Any]] = []
+        # La unicidad (proyecto, clip, plataforma, hora) impide dos jobs
+        # idénticos: dos cuentas de la misma plataforma a la misma hora
+        # se escalonan 1 s (mismo minuto, distinto segundo).
+        used_slots: set[tuple[str, str]] = set()
+        for target in request.targets:
+            scheduled_at = (
+                target.scheduled_at.isoformat()
+                if target.scheduled_at is not None
+                else database.utc_now()
+            )
+            base = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            while (target.platform, scheduled_at) in used_slots:
+                base += timedelta(seconds=1)
+                scheduled_at = base.isoformat()
+            used_slots.add((target.platform, scheduled_at))
+            created = database.enqueue_schedule_jobs(
+                app_settings.database_path,
+                project_id,
+                request.clip_ids,
+                target.platform,
+                scheduled_at,
+                target.visibility,
+                account_id=target.account_id,
+                group_id=group_id,
+            )
+            jobs.extend(
+                serialize_schedule_job(job)
+                for job in created
+                if job["clip_id"] in request.clip_ids
+            )
+        return {"group_id": group_id, "jobs": jobs}
+
+    # Ruta fuera de /api/scheduled-jobs/*: el middleware de autenticación
+    # trata el tercer segmento de esa ruta como un job_id y devolvería
+    # 404 para "groups".
+    @application.get("/api/schedule-groups/{group_id}")
+    def scheduled_jobs_group(group_id: str, request: Request) -> list[dict]:
+        return [
+            serialize_schedule_job(job)
+            for job in database.list_schedule_jobs_by_group(
+                app_settings.database_path,
+                group_id,
+                request_user_id(request),
+            )
+        ]
+
+    @application.post("/api/scheduled-jobs/{job_id}/reschedule")
+    def reschedule_scheduled_job(
+        job_id: str,
+        payload: RescheduleRequest,
+        request: Request,
+    ) -> dict:
+        job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        if job.get("confirmation_required"):
+            raise HTTPException(
+                status_code=409,
+                detail="Esta publicación vencida está pendiente de confirmación; resuélvela primero.",
+            )
+        if payload.scheduled_at < datetime.now(UTC) - timedelta(minutes=1):
+            raise HTTPException(status_code=422, detail="La fecha programada ya pasó.")
+        if not database.reschedule_schedule_job(
+            app_settings.database_path,
+            job_id,
+            payload.scheduled_at.isoformat(),
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Solo se puede reprogramar una publicación pendiente.",
+            )
+        updated = database.get_schedule_job(app_settings.database_path, job_id)
+        if updated is None:  # pragma: no cover - se borró entre medias
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        return serialize_schedule_job(updated)
+
+    @application.post("/api/scheduled-jobs/{job_id}/retry")
+    def retry_scheduled_job(job_id: str, request: Request) -> dict:
+        job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        if not database.retry_schedule_job(app_settings.database_path, job_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Solo se puede reintentar una publicación fallida.",
+            )
+        updated = database.get_schedule_job(app_settings.database_path, job_id)
+        if updated is None:  # pragma: no cover - se borró entre medias
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        return serialize_schedule_job(updated)
+
+    @application.delete("/api/scheduled-jobs/{job_id}", status_code=204)
+    def cancel_scheduled_job(job_id: str, request: Request) -> Response:
+        job = database.get_schedule_job(
+            app_settings.database_path,
+            job_id,
+            request_user_id(request),
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="No se encontró la publicación.")
+        if not database.cancel_schedule_job(app_settings.database_path, job_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Solo se puede cancelar una publicación pendiente.",
+            )
+        return Response(status_code=204)
+
+    @application.get("/api/queue")
+    def global_processing_queue(request: Request) -> list[dict[str, Any]]:
+        """Vista global de la cola de procesamiento (ítem 11)."""
+        return database.list_processing_jobs(
+            app_settings.database_path,
+            request_user_id(request),
+        )
+
+    @application.post("/api/queue/batch", status_code=201)
+    async def enqueue_batch(
+        payload: BatchEnqueueRequest,
+        background_tasks: BackgroundTasks,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Encola varios videos a la vez (ítem 11): staged listos se
+        convierten en proyecto y se encolan ahora; enlaces se descargan
+        en segundo plano y el worker los convierte al quedar listos."""
+        owner_id = request_user_id(request)
+        config = (
+            payload.config.model_dump(mode="json")
+            if payload.config is not None
+            else ProjectConfig().model_dump(mode="json")
+        )
+        batch_id = str(uuid.uuid4())
+        items: list[dict[str, Any]] = []
+        for staged_id in payload.staged_ids:
+            staged = database.get_staged_media(app_settings.database_path, staged_id)
+            if staged is None:
+                items.append({"staged_id": staged_id, "status": "failed", "error": "No se encontró la importación."})
+                continue
+            if staged.get("owner_id") not in (None, owner_id):
+                items.append({"staged_id": staged_id, "status": "failed", "error": "Esta importación pertenece a otra cuenta."})
+                continue
+            if staged["status"] == "completed" and staged.get("project_id"):
+                items.append({"staged_id": staged_id, "status": "done", "project_id": str(staged["project_id"])})
+                continue
+            if staged["status"] != "ready":
+                items.append({"staged_id": staged_id, "status": "failed", "error": "El archivo aún no está listo para crear el proyecto."})
+                continue
+            try:
+                project_id = await asyncio.to_thread(
+                    watch_folder.create_project_from_ready_staged,
+                    app_settings,
+                    staged_id,
+                )
+            except Exception as error:
+                items.append({"staged_id": staged_id, "status": "failed", "error": str(error)})
+                continue
+            if project_id is None:
+                items.append({"staged_id": staged_id, "status": "failed", "error": "La importación cambió mientras se procesaba el lote."})
+                continue
+            if payload.config is not None:
+                database.update_project(
+                    app_settings.database_path,
+                    project_id,
+                    config=config,
+                )
+            try:
+                await _enqueue_created_project(project_id)
+            except RuntimeError as error:
+                items.append({"staged_id": staged_id, "status": "failed", "project_id": project_id, "error": str(error)})
+                continue
+            items.append({"staged_id": staged_id, "status": "done", "project_id": project_id})
+        (app_settings.data_dir / "staging").mkdir(parents=True, exist_ok=True)
+        for url in payload.urls:
+            try:
+                validated_url = _validate_download_url(url)
+            except HTTPException as error:
+                items.append({"url": url, "status": "failed", "error": str(error.detail)})
+                continue
+            staged_id = str(uuid.uuid4())
+            database.create_staged_media(
+                app_settings.database_path,
+                staged_id,
+                "url",
+                "downloading",
+                "Descarga de enlace",
+                config=config,
+                owner_id=owner_id,
+            )
+            database.create_batch_item(
+                app_settings.database_path,
+                batch_id,
+                owner_id,
+                staged_id=staged_id,
+                url=url,
+                status="downloading",
+            )
+            background_tasks.add_task(
+                _download_staged_media,
+                app_settings,
+                staged_id,
+                validated_url,
+            )
+            items.append({"url": url, "staged_id": staged_id, "status": "downloading"})
+        return {"batch_id": batch_id, "items": items}
+
+    @application.get("/api/queue/batch")
+    def list_batch_items(request: Request) -> list[dict[str, Any]]:
+        return database.list_batch_items(
+            app_settings.database_path,
+            request_user_id(request),
+        )
+
+    @application.get("/api/watch-folders")
+    def list_watch_folders(request: Request) -> list[dict[str, Any]]:
+        return database.list_watch_folders(
+            app_settings.database_path,
+            request_user_id(request),
+        )
+
+    @application.post("/api/watch-folders", status_code=201)
+    def create_watch_folder(
+        payload: WatchFolderRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        folder_path = Path(payload.path).expanduser()
+        if not folder_path.is_dir():
+            raise HTTPException(
+                status_code=422,
+                detail="La carpeta observada no existe o no es una carpeta.",
+            )
+        config = (
+            payload.config.model_dump(mode="json")
+            if payload.config is not None
+            else ProjectConfig().model_dump(mode="json")
+        )
+        try:
+            return database.create_watch_folder(
+                app_settings.database_path,
+                request_user_id(request),
+                str(folder_path),
+                enabled=payload.enabled,
+                config=config,
+                poll_seconds=payload.poll_seconds,
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="Esa carpeta ya está observada.",
+            ) from error
+
+    @application.put("/api/watch-folders/{folder_id}")
+    def update_watch_folder(
+        folder_id: str,
+        payload: WatchFolderUpdateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        folder = database.get_watch_folder(
+            app_settings.database_path,
+            folder_id,
+            owner_id,
+        )
+        if folder is None:
+            raise HTTPException(status_code=404, detail="No se encontró la carpeta observada.")
+        updates: dict[str, Any] = {}
+        if payload.enabled is not None:
+            updates["enabled"] = payload.enabled
+        if payload.config is not None:
+            updates["config"] = payload.config.model_dump(mode="json")
+        if payload.poll_seconds is not None:
+            updates["poll_seconds"] = payload.poll_seconds
+        if updates:
+            database.update_watch_folder(
+                app_settings.database_path,
+                folder_id,
+                owner_id,
+                **updates,
+            )
+        updated = database.get_watch_folder(
+            app_settings.database_path,
+            folder_id,
+            owner_id,
+        )
+        assert updated is not None
+        return updated
+
+    @application.delete("/api/watch-folders/{folder_id}", status_code=204)
+    def delete_watch_folder(folder_id: str, request: Request) -> Response:
+        if not database.delete_watch_folder(
+            app_settings.database_path,
+            folder_id,
+            request_user_id(request),
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró la carpeta observada.")
+        return Response(status_code=204)
+
+    @application.post("/api/watch-folders/{folder_id}/scan")
+    async def scan_watch_folder_now(folder_id: str, request: Request) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        folder = database.get_watch_folder(
+            app_settings.database_path,
+            folder_id,
+            owner_id,
+        )
+        if folder is None:
+            raise HTTPException(status_code=404, detail="No se encontró la carpeta observada.")
+        created = await watch_folder.scan_folder_once(
+            app_settings,
+            folder,
+            _enqueue_created_project,
+        )
+        return {"scanned": True, "created": created}
+
+    @application.get("/api/preferences/night-window")
+    def get_night_window_preference() -> dict[str, Any]:
+        return watch_folder.get_night_window(app_settings.database_path)
+
+    @application.put("/api/preferences/night-window")
+    def set_night_window_preference(payload: NightWindowRequest) -> dict[str, Any]:
+        try:
+            publish_guide.parse_hhmm(payload.start)
+            publish_guide.parse_hhmm(payload.end)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return watch_folder.set_night_window(
+            app_settings.database_path,
+            enabled=payload.enabled,
+            start=payload.start,
+            end=payload.end,
+        )
+
+    @application.post("/api/projects/{project_id}/generate-captions")
+    def generate_captions(
+        project_id: str,
+        payload: CaptionGenerateRequest,
+    ) -> dict[str, Any]:
+        """Genera 3 variantes de título, descripción y hashtags por clip
+        (ítem 12). Requiere LLM: sin clave configurada responde 409."""
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Espera a que termine el procesamiento antes de generar títulos.",
+            )
+        clips = [
+            clip
+            for clip in project.get("clips") or []
+            if isinstance(clip, dict) and clip.get("status") != "failed"
+        ]
+        if payload.clip_ids is not None:
+            wanted = set(payload.clip_ids)
+            clips = [clip for clip in clips if str(clip.get("id")) in wanted]
+            if len(clips) != len(wanted):
+                raise HTTPException(status_code=404, detail="Uno o más clips seleccionados no existen.")
+        if not clips:
+            raise HTTPException(
+                status_code=409,
+                detail="Este proyecto no tiene clips listos para generar títulos.",
+            )
+        try:
+            llm = _resolve_llm_for_project(project, None, app_settings)
+        except (LLMConfigurationError, CredentialStoreError, ValidationError) as error:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Generar títulos necesita IA: configura una clave en "
+                    "Ajustes (Groq es gratis) para usarlo."
+                ),
+            ) from error
+        try:
+            variants = captions.generate_caption_variants(llm, clips)
+        except LLMResponseError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        metadata = dict(project.get("metadata") or {})
+        stored = dict(metadata.get("caption_variants") or {})
+        stored.update(variants)
+        metadata["caption_variants"] = stored
+        database.update_project(
+            app_settings.database_path,
+            project_id,
+            metadata=metadata,
+        )
+        return {"variants": variants}
+
+    @application.put("/api/projects/{project_id}/clips/{clip_id}/caption")
+    def apply_clip_caption(
+        project_id: str,
+        clip_id: str,
+        payload: CaptionApplyRequest,
+    ) -> dict[str, Any]:
+        """Guarda la edición del usuario (título/descripción/hashtags
+        elegidos) en el clip antes de publicar."""
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        clips = list(project.get("clips") or [])
+        index = next(
+            (
+                position
+                for position, clip in enumerate(clips)
+                if isinstance(clip, dict) and str(clip.get("id")) == clip_id
+            ),
+            None,
+        )
+        if index is None:
+            raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        clips[index] = captions.apply_caption_to_clip(
+            clips[index],
+            title=payload.title,
+            description=payload.description,
+            hashtags=payload.hashtags,
+        )
+        database.update_project(
+            app_settings.database_path,
+            project_id,
+            clips=clips,
+        )
+        return _serialize_clip(project_id, clips[index])
+
+    @application.get("/api/broll")
+    def list_broll_library(
+        request: Request,
+        q: str | None = None,
+        favorites: bool = False,
+    ) -> list[dict[str, Any]]:
+        return database.list_broll_items(
+            app_settings.database_path,
+            request_user_id(request),
+            query=q,
+            favorites_only=favorites,
+        )
+
+    @application.post("/api/broll/search")
+    def search_broll_provider(payload: BrollSearchRequest) -> dict[str, Any]:
+        try:
+            results = search_broll_videos(
+                app_settings,
+                payload.provider,
+                payload.query,
+                per_page=payload.per_page,
+            )
+        except IntegrationError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"provider": payload.provider, "results": results}
+
+    @application.post("/api/broll/import", status_code=201)
+    def import_broll_item(
+        payload: BrollImportRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Descarga un resultado del proveedor a la biblioteca local."""
+        parsed = urlparse(payload.download_url)
+        allowed_hosts = {
+            "pexels": ("pexels.com",),
+            "pixabay": ("pixabay.com",),
+        }[payload.provider]
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or not any(
+                parsed.hostname == host or parsed.hostname.endswith(f".{host}")
+                for host in allowed_hosts
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="La URL de descarga no pertenece al proveedor indicado.",
+            )
+        owner_id = request_user_id(request)
+        broll_dir = app_settings.data_dir / "broll"
+        broll_dir.mkdir(parents=True, exist_ok=True)
+        item_id = str(uuid.uuid4())
+        target_path = broll_dir / f"{item_id}.mp4"
+        written = 0
+        try:
+            with (
+                httpx.Client(
+                    timeout=httpx.Timeout(30, read=300), follow_redirects=True
+                ) as client,
+                client.stream("GET", payload.download_url) as response,
+            ):
+                if response.is_error:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"El proveedor no pudo entregar el video (HTTP {response.status_code}).",
+                    )
+                with target_path.open("wb") as target:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        written += len(chunk)
+                        if written > 250 * 1024 * 1024:
+                            raise HTTPException(
+                                status_code=422,
+                                detail="El B-roll supera el límite local de 250 MB.",
+                            )
+                        target.write(chunk)
+        except HTTPException:
+            target_path.unlink(missing_ok=True)
+            raise
+        except httpx.RequestError as error:
+            target_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=502,
+                detail=f"No se pudo descargar el B-roll desde {payload.provider.title()}.",
+            ) from error
+        if written == 0:
+            target_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=502,
+                detail="El proveedor devolvió un archivo vacío.",
+            )
+        item = database.create_broll_item(
+            app_settings.database_path,
+            owner_id,
+            title=payload.title,
+            query=payload.query,
+            provider=payload.provider.title(),
+            external_id=payload.external_id or None,
+            creator=payload.creator,
+            attribution_url=payload.attribution_url,
+            preview_url=payload.preview_url,
+            local_path=str(target_path),
+            duration=payload.duration,
+            width=payload.width,
+            height=payload.height,
+        )
+        return item
+
+    @application.put("/api/broll/{item_id}")
+    def update_broll_library_item(
+        item_id: str,
+        payload: BrollUpdateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        item = database.get_broll_item(
+            app_settings.database_path,
+            item_id,
+            owner_id,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="No se encontró ese B-roll.")
+        updates: dict[str, Any] = {}
+        if payload.title is not None:
+            updates["title"] = payload.title
+        if payload.favorite is not None:
+            updates["favorite"] = payload.favorite
+        if updates:
+            database.update_broll_item(
+                app_settings.database_path,
+                item_id,
+                owner_id,
+                **updates,
+            )
+        updated = database.get_broll_item(
+            app_settings.database_path,
+            item_id,
+            owner_id,
+        )
+        assert updated is not None
+        return updated
+
+    @application.delete("/api/broll/{item_id}", status_code=204)
+    def delete_broll_library_item(item_id: str, request: Request) -> Response:
+        owner_id = request_user_id(request)
+        item = database.get_broll_item(
+            app_settings.database_path,
+            item_id,
+            owner_id,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="No se encontró ese B-roll.")
+        database.delete_broll_item(app_settings.database_path, item_id, owner_id)
+        local_path = item.get("local_path")
+        if local_path:
+            try:
+                Path(str(local_path)).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return Response(status_code=204)
+
+    @application.get("/api/broll/{item_id}/file")
+    def stream_broll_file(item_id: str, request: Request) -> FileResponse:
+        item = database.get_broll_item(
+            app_settings.database_path,
+            item_id,
+            request_user_id(request),
+        )
+        if item is None or not item.get("local_path"):
+            raise HTTPException(status_code=404, detail="No hay un archivo local para este B-roll.")
+        broll_root = (app_settings.data_dir / "broll").resolve()
+        file_path = Path(str(item["local_path"])).resolve()
+        if not file_path.is_relative_to(broll_root) or not file_path.is_file():
+            raise HTTPException(status_code=404, detail="El archivo de B-roll ya no está disponible.")
+        return FileResponse(file_path, media_type="video/mp4", filename=f"{item_id}.mp4")
+
+    @application.get("/api/projects/{project_id}/broll")
+    def list_project_broll(
+        project_id: str,
+        request: Request,
+        clip_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not database.project_exists(app_settings.database_path, project_id):
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        return database.list_broll_segments(
+            app_settings.database_path,
+            project_id,
+            clip_id,
+            request_user_id(request),
+        )
+
+    @application.post("/api/broll/assign", status_code=201)
+    def assign_broll_to_clip(
+        payload: BrollAssignRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        item = database.get_broll_item(
+            app_settings.database_path,
+            payload.broll_id,
+            owner_id,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="No se encontró ese B-roll.")
+        project = database.get_project(app_settings.database_path, payload.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if not any(
+            isinstance(clip, dict) and str(clip.get("id")) == payload.clip_id
+            for clip in project.get("clips") or []
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        return database.assign_broll_segment(
+            app_settings.database_path,
+            owner_id,
+            broll_id=payload.broll_id,
+            project_id=payload.project_id,
+            clip_id=payload.clip_id,
+            start=payload.start,
+            end=payload.end,
+            label=payload.label,
+        )
+
+    @application.delete("/api/broll/segments/{segment_id}", status_code=204)
+    def delete_broll_assignment(segment_id: str, request: Request) -> Response:
+        if not database.delete_broll_segment(
+            app_settings.database_path,
+            segment_id,
+            request_user_id(request),
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró esa asignación de B-roll.")
+        return Response(status_code=204)
+
+    @application.get("/api/saved-moments")
+    def list_saved_moments_endpoint(
+        request: Request,
+        q: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return database.list_saved_moments(
+            app_settings.database_path,
+            request_user_id(request),
+            query=q,
+        )
+
+    @application.post("/api/saved-moments", status_code=201)
+    def create_saved_moment_endpoint(
+        payload: SavedMomentRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        if payload.project_id is not None:
+            project = database.get_project(app_settings.database_path, payload.project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+            if payload.clip_id is not None and not any(
+                isinstance(clip, dict) and str(clip.get("id")) == payload.clip_id
+                for clip in project.get("clips") or []
+            ):
+                raise HTTPException(status_code=404, detail="No se encontró el clip.")
+        return database.create_saved_moment(
+            app_settings.database_path,
+            owner_id,
+            title=payload.title,
+            description=payload.description,
+            project_id=payload.project_id,
+            clip_id=payload.clip_id,
+            start=payload.start,
+            end=payload.end,
+            excerpt=payload.excerpt,
+            tags=payload.tags,
+        )
+
+    @application.put("/api/saved-moments/{moment_id}")
+    def update_saved_moment_endpoint(
+        moment_id: str,
+        payload: SavedMomentUpdateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        owner_id = request_user_id(request)
+        moment = database.get_saved_moment(
+            app_settings.database_path,
+            moment_id,
+            owner_id,
+        )
+        if moment is None:
+            raise HTTPException(status_code=404, detail="No se encontró ese momento guardado.")
+        updates: dict[str, Any] = {}
+        if payload.title is not None:
+            updates["title"] = payload.title
+        if payload.description is not None:
+            updates["description"] = payload.description
+        if payload.excerpt is not None:
+            updates["excerpt"] = payload.excerpt
+        if payload.tags is not None:
+            updates["tags"] = payload.tags
+        if updates:
+            database.update_saved_moment(
+                app_settings.database_path,
+                moment_id,
+                owner_id,
+                **updates,
+            )
+        updated = database.get_saved_moment(
+            app_settings.database_path,
+            moment_id,
+            owner_id,
+        )
+        assert updated is not None
+        return updated
+
+    @application.delete("/api/saved-moments/{moment_id}", status_code=204)
+    def delete_saved_moment_endpoint(moment_id: str, request: Request) -> Response:
+        if not database.delete_saved_moment(
+            app_settings.database_path,
+            moment_id,
+            request_user_id(request),
+        ):
+            raise HTTPException(status_code=404, detail="No se encontró ese momento guardado.")
+        return Response(status_code=204)
+
+    @application.post("/api/saved-moments/{moment_id}/apply")
+    def apply_saved_moment_endpoint(
+        moment_id: str,
+        payload: ApplySavedMomentRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Aplica un momento guardado a otro proyecto: su tema pasa a ser
+        el "momento solicitado" de la detección en ese proyecto."""
+        owner_id = request_user_id(request)
+        moment = database.get_saved_moment(
+            app_settings.database_path,
+            moment_id,
+            owner_id,
+        )
+        if moment is None:
+            raise HTTPException(status_code=404, detail="No se encontró ese momento guardado.")
+        project = database.get_project(app_settings.database_path, payload.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        if project["status"] in {"processing", "queued"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Espera a que termine el procesamiento antes de aplicar el momento.",
+            )
+        config = dict(project.get("config") or {})
+        topic = moment["title"]
+        if moment.get("description"):
+            topic = f"{topic}: {moment['description']}"
+        config["moment"] = topic[:500]
+        try:
+            validated = ProjectConfig.model_validate(config)
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail=f"La configuración del proyecto no admite este momento: {error}",
+            ) from error
+        database.update_project(
+            app_settings.database_path,
+            payload.project_id,
+            config=validated.model_dump(mode="json"),
+        )
+        refreshed = database.get_project(app_settings.database_path, payload.project_id)
+        assert refreshed is not None
+        return _serialize_project(refreshed)
+
+    @application.post("/api/projects/{project_id}/duplicate", status_code=201)
+    async def duplicate_project_endpoint(
+        project_id: str,
+        payload: DuplicateProjectRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Duplica un proyecto sin volver a subir el video (ítem 15) y,
+        opcionalmente, lo reprocesa con otra configuración."""
+        project = database.get_project(app_settings.database_path, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="No se encontró el proyecto.")
+        try:
+            new_id = project_clone.duplicate_project(
+                app_settings,
+                project,
+                owner_id=request_user_id(request),
+                title=payload.title,
+                ratio=payload.ratio,
+                duration=payload.duration,
+                subtitle_template=payload.subtitle_template,
+            )
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if payload.process:
+            try:
+                await _enqueue_created_project(new_id)
+            except RuntimeError as error:
+                database.update_project(
+                    app_settings.database_path,
+                    new_id,
+                    status="failed",
+                    step="failed",
+                    error="La cola de procesamiento se cerró antes de aceptar el trabajo.",
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="El duplicado se creó pero la cola no está disponible. Inténtalo de nuevo.",
+                ) from error
+        duplicated = database.get_project(app_settings.database_path, new_id)
+        if duplicated is None:  # pragma: no cover - se borró entre medias
+            raise HTTPException(status_code=404, detail="No se encontró el duplicado.")
+        return _serialize_project(duplicated)
 
     if web_dir is not None:
         application.mount("/", SPAStaticFiles(directory=web_dir, html=True), name="frontend")

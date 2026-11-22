@@ -41,6 +41,11 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
     silence: false,
     censor: false,
     face_tracking: true,
+    // Fase 3: muletillas, punch-in, split dinámico y marca.
+    remove_fillers: false,
+    punch_in: false,
+    dynamic_split: false,
+    brand: false,
   });
   const [moment, setMoment] = useState('');
   const [schedule, setSchedule] = useState(false);
@@ -218,6 +223,10 @@ export function useProjectConfig({ apiBase, authReady, userId, notify, setLinkPr
       silence: false,
       censor: false,
       face_tracking: true,
+      remove_fillers: false,
+      punch_in: false,
+      dynamic_split: false,
+      brand: false,
       ...loaded.config.options,
     });
     setMoment(loaded.config.moment);

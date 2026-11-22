@@ -148,6 +148,15 @@ def initialize(database_path: Path) -> None:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (owner_id, name)
             );
+            CREATE TABLE IF NOT EXISTS brand_kits (
+                owner_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                primary_color TEXT NOT NULL DEFAULT '#ffffff',
+                accent_color TEXT NOT NULL DEFAULT '#facc15',
+                font_family TEXT,
+                logo_filename TEXT,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS clip_shares (
                 token TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -245,6 +254,130 @@ def initialize(database_path: Path) -> None:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS processing_jobs_active_project
                 ON processing_jobs(project_id) WHERE status IN ('pending', 'running');
+            -- Cuentas adicionales por proveedor (Fase 3, ítem 10): la tabla
+            -- connected_accounts solo admite una cuenta por proveedor (PK
+            -- owner_id, provider) y no se migra su PK; las cuentas extra
+            -- viven aquí con la misma forma. La cuenta de
+            -- connected_accounts es la predeterminada de cada proveedor.
+            CREATE TABLE IF NOT EXISTS connected_accounts_extra (
+                owner_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                expires_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, provider, account_id)
+            );
+            -- Preferencias por usuario (Fase 3, ítem 11): la franja
+            -- nocturna se guarda con owner_id '__device__' porque
+            -- protege el PC compartido, no a un usuario concreto.
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                owner_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, key)
+            );
+            -- Biblioteca de B-roll (Fase 3, ítem 13): caché local de
+            -- videos reutilizables, con favoritos.
+            CREATE TABLE IF NOT EXISTS broll_items (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                query TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT 'local',
+                external_id TEXT,
+                creator TEXT NOT NULL DEFAULT '',
+                attribution_url TEXT NOT NULL DEFAULT '',
+                preview_url TEXT NOT NULL DEFAULT '',
+                local_path TEXT,
+                thumbnail_path TEXT,
+                duration REAL NOT NULL DEFAULT 0,
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                favorite INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS broll_items_owner_created
+                ON broll_items(owner_id, created_at DESC);
+            -- B-roll por frase/segmento (Fase 3, ítem 13): asigna un
+            -- elemento de la biblioteca a un clip (start=end=0) o a un
+            -- segmento concreto de ese clip.
+            CREATE TABLE IF NOT EXISTS broll_segments (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                broll_id TEXT NOT NULL REFERENCES broll_items(id) ON DELETE CASCADE,
+                project_id TEXT NOT NULL,
+                clip_id TEXT NOT NULL,
+                start REAL NOT NULL DEFAULT 0,
+                end REAL NOT NULL DEFAULT 0,
+                label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS broll_segments_clip
+                ON broll_segments(project_id, clip_id);
+            -- Biblioteca de momentos guardados (Fase 3, ítem 14):
+            -- favoritos reutilizables entre proyectos (el título y la
+            -- descripción son el tema; start/end solo aplican al proyecto
+            -- de origen).
+            CREATE TABLE IF NOT EXISTS saved_moments (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                project_id TEXT,
+                clip_id TEXT,
+                start REAL,
+                end REAL,
+                excerpt TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS saved_moments_owner_created
+                ON saved_moments(owner_id, created_at DESC);
+            -- Carpetas observadas (Fase 3, ítem 11): videos nuevos en
+            -- estas carpetas crean un proyecto y se encolan solos.
+            CREATE TABLE IF NOT EXISTS watch_folders (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                poll_seconds INTEGER NOT NULL DEFAULT 300,
+                last_scan_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(owner_id, path)
+            );
+            CREATE TABLE IF NOT EXISTS watch_folder_seen (
+                folder_id TEXT NOT NULL REFERENCES watch_folders(id) ON DELETE CASCADE,
+                file_key TEXT NOT NULL,
+                project_id TEXT,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (folder_id, file_key)
+            );
+            -- Elementos de lote (Fase 3, ítem 11): cada URL de un lote se
+            -- descarga como staged media; el worker la convierte en
+            -- proyecto cuando queda lista.
+            CREATE TABLE IF NOT EXISTS batch_items (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                staged_id TEXT,
+                url TEXT,
+                status TEXT NOT NULL CHECK (status IN ('downloading', 'pending', 'done', 'failed')),
+                project_id TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS batch_items_owner_created
+                ON batch_items(owner_id, created_at DESC);
             """
         )
         # Columnas añadidas en v1.0.11 sin subir la versión de esquema: las
@@ -264,6 +397,24 @@ def initialize(database_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE llm_credentials ADD COLUMN whisper_model TEXT"
             )
+        # Columnas de la Fase 3 (ítems 9–10) en scheduled_jobs, añadidas
+        # de forma idempotente como las de arriba: attempts y
+        # next_attempt_at sostienen el reintento por job con backoff;
+        # account_id, la cuenta concreta de la publicación cruzada; y
+        # group_id agrupa los jobs de una misma publicación cruzada.
+        schedule_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(scheduled_jobs)")
+        }
+        for column, definition in (
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "TEXT"),
+            ("account_id", "TEXT"),
+            ("group_id", "TEXT"),
+        ):
+            if column not in schedule_columns:
+                conn.execute(
+                    f"ALTER TABLE scheduled_jobs ADD COLUMN {column} {definition}"
+                )
         if version < _LATEST_SCHEMA_VERSION:
             # Copia de seguridad ANTES de migrar (B-S8): si una migración
             # corrompe algo, la BD previa está en <data_dir>/backups/.
@@ -604,6 +755,23 @@ def claim_legacy_data(database_path: Path, owner_id: str) -> None:
         ):
             conn.execute(
                 f"UPDATE {table} SET owner_id = ? WHERE owner_id IS NULL OR owner_id = 'legacy'",
+                (owner_id,),
+            )
+        # brand_kits también se reclama: owner_id es la clave primaria,
+        # así que la fila legacy solo se reclama si el usuario aún no
+        # tiene kit propio; si ya tiene, la legacy se descarta.
+        has_kit = conn.execute(
+            "SELECT 1 FROM brand_kits WHERE owner_id = ?", (owner_id,)
+        ).fetchone()
+        if has_kit is not None:
+            conn.execute(
+                "DELETE FROM brand_kits "
+                "WHERE owner_id IS NULL OR owner_id = 'legacy'"
+            )
+        else:
+            conn.execute(
+                "UPDATE brand_kits SET owner_id = ? "
+                "WHERE owner_id IS NULL OR owner_id = 'legacy'",
                 (owner_id,),
             )
         # llm_credentials también se reclama (B20): la clave guardada antes
@@ -1255,6 +1423,96 @@ def resolve_subtitle_template(
     return str(row["base_template"]) if row else name
 
 
+def get_brand_kit(
+    database_path: Path,
+    owner_id: str = "legacy",
+) -> dict[str, Any] | None:
+    """Plantilla de marca del usuario (Fase 3, ítem 5), o None."""
+    with connection(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT name, primary_color, accent_color, font_family, logo_filename
+            FROM brand_kits WHERE owner_id = ?
+            """,
+            (owner_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_brand_kit(
+    database_path: Path,
+    kit: dict[str, Any],
+    owner_id: str = "legacy",
+) -> dict[str, Any]:
+    """Crea o actualiza la plantilla de marca (una por usuario).
+
+    ``logo_filename`` se conserva si el kit entrante no lo trae (el
+    logo se sube por su propio endpoint).
+    """
+    with _lock, connection(database_path) as conn:
+        existing = conn.execute(
+            "SELECT logo_filename FROM brand_kits WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+        logo_filename = kit.get("logo_filename")
+        if logo_filename is None and existing is not None:
+            logo_filename = existing["logo_filename"]
+        conn.execute(
+            """
+            INSERT INTO brand_kits (
+                owner_id, name, primary_color, accent_color,
+                font_family, logo_filename, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id) DO UPDATE SET
+                name = excluded.name,
+                primary_color = excluded.primary_color,
+                accent_color = excluded.accent_color,
+                font_family = excluded.font_family,
+                logo_filename = excluded.logo_filename,
+                updated_at = excluded.updated_at
+            """,
+            (
+                owner_id,
+                str(kit.get("name") or ""),
+                str(kit.get("primary_color") or "#ffffff"),
+                str(kit.get("accent_color") or "#facc15"),
+                kit.get("font_family"),
+                logo_filename,
+                utc_now(),
+            ),
+        )
+    saved = get_brand_kit(database_path, owner_id)
+    assert saved is not None
+    return saved
+
+
+def set_brand_kit_logo(
+    database_path: Path,
+    logo_filename: str | None,
+    owner_id: str = "legacy",
+) -> dict[str, Any] | None:
+    """Actualiza solo el logo de la plantilla de marca (o None)."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            "UPDATE brand_kits SET logo_filename = ?, updated_at = ? "
+            "WHERE owner_id = ?",
+            (logo_filename, utc_now(), owner_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_brand_kit(database_path, owner_id)
+
+
+def delete_brand_kit(database_path: Path, owner_id: str = "legacy") -> bool:
+    """Borra la plantilla de marca del usuario."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM brand_kits WHERE owner_id = ?",
+            (owner_id,),
+        )
+    return cursor.rowcount == 1
+
+
 def get_clip_share(database_path: Path, token: str) -> dict[str, str] | None:
     with connection(database_path) as conn:
         row = conn.execute(
@@ -1538,6 +1796,9 @@ def enqueue_schedule_jobs(
     platform: str,
     scheduled_at: str,
     visibility: str,
+    *,
+    account_id: str | None = None,
+    group_id: str | None = None,
 ) -> list[dict[str, Any]]:
     now = utc_now()
     with _lock, connection(database_path) as conn:
@@ -1546,8 +1807,8 @@ def enqueue_schedule_jobs(
                 """
                 INSERT OR IGNORE INTO scheduled_jobs (
                     id, project_id, clip_id, platform, scheduled_at, status,
-                    visibility, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?)
+                    visibility, account_id, group_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1556,6 +1817,8 @@ def enqueue_schedule_jobs(
                     platform,
                     scheduled_at,
                     visibility,
+                    account_id,
+                    group_id,
                     now,
                     now,
                 ),
@@ -1644,19 +1907,22 @@ def get_schedule_job(
 
 
 def due_schedule_jobs(database_path: Path, now: str) -> list[dict[str, Any]]:
+    # Un job en backoff (next_attempt_at futuro) no está vencido aunque su
+    # scheduled_at ya pasara: el reintento espera a su hora (Fase 3, ítem 9).
     with connection(database_path) as conn:
         rows = conn.execute(
             """
             SELECT scheduled_jobs.*, projects.owner_id FROM scheduled_jobs
             JOIN projects ON projects.id = scheduled_jobs.project_id
             WHERE scheduled_jobs.status = 'scheduled' AND scheduled_jobs.scheduled_at <= ?
+              AND (scheduled_jobs.next_attempt_at IS NULL OR scheduled_jobs.next_attempt_at <= ?)
               AND NOT EXISTS (
                   SELECT 1 FROM schedule_job_confirmations
                   WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
               )
             ORDER BY scheduled_jobs.scheduled_at, scheduled_jobs.created_at
             """,
-            (now,),
+            (now, now),
         ).fetchall()
     return [schedule_job_from_row(row) for row in rows]
 
@@ -1669,8 +1935,9 @@ def hold_overdue_schedule_jobs(database_path: Path, now: str) -> int:
             SELECT id, ?
             FROM scheduled_jobs
             WHERE status = 'scheduled' AND scheduled_at <= ?
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
             """,
-            (now, now),
+            (now, now, now),
         )
     return cursor.rowcount
 
@@ -1738,18 +2005,22 @@ def fail_interrupted_schedule_jobs(database_path: Path) -> int:
 
 
 def claim_schedule_job(database_path: Path, job_id: str) -> bool:
+    # Reclamar cuenta como un intento (Fase 3, ítem 9): attempts sube en
+    # cada toma del job, y el backoff se calcula sobre ese contador.
     with _lock, connection(database_path) as conn:
         cursor = conn.execute(
             """
             UPDATE scheduled_jobs
-            SET status = 'processing', error = NULL, updated_at = ?
+            SET status = 'processing', attempts = attempts + 1,
+                error = NULL, updated_at = ?
             WHERE id = ? AND status = 'scheduled'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
               AND NOT EXISTS (
                   SELECT 1 FROM schedule_job_confirmations
                   WHERE schedule_job_confirmations.job_id = scheduled_jobs.id
               )
             """,
-            (utc_now(), job_id),
+            (utc_now(), job_id, utc_now()),
         )
     return cursor.rowcount == 1
 
@@ -2017,3 +2288,1180 @@ def list_recoverable_processing_jobs(database_path: Path) -> list[dict[str, Any]
         job["retry_failed_only"] = bool(job["retry_failed_only"])
         jobs.append(job)
     return jobs
+
+
+def list_processing_jobs(
+    database_path: Path,
+    owner_id: str | None = None,
+    *,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Vista global de la cola (Fase 3, ítem 11): trabajos con el título
+    y el estado del proyecto, los activos primero."""
+    query = """
+        SELECT processing_jobs.*, projects.title AS project_title,
+               projects.status AS project_status,
+               projects.progress AS project_progress
+        FROM processing_jobs
+        JOIN projects ON projects.id = processing_jobs.project_id
+    """
+    parameters: tuple[Any, ...] = ()
+    if owner_id is not None:
+        query += " WHERE projects.owner_id = ?"
+        parameters = (owner_id,)
+    query += (
+        " ORDER BY CASE processing_jobs.status"
+        " WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,"
+        " processing_jobs.created_at DESC LIMIT ?"
+    )
+    parameters += (limit,)
+    with connection(database_path) as conn:
+        rows = conn.execute(query, parameters).fetchall()
+    jobs = []
+    for row in rows:
+        job = dict(row)
+        job["retry_failed_only"] = bool(job["retry_failed_only"])
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Cuentas conectadas: varias cuentas por plataforma (Fase 3, ítem 10)
+# ---------------------------------------------------------------------------
+# La tabla connected_accounts guarda la cuenta PREDETERMINADA de cada
+# proveedor (PK owner_id, provider). Las demás viven en
+# connected_accounts_extra con los mismos campos y el mismo cifrado de
+# tokens. save_account_document enruta cada documento OAuth al lugar
+# correcto: si la cuenta ya existe en algún lado se actualiza ahí; si es
+# nueva y ya hay una predeterminada distinta, va a extras.
+
+
+def _account_row_to_dict(row: sqlite3.Row, *, is_primary: bool) -> dict[str, Any]:
+    result = dict(row)
+    result["metadata"] = json.loads(result.pop("metadata_json"))
+    result["access_token"] = decrypt_oauth_token(result["access_token"])
+    result["refresh_token"] = decrypt_oauth_token(result["refresh_token"])
+    user_access_token = result["metadata"].get("user_access_token")
+    if user_access_token:
+        result["metadata"]["user_access_token"] = decrypt_oauth_token(
+            user_access_token
+        )
+    result["is_primary"] = is_primary
+    return result
+
+
+def _encrypted_account_values(
+    account_id: str,
+    display_name: str,
+    access_token: str,
+    refresh_token: str | None,
+    expires_at: str | None,
+    metadata: dict[str, Any],
+) -> tuple[Any, ...]:
+    return (
+        account_id,
+        display_name,
+        encrypt_oauth_token(access_token),
+        encrypt_oauth_token(refresh_token) if refresh_token else None,
+        expires_at,
+        json.dumps(
+            {
+                **metadata,
+                **(
+                    {
+                        "user_access_token": encrypt_oauth_token(
+                            str(metadata["user_access_token"])
+                        )
+                    }
+                    if metadata.get("user_access_token")
+                    else {}
+                ),
+            },
+            ensure_ascii=False,
+        ),
+        utc_now(),
+    )
+
+
+def list_connected_accounts(
+    database_path: Path,
+    provider: str,
+    owner_id: str = "legacy",
+) -> list[dict[str, Any]]:
+    """Todas las cuentas de un proveedor: la predeterminada primero."""
+    accounts: list[dict[str, Any]] = []
+    primary = get_connected_account(database_path, provider, owner_id)
+    if primary is not None:
+        primary["is_primary"] = True
+        accounts.append(primary)
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM connected_accounts_extra
+            WHERE owner_id = ? AND provider = ?
+            ORDER BY updated_at, account_id
+            """,
+            (owner_id, provider),
+        ).fetchall()
+    accounts.extend(
+        _account_row_to_dict(row, is_primary=False) for row in rows
+    )
+    return accounts
+
+
+def account_summary(account: dict[str, Any]) -> dict[str, Any]:
+    """Resumen sin tokens para devolver al navegador."""
+    return {
+        "provider": account["provider"],
+        "account_id": account["account_id"],
+        "display_name": account["display_name"],
+        "is_primary": bool(account.get("is_primary")),
+        "expires_at": account.get("expires_at"),
+    }
+
+
+def get_account_by_id(
+    database_path: Path,
+    provider: str,
+    account_id: str,
+    owner_id: str = "legacy",
+) -> dict[str, Any] | None:
+    """Una cuenta concreta (predeterminada o extra), con tokens."""
+    primary = get_connected_account(database_path, provider, owner_id)
+    if primary is not None and str(primary["account_id"]) == account_id:
+        primary["is_primary"] = True
+        return primary
+    with connection(database_path) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM connected_accounts_extra
+            WHERE owner_id = ? AND provider = ? AND account_id = ?
+            """,
+            (owner_id, provider, account_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return _account_row_to_dict(row, is_primary=False)
+
+
+def save_account_document(
+    database_path: Path,
+    provider: str,
+    account_id: str,
+    display_name: str,
+    access_token: str,
+    refresh_token: str | None,
+    expires_at: str | None,
+    metadata: dict[str, Any],
+    owner_id: str = "legacy",
+) -> bool:
+    """Guarda un documento OAuth y devuelve True si quedó como extra.
+
+    Misma cuenta que la predeterminada → actualiza la predeterminada.
+    Cuenta ya guardada como extra → actualiza esa extra. Cuenta nueva con
+    predeterminada distinta ocupando el sitio → se guarda como extra, sin
+    desplazar a la predeterminada (antes, conectar una segunda cuenta
+    borraba la primera en silencio).
+    """
+    with _lock, connection(database_path) as conn:
+        primary = conn.execute(
+            "SELECT account_id FROM connected_accounts WHERE owner_id = ? AND provider = ?",
+            (owner_id, provider),
+        ).fetchone()
+        extra = conn.execute(
+            """
+            SELECT account_id FROM connected_accounts_extra
+            WHERE owner_id = ? AND provider = ? AND account_id = ?
+            """,
+            (owner_id, provider, account_id),
+        ).fetchone()
+        values = _encrypted_account_values(
+            account_id,
+            display_name,
+            access_token,
+            refresh_token,
+            expires_at,
+            metadata,
+        )
+        if extra is not None or (
+            primary is not None and str(primary["account_id"]) != account_id
+        ):
+            conn.execute(
+                """
+                INSERT INTO connected_accounts_extra (
+                    owner_id, provider, account_id, display_name,
+                    access_token, refresh_token, expires_at, metadata_json,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_id, provider, account_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    access_token = excluded.access_token,
+                    refresh_token = excluded.refresh_token,
+                    expires_at = excluded.expires_at,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (owner_id, provider, *values),
+            )
+            return True
+    save_connected_account(
+        database_path,
+        provider,
+        account_id,
+        display_name,
+        access_token,
+        refresh_token,
+        expires_at,
+        metadata,
+        owner_id,
+    )
+    return False
+
+
+def set_default_account(
+    database_path: Path,
+    provider: str,
+    account_id: str,
+    owner_id: str = "legacy",
+) -> bool:
+    """Hace predeterminada una cuenta extra (intercambia con la actual).
+
+    Devuelve False si esa cuenta no existe o ya es la predeterminada.
+    """
+    with _lock, connection(database_path) as conn:
+        extra_row = conn.execute(
+            """
+            SELECT * FROM connected_accounts_extra
+            WHERE owner_id = ? AND provider = ? AND account_id = ?
+            """,
+            (owner_id, provider, account_id),
+        ).fetchone()
+        if extra_row is None:
+            return False
+        primary_row = conn.execute(
+            "SELECT * FROM connected_accounts WHERE owner_id = ? AND provider = ?",
+            (owner_id, provider),
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM connected_accounts_extra WHERE owner_id = ? AND provider = ? AND account_id = ?",
+            (owner_id, provider, account_id),
+        )
+        if primary_row is not None:
+            # La principal degradada conserva su updated_at original: si
+            # luego se borra la nueva predeterminada, la promoción por
+            # antigüedad devuelve a la anterior predeterminada, no a una
+            # extra más reciente (menos sorpresa para el usuario).
+            conn.execute(
+                """
+                INSERT INTO connected_accounts_extra (
+                    owner_id, provider, account_id, display_name,
+                    access_token, refresh_token, expires_at, metadata_json,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    owner_id,
+                    provider,
+                    primary_row["account_id"],
+                    primary_row["display_name"],
+                    primary_row["access_token"],
+                    primary_row["refresh_token"],
+                    primary_row["expires_at"],
+                    primary_row["metadata_json"],
+                    primary_row["updated_at"],
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO connected_accounts (
+                owner_id, provider, account_id, display_name, access_token,
+                refresh_token, expires_at, metadata_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id, provider) DO UPDATE SET
+                account_id = excluded.account_id,
+                display_name = excluded.display_name,
+                access_token = excluded.access_token,
+                refresh_token = excluded.refresh_token,
+                expires_at = excluded.expires_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                owner_id,
+                provider,
+                extra_row["account_id"],
+                extra_row["display_name"],
+                extra_row["access_token"],
+                extra_row["refresh_token"],
+                extra_row["expires_at"],
+                extra_row["metadata_json"],
+                utc_now(),
+            ),
+        )
+    return True
+
+
+def delete_account_by_id(
+    database_path: Path,
+    provider: str,
+    account_id: str,
+    owner_id: str = "legacy",
+) -> bool:
+    """Desconecta una cuenta concreta. Si era la predeterminada y quedan
+    extras, la extra más antigua pasa a ser predeterminada. Devuelve
+    False si esa cuenta no existe."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM connected_accounts_extra
+            WHERE owner_id = ? AND provider = ? AND account_id = ?
+            """,
+            (owner_id, provider, account_id),
+        )
+        if cursor.rowcount == 1:
+            return True
+        primary_row = conn.execute(
+            """
+            SELECT account_id FROM connected_accounts
+            WHERE owner_id = ? AND provider = ? AND account_id = ?
+            """,
+            (owner_id, provider, account_id),
+        ).fetchone()
+        if primary_row is None:
+            return False
+        conn.execute(
+            "DELETE FROM connected_accounts WHERE owner_id = ? AND provider = ?",
+            (owner_id, provider),
+        )
+        promoted = conn.execute(
+            """
+            SELECT * FROM connected_accounts_extra
+            WHERE owner_id = ? AND provider = ?
+            ORDER BY updated_at, account_id LIMIT 1
+            """,
+            (owner_id, provider),
+        ).fetchone()
+        if promoted is not None:
+            conn.execute(
+                "DELETE FROM connected_accounts_extra WHERE owner_id = ? AND provider = ? AND account_id = ?",
+                (owner_id, provider, promoted["account_id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO connected_accounts (
+                    owner_id, provider, account_id, display_name,
+                    access_token, refresh_token, expires_at, metadata_json,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    owner_id,
+                    provider,
+                    promoted["account_id"],
+                    promoted["display_name"],
+                    promoted["access_token"],
+                    promoted["refresh_token"],
+                    promoted["expires_at"],
+                    promoted["metadata_json"],
+                    promoted["updated_at"],
+                ),
+            )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Publicaciones programadas: reintento, reprogramación y grupos (Fase 3,
+# ítems 9–10)
+# ---------------------------------------------------------------------------
+
+
+def requeue_schedule_job_for_retry(
+    database_path: Path,
+    job_id: str,
+    next_attempt_at: str,
+    error: str | None,
+) -> bool:
+    """Devuelve un job en curso a 'scheduled' para reintentarlo a la hora
+    indicada (backoff). Solo desde 'processing'."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE scheduled_jobs
+            SET status = 'scheduled', next_attempt_at = ?, error = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'processing'
+            """,
+            (next_attempt_at, error, utc_now(), job_id),
+        )
+    return cursor.rowcount == 1
+
+
+def reschedule_schedule_job(
+    database_path: Path,
+    job_id: str,
+    scheduled_at: str,
+) -> bool:
+    """Mueve un job pendiente a otra fecha/hora (calendario, drag & drop).
+    Solo jobs 'scheduled'; cancela cualquier backoff pendiente."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE scheduled_jobs
+            SET scheduled_at = ?, next_attempt_at = NULL, error = NULL,
+                updated_at = ?
+            WHERE id = ? AND status = 'scheduled'
+            """,
+            (scheduled_at, utc_now(), job_id),
+        )
+    return cursor.rowcount == 1
+
+
+def cancel_schedule_job(database_path: Path, job_id: str) -> bool:
+    """Cancela un job pendiente (queda 'failed' con el motivo)."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE scheduled_jobs
+            SET status = 'failed',
+                error = 'Publicación cancelada por el usuario.',
+                updated_at = ?
+            WHERE id = ? AND status = 'scheduled'
+            """,
+            (utc_now(), job_id),
+        )
+    return cursor.rowcount == 1
+
+
+def retry_schedule_job(database_path: Path, job_id: str) -> bool:
+    """Reintento manual de un job fallido: vuelve a 'scheduled' para
+    publicarse cuanto antes, con el contador de intentos a cero."""
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE scheduled_jobs
+            SET status = 'scheduled', attempts = 0, next_attempt_at = NULL,
+                scheduled_at = ?, error = NULL, updated_at = ?
+            WHERE id = ? AND status = 'failed'
+            """,
+            (utc_now(), utc_now(), job_id),
+        )
+    return cursor.rowcount == 1
+
+
+def list_schedule_jobs_by_group(
+    database_path: Path,
+    group_id: str,
+    owner_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Jobs de una publicación cruzada (mismo group_id)."""
+    query = f"SELECT {_schedule_job_select()} FROM scheduled_jobs"
+    parameters: tuple[Any, ...] = (group_id,)
+    if owner_id is not None:
+        query += " JOIN projects ON projects.id = scheduled_jobs.project_id"
+    query += " WHERE scheduled_jobs.group_id = ?"
+    if owner_id is not None:
+        query += " AND projects.owner_id = ?"
+        parameters += (owner_id,)
+    query += " ORDER BY scheduled_jobs.platform, scheduled_jobs.created_at"
+    with connection(database_path) as conn:
+        rows = conn.execute(query, parameters).fetchall()
+    return [schedule_job_from_row(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Preferencias por usuario (Fase 3, ítem 11)
+# ---------------------------------------------------------------------------
+
+
+def get_preference(
+    database_path: Path,
+    owner_id: str,
+    key: str,
+    default: Any = None,
+) -> Any:
+    with connection(database_path) as conn:
+        row = conn.execute(
+            "SELECT value_json FROM user_preferences WHERE owner_id = ? AND key = ?",
+            (owner_id, key),
+        ).fetchone()
+    if row is None:
+        return default
+    return json.loads(row["value_json"])
+
+
+def get_preferences(database_path: Path, owner_id: str) -> dict[str, Any]:
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT key, value_json FROM user_preferences WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchall()
+    return {str(row["key"]): json.loads(row["value_json"]) for row in rows}
+
+
+def set_preference(
+    database_path: Path,
+    owner_id: str,
+    key: str,
+    value: Any,
+) -> None:
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_preferences (owner_id, key, value_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(owner_id, key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (owner_id, key, json.dumps(value, ensure_ascii=False), utc_now()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Biblioteca de B-roll (Fase 3, ítem 13)
+# ---------------------------------------------------------------------------
+
+
+def _broll_item_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["favorite"] = bool(item["favorite"])
+    return item
+
+
+def create_broll_item(
+    database_path: Path,
+    owner_id: str,
+    *,
+    title: str,
+    query: str = "",
+    provider: str = "local",
+    external_id: str | None = None,
+    creator: str = "",
+    attribution_url: str = "",
+    preview_url: str = "",
+    local_path: str | None = None,
+    thumbnail_path: str | None = None,
+    duration: float = 0,
+    width: int = 0,
+    height: int = 0,
+) -> dict[str, Any]:
+    item_id = str(uuid.uuid4())
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO broll_items (
+                id, owner_id, title, query, provider, external_id, creator,
+                attribution_url, preview_url, local_path, thumbnail_path,
+                duration, width, height, favorite, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                item_id,
+                owner_id,
+                title[:200],
+                query[:200],
+                provider,
+                external_id,
+                creator[:200],
+                attribution_url,
+                preview_url,
+                local_path,
+                thumbnail_path,
+                duration,
+                width,
+                height,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM broll_items WHERE id = ?", (item_id,)
+        ).fetchone()
+    assert row is not None
+    return _broll_item_from_row(row)
+
+
+def list_broll_items(
+    database_path: Path,
+    owner_id: str,
+    *,
+    query: str | None = None,
+    favorites_only: bool = False,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM broll_items WHERE owner_id = ?"
+    parameters: list[Any] = [owner_id]
+    if favorites_only:
+        sql += " AND favorite = 1"
+    if query and query.strip():
+        sql += " AND (title LIKE ? OR query LIKE ? OR creator LIKE ?)"
+        like = f"%{query.strip()}%"
+        parameters.extend([like, like, like])
+    sql += " ORDER BY favorite DESC, created_at DESC LIMIT ?"
+    parameters.append(limit)
+    with connection(database_path) as conn:
+        rows = conn.execute(sql, parameters).fetchall()
+    return [_broll_item_from_row(row) for row in rows]
+
+
+def get_broll_item(
+    database_path: Path,
+    item_id: str,
+    owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = "SELECT * FROM broll_items WHERE id = ?"
+    parameters: tuple[Any, ...] = (item_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
+    with connection(database_path) as conn:
+        row = conn.execute(query, parameters).fetchone()
+    return _broll_item_from_row(row) if row is not None else None
+
+
+def update_broll_item(
+    database_path: Path,
+    item_id: str,
+    owner_id: str,
+    **values: Any,
+) -> bool:
+    allowed = {"title", "favorite", "local_path", "thumbnail_path"}
+    updates = {key: value for key, value in values.items() if key in allowed}
+    if not updates:
+        return False
+    if "title" in updates:
+        updates["title"] = str(updates["title"])[:200]
+    if "favorite" in updates:
+        updates["favorite"] = 1 if updates["favorite"] else 0
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE broll_items SET {assignments}, updated_at = ? "
+            "WHERE id = ? AND owner_id = ?",
+            (*updates.values(), utc_now(), item_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+def delete_broll_item(database_path: Path, item_id: str, owner_id: str) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM broll_items WHERE id = ? AND owner_id = ?",
+            (item_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+def assign_broll_segment(
+    database_path: Path,
+    owner_id: str,
+    *,
+    broll_id: str,
+    project_id: str,
+    clip_id: str,
+    start: float = 0,
+    end: float = 0,
+    label: str = "",
+) -> dict[str, Any]:
+    segment_id = str(uuid.uuid4())
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO broll_segments (
+                id, owner_id, broll_id, project_id, clip_id, start, end,
+                label, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                segment_id,
+                owner_id,
+                broll_id,
+                project_id,
+                clip_id,
+                start,
+                end,
+                label[:200],
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM broll_segments WHERE id = ?", (segment_id,)
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def list_broll_segments(
+    database_path: Path,
+    project_id: str,
+    clip_id: str | None = None,
+    owner_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = """
+        SELECT broll_segments.*, broll_items.title AS broll_title,
+               broll_items.provider AS broll_provider,
+               broll_items.local_path AS broll_local_path,
+               broll_items.creator AS broll_creator,
+               broll_items.attribution_url AS broll_attribution_url
+        FROM broll_segments
+        JOIN broll_items ON broll_items.id = broll_segments.broll_id
+        WHERE broll_segments.project_id = ?
+    """
+    parameters: list[Any] = [project_id]
+    if clip_id is not None:
+        query += " AND broll_segments.clip_id = ?"
+        parameters.append(clip_id)
+    if owner_id is not None:
+        query += " AND broll_segments.owner_id = ?"
+        parameters.append(owner_id)
+    query += " ORDER BY broll_segments.clip_id, broll_segments.start"
+    with connection(database_path) as conn:
+        rows = conn.execute(query, parameters).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_broll_segment(
+    database_path: Path,
+    segment_id: str,
+    owner_id: str,
+) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM broll_segments WHERE id = ? AND owner_id = ?",
+            (segment_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+def broll_assignment_for_clip(
+    database_path: Path,
+    project_id: str,
+    clip_id: str,
+) -> dict[str, Any] | None:
+    """Primera asignación de B-roll de un clip con archivo local.
+
+    El pipeline la usa al renderizar: un B-roll asignado explícitamente
+    gana a la descarga automática del proveedor.
+    """
+    segments = list_broll_segments(database_path, project_id, clip_id)
+    for segment in segments:
+        local_path = segment.get("broll_local_path")
+        if local_path and Path(str(local_path)).is_file():
+            return segment
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Biblioteca de momentos guardados (Fase 3, ítem 14)
+# ---------------------------------------------------------------------------
+
+
+def _saved_moment_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    moment = dict(row)
+    moment["tags"] = json.loads(moment.pop("tags_json"))
+    return moment
+
+
+def create_saved_moment(
+    database_path: Path,
+    owner_id: str,
+    *,
+    title: str,
+    description: str = "",
+    project_id: str | None = None,
+    clip_id: str | None = None,
+    start: float | None = None,
+    end: float | None = None,
+    excerpt: str = "",
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    moment_id = str(uuid.uuid4())
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO saved_moments (
+                id, owner_id, title, description, project_id, clip_id,
+                start, end, excerpt, tags_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                moment_id,
+                owner_id,
+                title[:200],
+                description[:1000],
+                project_id,
+                clip_id,
+                start,
+                end,
+                excerpt[:2000],
+                json.dumps(
+                    [str(tag)[:50] for tag in (tags or [])][:10],
+                    ensure_ascii=False,
+                ),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM saved_moments WHERE id = ?", (moment_id,)
+        ).fetchone()
+    assert row is not None
+    return _saved_moment_from_row(row)
+
+
+def list_saved_moments(
+    database_path: Path,
+    owner_id: str,
+    *,
+    query: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM saved_moments WHERE owner_id = ?"
+    parameters: list[Any] = [owner_id]
+    if query and query.strip():
+        sql += " AND (title LIKE ? OR description LIKE ? OR tags_json LIKE ?)"
+        like = f"%{query.strip()}%"
+        parameters.extend([like, like, like])
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    parameters.append(limit)
+    with connection(database_path) as conn:
+        rows = conn.execute(sql, parameters).fetchall()
+    return [_saved_moment_from_row(row) for row in rows]
+
+
+def get_saved_moment(
+    database_path: Path,
+    moment_id: str,
+    owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = "SELECT * FROM saved_moments WHERE id = ?"
+    parameters: tuple[Any, ...] = (moment_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
+    with connection(database_path) as conn:
+        row = conn.execute(query, parameters).fetchone()
+    return _saved_moment_from_row(row) if row is not None else None
+
+
+def update_saved_moment(
+    database_path: Path,
+    moment_id: str,
+    owner_id: str,
+    **values: Any,
+) -> bool:
+    allowed = {"title", "description", "excerpt", "tags"}
+    updates: dict[str, Any] = {}
+    for key, value in values.items():
+        if key not in allowed:
+            continue
+        if key == "tags":
+            updates["tags_json"] = json.dumps(
+                [str(tag)[:50] for tag in (value or [])][:10],
+                ensure_ascii=False,
+            )
+        elif key == "title":
+            updates[key] = str(value)[:200]
+        elif key == "description":
+            updates[key] = str(value)[:1000]
+        else:
+            updates[key] = str(value)[:2000]
+    if not updates:
+        return False
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE saved_moments SET {assignments}, updated_at = ? "
+            "WHERE id = ? AND owner_id = ?",
+            (*updates.values(), utc_now(), moment_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+def delete_saved_moment(
+    database_path: Path,
+    moment_id: str,
+    owner_id: str,
+) -> bool:
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM saved_moments WHERE id = ? AND owner_id = ?",
+            (moment_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Carpetas observadas y lotes (Fase 3, ítem 11)
+# ---------------------------------------------------------------------------
+
+
+def _watch_folder_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    folder = dict(row)
+    folder["enabled"] = bool(folder["enabled"])
+    folder["config"] = json.loads(folder.pop("config_json"))
+    return folder
+
+
+def create_watch_folder(
+    database_path: Path,
+    owner_id: str,
+    path: str,
+    *,
+    enabled: bool = True,
+    config: dict[str, Any] | None = None,
+    poll_seconds: int = 300,
+) -> dict[str, Any]:
+    folder_id = str(uuid.uuid4())
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO watch_folders (
+                id, owner_id, path, enabled, config_json, poll_seconds,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                folder_id,
+                owner_id,
+                path,
+                1 if enabled else 0,
+                json.dumps(config or {}, ensure_ascii=False),
+                poll_seconds,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM watch_folders WHERE id = ?", (folder_id,)
+        ).fetchone()
+    assert row is not None
+    return _watch_folder_from_row(row)
+
+
+def list_watch_folders(
+    database_path: Path,
+    owner_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = "SELECT * FROM watch_folders"
+    parameters: tuple[Any, ...] = ()
+    if owner_id is not None:
+        query += " WHERE owner_id = ?"
+        parameters = (owner_id,)
+    query += " ORDER BY created_at"
+    with connection(database_path) as conn:
+        rows = conn.execute(query, parameters).fetchall()
+    return [_watch_folder_from_row(row) for row in rows]
+
+
+def get_watch_folder(
+    database_path: Path,
+    folder_id: str,
+    owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = "SELECT * FROM watch_folders WHERE id = ?"
+    parameters: tuple[Any, ...] = (folder_id,)
+    if owner_id is not None:
+        query += " AND owner_id = ?"
+        parameters += (owner_id,)
+    with connection(database_path) as conn:
+        row = conn.execute(query, parameters).fetchone()
+    return _watch_folder_from_row(row) if row is not None else None
+
+
+def update_watch_folder(
+    database_path: Path,
+    folder_id: str,
+    owner_id: str,
+    **values: Any,
+) -> bool:
+    allowed = {"enabled", "config", "poll_seconds"}
+    updates: dict[str, Any] = {}
+    for key, value in values.items():
+        if key not in allowed:
+            continue
+        if key == "config":
+            updates["config_json"] = json.dumps(value or {}, ensure_ascii=False)
+        elif key == "enabled":
+            updates["enabled"] = 1 if value else 0
+        else:
+            updates["poll_seconds"] = int(value)
+    if not updates:
+        return False
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE watch_folders SET {assignments}, updated_at = ? "
+            "WHERE id = ? AND owner_id = ?",
+            (*updates.values(), utc_now(), folder_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+def delete_watch_folder(
+    database_path: Path,
+    folder_id: str,
+    owner_id: str,
+) -> bool:
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            "DELETE FROM watch_folder_seen WHERE folder_id = ?", (folder_id,)
+        )
+        cursor = conn.execute(
+            "DELETE FROM watch_folders WHERE id = ? AND owner_id = ?",
+            (folder_id, owner_id),
+        )
+    return cursor.rowcount == 1
+
+
+def touch_watch_folder_scan(database_path: Path, folder_id: str) -> None:
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            "UPDATE watch_folders SET last_scan_at = ?, updated_at = ? WHERE id = ?",
+            (utc_now(), utc_now(), folder_id),
+        )
+
+
+def list_seen_file_keys(database_path: Path, folder_id: str) -> set[str]:
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT file_key FROM watch_folder_seen WHERE folder_id = ?",
+            (folder_id,),
+        ).fetchall()
+    return {str(row["file_key"]) for row in rows}
+
+
+def list_seen_files(database_path: Path, folder_id: str) -> dict[str, str | None]:
+    """Claves vistas con su proyecto (None = visto pero aún sin proyecto:
+    candidato en espera de estabilizarse)."""
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            "SELECT file_key, project_id FROM watch_folder_seen WHERE folder_id = ?",
+            (folder_id,),
+        ).fetchall()
+    return {
+        str(row["file_key"]): (
+            str(row["project_id"]) if row["project_id"] is not None else None
+        )
+        for row in rows
+    }
+
+
+def mark_file_seen(
+    database_path: Path,
+    folder_id: str,
+    file_key: str,
+    *,
+    project_id: str | None = None,
+) -> None:
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO watch_folder_seen (folder_id, file_key, project_id, seen_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(folder_id, file_key) DO UPDATE SET
+                project_id = COALESCE(excluded.project_id, watch_folder_seen.project_id),
+                seen_at = excluded.seen_at
+            """,
+            (folder_id, file_key, project_id, utc_now()),
+        )
+
+
+def create_batch_item(
+    database_path: Path,
+    batch_id: str,
+    owner_id: str,
+    *,
+    staged_id: str | None = None,
+    url: str | None = None,
+    status: str = "downloading",
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    item_id = str(uuid.uuid4())
+    now = utc_now()
+    with _lock, connection(database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO batch_items (
+                id, batch_id, owner_id, staged_id, url, status, project_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                batch_id,
+                owner_id,
+                staged_id,
+                url,
+                status,
+                project_id,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM batch_items WHERE id = ?", (item_id,)
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def list_pending_batch_items(
+    database_path: Path,
+) -> list[dict[str, Any]]:
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM batch_items
+            WHERE status IN ('downloading', 'pending')
+            ORDER BY created_at
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_batch_items(
+    database_path: Path,
+    owner_id: str,
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    with connection(database_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM batch_items WHERE owner_id = ?
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (owner_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_batch_item(
+    database_path: Path,
+    item_id: str,
+    *,
+    status: str | None = None,
+    project_id: str | None = None,
+    error: str | None = None,
+) -> bool:
+    updates: dict[str, Any] = {}
+    if status is not None:
+        updates["status"] = status
+    if project_id is not None:
+        updates["project_id"] = project_id
+    if error is not None:
+        updates["error"] = error[:1000]
+    if not updates:
+        return False
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _lock, connection(database_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE batch_items SET {assignments}, updated_at = ? WHERE id = ?",
+            (*updates.values(), utc_now(), item_id),
+        )
+    return cursor.rowcount == 1

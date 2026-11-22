@@ -87,6 +87,7 @@ class ProjectProcessingQueue:
         *,
         database_path: Path | None = None,
         drain_timeout: float = _DRAIN_TIMEOUT_SECONDS,
+        gate: Callable[[], bool] | None = None,
     ) -> None:
         if max_concurrency not in {1, 2}:
             raise ValueError("La concurrencia de procesamiento debe ser 1 o 2.")
@@ -94,6 +95,11 @@ class ProjectProcessingQueue:
         self._processor = processor
         self._database_path = database_path
         self._drain_timeout = drain_timeout
+        # Gate opcional (Fase 3, ítem 11 "procesar de noche"): mientras
+        # devuelva False, los workers devuelven el trabajo a la cola y
+        # esperan en vez de procesarlo. None = procesar siempre.
+        self._gate = gate
+        self._gate_wait_seconds = 30.0
         # (job_id persistido o None, project_id, llm_config, retry_failed_only, intentos)
         self._queue: asyncio.Queue[
             tuple[str | None, str, LLMConfig | None, bool, int]
@@ -320,6 +326,26 @@ class ProjectProcessingQueue:
             job_id, project_id, llm_config, retry_failed_only, attempts = (
                 await self._queue.get()
             )
+            # Franja nocturna (Fase 3, ítem 11): fuera de la franja, el
+            # trabajo vuelve a la cola y el worker espera. El put + el
+            # task_done mantienen la contabilidad de join(); un gate que
+            # lanza se trata como "permitido" (fail-open: un error de
+            # lectura de ajustes no debe parar la cola para siempre).
+            if self._gate is not None:
+                try:
+                    allowed = self._gate()
+                except Exception:
+                    logger.exception(
+                        "El gate de procesamiento falló; se permite el trabajo."
+                    )
+                    allowed = True
+                if not allowed:
+                    await self._queue.put(
+                        (job_id, project_id, llm_config, retry_failed_only, attempts)
+                    )
+                    self._queue.task_done()
+                    await asyncio.sleep(self._gate_wait_seconds)
+                    continue
             try:
                 async with self._in_flight_condition:
                     self._in_flight += 1

@@ -1,4 +1,4 @@
-import { ArrowLeft, Download, FolderOpen, LoaderCircle, LogOut, Moon, Settings2, Sun } from 'lucide-react';
+import { ArrowLeft, CalendarDays, Download, Film, FolderOpen, Layers, LoaderCircle, LogOut, Moon, Settings2, Sun } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
 // Cabecera de la aplicación (extraída de App.tsx, ítem 23 de la Fase 2).
@@ -6,6 +6,9 @@ export function TopBar() {
   const {
     navigate,
     isProjects,
+    isCalendar,
+    isQueue,
+    isBroll,
     isSettings,
     route,
     settingsReturnPath,
@@ -27,6 +30,19 @@ export function TopBar() {
       <button className={`settings-link ${isProjects ? 'is-active' : ''}`} type="button" onClick={() => navigate('/projects')} aria-label="Mis proyectos">
         <FolderOpen size={17} />
         <span>Mis proyectos</span>
+      </button>
+      {/* Fase 3 (ítems 9, 11, 13): calendario, cola y biblioteca de B-roll. */}
+      <button className={`settings-link ${isCalendar ? 'is-active' : ''}`} type="button" onClick={() => navigate('/calendar')} aria-label="Calendario de publicaciones">
+        <CalendarDays size={17} />
+        <span>Calendario</span>
+      </button>
+      <button className={`settings-link ${isQueue ? 'is-active' : ''}`} type="button" onClick={() => navigate('/queue')} aria-label="Cola de procesamiento">
+        <Layers size={17} />
+        <span>Cola</span>
+      </button>
+      <button className={`settings-link ${isBroll ? 'is-active' : ''}`} type="button" onClick={() => navigate('/broll')} aria-label="Biblioteca de B-roll">
+        <Film size={17} />
+        <span>B-roll</span>
       </button>
       {/* Fase 2 (ítem 17): interruptor manual de modo oscuro. */}
       <button className="settings-link" type="button" onClick={toggleTheme} aria-label={resolvedTheme === 'dark' ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro'}>

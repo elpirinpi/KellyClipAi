@@ -91,6 +91,10 @@ export type ClipResult = {
   broll_provider?: string;
   broll_creator?: string;
   broll_attribution_url?: string;
+  // Título/descripción/hashtags editados antes de publicar (Fase 3,
+  // ítem 12): el backend los guarda en el clip y los usa al publicar.
+  description?: string;
+  hashtags?: Record<string, string[]>;
   transcript: ClipWord[];
 };
 
@@ -209,4 +213,131 @@ export type ScheduleJob = {
   external_url: string | null;
   error: string | null;
   download_url: string | null;
+  // Fase 3 (ítems 9–10): reintento por job, cuenta y grupo cruzado.
+  attempts?: number;
+  next_attempt_at?: string | null;
+  account_id?: string | null;
+  group_id?: string | null;
+};
+
+// Fase 3 (ítems 9–15): publicación y flujo.
+export type PublishAccount = {
+  provider: string;
+  account_id: string;
+  display_name: string;
+  is_primary: boolean;
+  expires_at: string | null;
+};
+
+export type BestTimesGuide = {
+  platforms?: Record<string, { weekday: number[]; weekend: number[] }>;
+  platform?: string;
+  label?: string;
+  weekday_hours?: number[];
+  weekend_hours?: number[];
+  note: string;
+  next_slots: Record<string, string[]>;
+};
+
+export type QueueJob = {
+  id: string;
+  project_id: string;
+  project_title: string | null;
+  project_status: string | null;
+  project_progress: number | null;
+  retry_failed_only: boolean;
+  attempts: number;
+  status: string;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type BatchItem = {
+  id: string;
+  batch_id: string;
+  staged_id: string | null;
+  url: string | null;
+  status: string;
+  project_id: string | null;
+  error: string | null;
+  created_at: string;
+};
+
+export type WatchFolder = {
+  id: string;
+  path: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  poll_seconds: number;
+  last_scan_at: string | null;
+  created_at: string;
+};
+
+export type NightWindow = {
+  enabled: boolean;
+  start: string;
+  end: string;
+};
+
+export type CaptionVariant = {
+  clip_id: string;
+  titles: string[];
+  description: string;
+  hashtags: Record<string, string[]>;
+};
+
+export type BrollItem = {
+  id: string;
+  title: string;
+  query: string;
+  provider: string;
+  external_id: string | null;
+  creator: string;
+  attribution_url: string;
+  preview_url: string;
+  local_path: string | null;
+  duration: number;
+  width: number;
+  height: number;
+  favorite: boolean;
+  created_at: string;
+};
+
+export type BrollSearchResult = {
+  provider: string;
+  external_id: string;
+  title: string;
+  creator: string;
+  attribution_url: string;
+  preview_url: string;
+  download_url: string;
+  duration: number;
+  width: number;
+  height: number;
+};
+
+export type BrollSegment = {
+  id: string;
+  broll_id: string;
+  project_id: string;
+  clip_id: string;
+  start: number;
+  end: number;
+  label: string;
+  broll_title: string;
+  broll_provider: string;
+};
+
+export type SavedMoment = {
+  id: string;
+  title: string;
+  description: string;
+  project_id: string | null;
+  clip_id: string | null;
+  start: number | null;
+  end: number | null;
+  excerpt: string;
+  tags: string[];
+  created_at: string;
 };

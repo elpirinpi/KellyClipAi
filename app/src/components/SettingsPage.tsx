@@ -2,10 +2,11 @@ import { useEffect, useState } from 'react';
 import { ArrowLeft, ChevronDown, Circle, LoaderCircle, Sparkles } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { apiFetch } from '../auth';
+import { DesktopSettingsSection } from './DesktopSettingsSection';
 import { API_BASE, type MomentEngine } from '../context/constants';
 import type { ThemePreference } from '../hooks/useTheme';
 import type { ToastKind } from './Toasts';
-import type { IntegrationStatus } from '../types';
+import type { IntegrationStatus, PublishAccount } from '../types';
 import { responseError } from '../utils';
 
 function defaultModelFor(provider: string): string {
@@ -48,6 +49,11 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
   const [envKeyConfigured, setEnvKeyConfigured] = useState(false);
   const [integrations, setIntegrations] = useState<Record<string, IntegrationStatus>>({});
   const [integrationBusy, setIntegrationBusy] = useState('');
+  // Fase 3 (ítem 10): varias cuentas por plataforma (YouTube, TikTok,
+  // Instagram). La primera conectada es la predeterminada; una segunda
+  // conexión del mismo proveedor se guarda como cuenta adicional.
+  const [publishAccounts, setPublishAccounts] = useState<Record<string, PublishAccount[]>>({});
+  const [accountBusy, setAccountBusy] = useState('');
 
   useEffect(() => {
     let active = true;
@@ -82,6 +88,20 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
       active = false;
     };
   }, [setProvider, setWhisper]);
+
+  useEffect(() => {
+    let active = true;
+    apiFetch(`${API_BASE}/api/integrations/accounts`)
+      .then(async (response) => {
+        if (!response.ok) return;
+        const result = await response.json() as Record<string, PublishAccount[]>;
+        if (active) setPublishAccounts(result);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     const params = new URLSearchParams(settingsLocation.search);
@@ -123,6 +143,43 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
       onNotice(error instanceof Error ? error.message : 'No se pudo desconectar la cuenta.', 'error');
     } finally {
       setIntegrationBusy('');
+    }
+  };
+
+  const setDefaultAccount = async (providerName: string, accountId: string) => {
+    setAccountBusy(accountId);
+    try {
+      const response = await apiFetch(`${API_BASE}/api/integrations/${providerName}/accounts/${accountId}/set-default`, { method: 'POST' });
+      if (!response.ok) throw new Error(await responseError(response));
+      const accounts = await response.json() as PublishAccount[];
+      setPublishAccounts((current) => ({ ...current, [providerName]: accounts }));
+      onNotice('Cuenta predeterminada actualizada.', 'success');
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : 'No se pudo cambiar la cuenta predeterminada.', 'error');
+    } finally {
+      setAccountBusy('');
+    }
+  };
+
+  const disconnectAccount = async (providerName: string, accountId: string, displayName: string) => {
+    if (!window.confirm(`¿Desconectar la cuenta ${displayName} de ${providerName}?`)) return;
+    setAccountBusy(accountId);
+    try {
+      const response = await apiFetch(`${API_BASE}/api/integrations/${providerName}/accounts/${accountId}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await responseError(response));
+      const result = await response.json() as { remaining: PublishAccount[] };
+      setPublishAccounts((current) => ({ ...current, [providerName]: result.remaining }));
+      if (result.remaining.length === 0) {
+        setIntegrations((current) => ({
+          ...current,
+          [providerName]: { ...current[providerName], connected: false, display_name: null },
+        }));
+      }
+      onNotice('Cuenta desconectada.', 'success');
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : 'No se pudo desconectar la cuenta.', 'error');
+    } finally {
+      setAccountBusy('');
     }
   };
 
@@ -272,6 +329,8 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
           </label>
         </div>
       </section>
+      {/* Fase 3 (ítems 17, 18 y 20): actualizaciones, escritorio y bandeja. */}
+      <DesktopSettingsSection onNotice={onNotice} />
       <section className="config-card integrations-list">
         <div className="card-heading"><div><h2>Cuentas e integraciones</h2><p>Las credenciales se configuran en `.env`; las cuentas se conectan mediante OAuth local.</p></div></div>
         {[
@@ -308,6 +367,41 @@ export function SettingsPage({ provider, setProvider, whisper, setWhisper, momen
           );
         })}
       </section>
+      {/* Fase 3 (ítem 10): varias cuentas por plataforma. Solo se muestra
+          cuando hay al menos una cuenta conectada; conectar una segunda
+          cuenta del mismo proveedor se hace con "Conectar cuenta". */}
+      {Object.entries(publishAccounts).some(([, accounts]) => accounts.length > 0) && (
+        <section className="config-card">
+          <div className="card-heading"><div><h2>Cuentas por plataforma</h2><p>Publica con la cuenta que elijas en cada clip. La predeterminada se usa cuando no eliges otra.</p></div></div>
+          {(['youtube', 'tiktok', 'instagram'] as const).map((providerName) => {
+            const accounts = publishAccounts[providerName] ?? [];
+            if (accounts.length === 0) return null;
+            return (
+              <div className="pf-accounts-group" key={providerName}>
+                <h3>{providerName === 'youtube' ? 'YouTube' : providerName === 'tiktok' ? 'TikTok' : 'Instagram'}</h3>
+                <ul className="pf-accounts-list">
+                  {accounts.map((account) => (
+                    <li key={account.account_id} className="pf-account-row">
+                      <span className="pf-account-name">
+                        <strong>{account.display_name}</strong>
+                        {account.is_primary && <span className="pf-account-default">Predeterminada</span>}
+                      </span>
+                      {!account.is_primary && (
+                        <button type="button" className="connect-button" disabled={accountBusy === account.account_id} onClick={() => void setDefaultAccount(providerName, account.account_id)}>
+                          Predeterminada
+                        </button>
+                      )}
+                      <button type="button" className="connect-button pf-danger-button" disabled={accountBusy === account.account_id} onClick={() => void disconnectAccount(providerName, account.account_id, account.display_name)}>
+                        Desconectar
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </section>
+      )}
     </main>
   );
 }

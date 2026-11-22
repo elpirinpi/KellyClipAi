@@ -168,12 +168,14 @@ if (-not (Test-Path $gplLicense)) {
 }
 
 # Tamaño del bundle (revisado en la Fase 2, v1.1.0):
-# - Los 8 --collect-all son necesarios: faster_whisper (assets de voz),
+# - Los 9 --collect-all son necesarios: faster_whisper (assets de voz),
 #   ctranslate2 (librerías nativas), av (DLL de FFmpeg de PyAV), yt_dlp
 #   (extractores cargados dinámicamente), uvicorn (loops y protocolos
 #   cargados por importlib), webview (assets JS y backends), cv2
-#   (binario y datos) y mediapipe (binario y modelos). Recortar alguno
-#   rompería el bundle o ahorraría menos de 1 MB (uvicorn).
+#   (binario y datos), mediapipe (binario y modelos) y pystray (el
+#   backend _win32 de la bandeja del sistema se elige por importlib;
+#   sin el bundle completo la bandeja no arranca). Recortar alguno
+#   rompería el bundle o ahorraría menos de 1 MB (uvicorn, pystray).
 # - --exclude-module solo incluye módulos verificados como no usados en
 #   runtime: tkinter (nada lo importa; matplotlib usa el backend Agg
 #   cuando Tk no está disponible) y los bindings Qt (no instalados; la
@@ -206,6 +208,7 @@ if (-not (Test-Path $gplLicense)) {
     --collect-all webview `
     --collect-all cv2 `
     --collect-all mediapipe `
+    --collect-all pystray `
     --exclude-module tkinter `
     --exclude-module PyQt5 `
     --exclude-module PyQt6 `

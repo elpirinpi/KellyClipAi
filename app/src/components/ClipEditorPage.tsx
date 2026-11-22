@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertCircle, ArrowLeft, Check, LoaderCircle, Pause, Play, Redo2, RotateCcw, Scissors, Undo2, X,
+  AlertCircle, ArrowLeft, Check, History, Languages, LoaderCircle, Pause, Play, Redo2, RotateCcw, Scissors, Undo2, X,
 } from 'lucide-react';
 import { apiFetch } from '../auth';
-import { API_BASE, customTemplates, templates, type Template } from '../context/constants';
+import { API_BASE, customTemplates, formatBytes, templates, type Template } from '../context/constants';
 import { SubtitleStyleControls } from './SubtitleStyleControls';
 import type { ClipEditorState, EditablePhrase, ProjectResult } from '../types';
 import { formatDuration, responseError } from '../utils';
+import {
+  downloadTranslatedSubtitles,
+  fetchClipVersions,
+  restoreClipVersion,
+  type ClipVersion,
+} from '../studio/api';
 import { useCanvasPreview } from '../studio/hooks/useCanvasPreview';
 import { DEFAULT_SETTINGS } from '../studio/types/editor';
 import { CANVAS_HEIGHT, CANVAS_WIDTH } from '../studio/utils/canvasRenderer';
@@ -46,6 +52,13 @@ export function ClipEditorPage({
   const [autosavedAt, setAutosavedAt] = useState<Date | null>(null);
   const [past, setPast] = useState<ClipEditorState[]>([]);
   const [future, setFuture] = useState<ClipEditorState[]>([]);
+  // Versiones de clip (Fase 3, ítem 6) y traducción (ítem 7).
+  const [versions, setVersions] = useState<ClipVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [restoringVersion, setRestoringVersion] = useState<number | null>(null);
+  const [translateLang, setTranslateLang] = useState('en');
+  const [translateFormat, setTranslateFormat] = useState<'srt' | 'vtt'>('srt');
+  const [translating, setTranslating] = useState(false);
   const editorRef = useRef<ClipEditorState | null>(null);
   const lastHistoryPushRef = useRef<{ phraseId: string; at: number }>({ phraseId: '', at: 0 });
   const clip = project?.clips.find((item) => item.id === clipId);
@@ -118,6 +131,58 @@ export function ClipEditorPage({
       });
     return () => controller.abort();
   }, [endpoint]);
+
+  // Versiones archivadas del clip (cada exportación archiva el
+  // archivo vigente antes de sustituirlo).
+  const loadVersions = useCallback(() => {
+    setVersionsLoading(true);
+    fetchClipVersions(projectId, clipId)
+      .then(setVersions)
+      .catch(() => setVersions([]))
+      .finally(() => setVersionsLoading(false));
+  }, [projectId, clipId]);
+
+  useEffect(() => {
+    loadVersions();
+  }, [loadVersions]);
+
+  const handleRestoreVersion = async (version: number) => {
+    if (!window.confirm(`¿Restaurar la versión v${version}? La versión actual se archivará como una versión nueva.`)) return;
+    setRestoringVersion(version);
+    try {
+      const updated = await restoreClipVersion(projectId, clipId, version);
+      setVersions(updated);
+      setMessage(`Versión v${version} restaurada.`);
+    } catch (restoreError) {
+      setError(restoreError instanceof Error ? restoreError.message : 'No se pudo restaurar la versión.');
+    } finally {
+      setRestoringVersion(null);
+    }
+  };
+
+  const handleTranslate = async () => {
+    setTranslating(true);
+    setError('');
+    try {
+      const { blob, filename } = await downloadTranslatedSubtitles(
+        projectId,
+        clipId,
+        translateLang,
+        translateFormat,
+      );
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setMessage(`Subtítulos traducidos descargados (${filename}).`);
+    } catch (translateError) {
+      setError(translateError instanceof Error ? translateError.message : 'No se pudo traducir los subtítulos.');
+    } finally {
+      setTranslating(false);
+    }
+  };
 
   // Aplica un cambio al editor registrando el estado anterior en el
   // historial de deshacer (salvo que se pida lo contrario). Cualquier
@@ -471,6 +536,76 @@ export function ClipEditorPage({
             ) : (
               <p className="empty-templates">Este clip no tiene palabras con marcas de tiempo para editar.</p>
             )}
+          </section>
+
+          <section className="editor-transcript-card">
+            <div className="editor-section-heading">
+              <div><h2><History size={16} /> Versiones</h2><p>Cada exportación archiva la versión anterior (máx. 10). Restaurar no destruye nada: la actual se archiva como una versión nueva.</p></div>
+              <span>{versions.length} guardada{versions.length === 1 ? '' : 's'}</span>
+            </div>
+            {versionsLoading ? (
+              <p className="empty-templates"><LoaderCircle size={15} className="spin" /> Cargando versiones…</p>
+            ) : versions.length ? (
+              <div className="clip-versions">
+                {versions.map((version) => (
+                  <div className="clip-version-row" key={version.version}>
+                    <strong>v{version.version}</strong>
+                    <span className="version-meta">
+                      {formatBytes(version.size_bytes)} · {new Date(version.created_at).toLocaleString('es-DO')}
+                      {version.has_subtitles ? ' · con subtítulos' : ''}
+                    </span>
+                    <a
+                      className="subtle-button"
+                      href={`${API_BASE}/api/projects/${projectId}/clips/${clipId}/versions/${version.version}/file`}
+                      download
+                    >
+                      Descargar
+                    </a>
+                    <button
+                      type="button"
+                      className="subtle-button"
+                      onClick={() => void handleRestoreVersion(version.version)}
+                      disabled={restoringVersion !== null}
+                    >
+                      {restoringVersion === version.version ? <LoaderCircle size={15} className="spin" /> : <RotateCcw size={15} />}
+                      Restaurar
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-templates">Aún no hay versiones archivadas: la primera se crea al exportar cambios.</p>
+            )}
+          </section>
+
+          <section className="editor-transcript-card">
+            <div className="editor-section-heading">
+              <div><h2><Languages size={16} /> Traducir subtítulos</h2><p>Traduce la transcripción con tu proveedor de IA y descarga el SRT o VTT en otro idioma. Necesita una clave de IA configurada en Ajustes.</p></div>
+            </div>
+            <div className="editor-settings">
+              <label className="config-field">
+                <span>Idioma destino</span>
+                <select value={translateLang} onChange={(event) => setTranslateLang(event.target.value)}>
+                  <option value="en">Inglés</option>
+                  <option value="fr">Francés</option>
+                  <option value="de">Alemán</option>
+                  <option value="it">Italiano</option>
+                  <option value="pt">Portugués</option>
+                  <option value="es">Español</option>
+                </select>
+              </label>
+              <label className="config-field">
+                <span>Formato</span>
+                <select value={translateFormat} onChange={(event) => setTranslateFormat(event.target.value as 'srt' | 'vtt')}>
+                  <option value="srt">SRT</option>
+                  <option value="vtt">WebVTT</option>
+                </select>
+              </label>
+              <button type="button" className="subtle-button" onClick={() => void handleTranslate()} disabled={translating}>
+                {translating ? <LoaderCircle size={16} className="spin" /> : <Languages size={16} />}
+                {translating ? 'Traduciendo…' : 'Traducir y descargar'}
+              </button>
+            </div>
           </section>
 
           <footer className="editor-actions">

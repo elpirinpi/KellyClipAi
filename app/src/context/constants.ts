@@ -104,6 +104,21 @@ export function readStoredAutoEdit(): boolean {
   return false;
 }
 
+// Fase 3 (ítem 18, C.4.31): notificaciones de escritorio al terminar
+// un procesamiento largo. Activadas por defecto (solo '0' las apaga);
+// el permiso del sistema se pide una sola vez, al primer procesamiento.
+export const DESKTOP_NOTIFICATIONS_STORAGE_KEY = 'kellyclipai-desktop-notifications';
+export const NOTIFICATIONS_ASKED_STORAGE_KEY = 'kellyclipai-notifications-asked';
+
+export function readStoredDesktopNotifications(): boolean {
+  try {
+    return window.localStorage.getItem(DESKTOP_NOTIFICATIONS_STORAGE_KEY) !== '0';
+  } catch {
+    // Sin almacenamiento disponible: notificaciones activadas.
+  }
+  return true;
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];

@@ -182,6 +182,33 @@ def save_editor_draft(
     }
 
 
+def _brand_kit_for_project(
+    settings: AppSettings,
+    project: dict[str, Any],
+    project_config: ProjectConfig,
+) -> dict[str, Any] | None:
+    """Kit de marca resuelto para un render, o None si no aplica."""
+    if not project_config.options.brand:
+        return None
+    owner_id = str(project.get("owner_id") or "legacy")
+    try:
+        kit = database.get_brand_kit(settings.database_path, owner_id)
+    except Exception as error:  # noqa: BLE001 - sin marca, render normal
+        logger.warning("No se pudo cargar la plantilla de marca (%s).", error)
+        return None
+    if kit is None:
+        return None
+    from .brand import brand_logo_path
+
+    brand_kit = dict(kit)
+    logo_path = brand_logo_path(
+        settings.data_dir, owner_id, kit.get("logo_filename")
+    )
+    if logo_path is not None:
+        brand_kit["logo_path"] = str(logo_path)
+    return brand_kit
+
+
 def render_editor_version(
     settings: AppSettings,
     project: dict[str, Any],
@@ -267,6 +294,8 @@ def render_editor_version(
             output_resolution=resolution,
             enhance_audio=audio_is_enhanced,
             on_analysis_progress=on_analysis_progress,
+            speaker_segments=(project.get("metadata") or {}).get("speaker_segments"),
+            brand_kit=_brand_kit_for_project(settings, project, project_config),
         )
         metadata = probe_media(output_path, ffprobe_path)
         if preview:
@@ -284,6 +313,11 @@ def render_editor_version(
 
         final_path = render_dir / filename
         final_subtitle = final_path.with_suffix(".ass")
+        # Versiones (Fase 3, ítem 6): el archivo vigente se archiva
+        # como vN antes de sustituirlo, para poder volver atrás.
+        from .clip_versions import archive_version
+
+        archive_version(project_dir, render_dir, clip["id"], filename)
         os.replace(output_path, final_path)
         os.replace(subtitle_path, final_subtitle)
         clips = list(project.get("clips") or [])

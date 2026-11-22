@@ -33,3 +33,8 @@ The model and MediaPipe are distributed under Apache-2.0; the license is
 included as `backend/models/MEDIAPIPE-LICENSE.txt`. The model file is
 `backend/models/face_landmarker.task`, SHA-256:
 `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`.
+
+The system tray icon uses [pystray](https://github.com/moses-palmer/pystray)
+0.19.5, licensed under LGPL-3.0. pystray is imported as a separate Python
+library; the application does not modify it. Its dependency
+[six](https://github.com/benjaminp/six) 1.17.0 is licensed under MIT.

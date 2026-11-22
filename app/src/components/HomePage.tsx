@@ -1,9 +1,10 @@
 import {
-  AlertCircle, ArrowRight, AudioLines, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CloudUpload, FileVideo2, FolderOpen, Link2, LoaderCircle, LockKeyhole, Plus, Video, WandSparkles, X,
+  AlertCircle, ArrowRight, AudioLines, CalendarDays, Check, ChevronDown, ChevronLeft, ChevronRight, CloudUpload, FileVideo2, FolderOpen, Link2, LoaderCircle, Plus, Video, WandSparkles, X,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { formatBytes } from '../context/constants';
 import { ACCEPT, MAX_UPLOAD_LABEL } from '../hooks/useImport';
+import { BrandKitForm } from './BrandKitForm';
 import { SubtitleStyleControls } from './SubtitleStyleControls';
 import { TemplatePreview } from './TemplatePreview';
 import { formatDuration } from '../utils';
@@ -246,7 +247,7 @@ export function HomePage() {
             </div>
             <div role="tabpanel" id={`template-panel-${templateTab}`} aria-labelledby={`template-tab-${templateTab}`}>
             {templateTab === 'brand' ? (
-              <div className="locked-brand"><span className="lock-badge"><LockKeyhole size={20} /></span><div><strong>Plantilla de marca</strong><p>Personaliza clips con tu identidad visual. Esta opción premium todavía no está disponible.</p></div><span className="premium-chip">◆ Premium</span></div>
+              <BrandKitForm notify={notify} />
             ) : visibleTemplates.length ? (
               <div className="template-rail-wrap">
                 <button className="rail-arrow rail-prev" type="button" aria-label="Ver plantillas anteriores" onClick={(event) => event.currentTarget.parentElement?.querySelector('.template-rail')?.scrollBy({ left: -260, behavior: 'smooth' })}><ChevronLeft size={18} /></button>
@@ -279,6 +280,10 @@ export function HomePage() {
               <Option checked={options.silence} onClick={() => toggleOption('silence')} title="Eliminar silencios" description="Recorta las pausas largas" />
               <Option checked={options.censor} onClick={() => toggleOption('censor')} title="Auto-censurar" description="Silencia y oculta palabrotas" />
               <Option checked={options.face_tracking} onClick={() => toggleOption('face_tracking')} title="Seguir rostro en el encuadre" description="Mantiene a la persona principal visible al recortar" />
+              <Option checked={options.remove_fillers} onClick={() => toggleOption('remove_fillers')} title="Quitar muletillas" description="Elimina “eh/este/em” y micro-pausas" />
+              <Option checked={options.punch_in} onClick={() => toggleOption('punch_in')} title="Zoom punch-in" description="Acercamiento en los picos de energía del audio" />
+              <Option checked={options.dynamic_split} onClick={() => toggleOption('dynamic_split')} title="Split dinámico en entrevistas" description="Pantalla dividida cuando alternan dos hablantes" />
+              <Option checked={options.brand} onClick={() => toggleOption('brand')} title="Aplicar mi marca" description="Logo y colores de tu plantilla de marca" />
             </div>
             <label className="config-field">
               <span>Encuadre inteligente</span>

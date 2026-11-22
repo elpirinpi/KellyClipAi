@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
-  AlertCircle, ArrowRight, Clapperboard, Download, FileText, FileVideo2, Film, LoaderCircle, Scissors, Search, Share2, Sparkles, Trash2, WandSparkles,
+  AlertCircle, ArrowRight, BookmarkPlus, Clapperboard, CopyPlus, Download, FileText, FileVideo2, Film, LoaderCircle, Megaphone, RotateCcw, Scissors, Search, Share2, Sparkles, Trash2, Type, WandSparkles,
 } from 'lucide-react';
 import { apiFetch } from '../auth';
 import { API_BASE, CONTENT_PROFILE_LABELS, MOMENT_ENGINE_LABELS, formatBytes, type ContentProfile, type MomentEngine } from '../context/constants';
+import { CaptionsPanel } from './CaptionsPanel';
+import { CrossPublishModal } from './CrossPublishModal';
+import { SavedMomentsPanel } from './SavedMomentsPanel';
 import { ToastStack, useToasts, type ToastKind } from './Toasts';
 import type { ClipProposalRecord, ClipResult, ProjectResult, ScheduleJob } from '../types';
 import { formatDuration, responseError } from '../utils';
@@ -97,6 +101,12 @@ export function ResultsPage({
   const [scheduleError, setScheduleError] = useState('');
   const [storageUsedBytes, setStorageUsedBytes] = useState<number | null>(null);
   const [storageError, setStorageError] = useState('');
+  // Fase 3 (ítems 10, 12, 14, 15): publicación cruzada, títulos con IA,
+  // momentos guardados y duplicar proyecto.
+  const navigate = useNavigate();
+  const [crossPublishOpen, setCrossPublishOpen] = useState(false);
+  const [captionsClip, setCaptionsClip] = useState<ClipResult | null>(null);
+  const [saveMomentClip, setSaveMomentClip] = useState<ClipResult | null>(null);
   const players = useRef<Record<string, HTMLVideoElement | null>>({});
   const clips = useMemo(() => {
     const allClips = [...(project?.clips ?? [])];
@@ -478,6 +488,59 @@ export function ResultsPage({
     onEdit(selectedClips[0].id);
   };
 
+  // Fase 3 (ítem 15): clona el proyecto sin volver a subir el video y
+  // abre la copia en configuración, para reprocesarla con otro ratio,
+  // duración o plantilla.
+  const duplicateProject = async () => {
+    if (!project) return;
+    setBusyAction('duplicate-project');
+    try {
+      const response = await apiFetch(`${API_BASE}/api/projects/${project.id}/duplicate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const clone = await response.json() as { id: string; title: string };
+      notify(`Proyecto duplicado como “${clone.title}”.`, 'success');
+      navigate(`/p/${clone.id}/configure`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'No se pudo duplicar el proyecto.', 'error');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  // Fase 3 (ítem 9): reintentar un job fallido o cancelar uno pendiente
+  // desde la lista de publicaciones programadas.
+  const retryScheduleJob = async (jobId: string) => {
+    setBusyAction(`retry-job:${jobId}`);
+    try {
+      const response = await apiFetch(`${API_BASE}/api/scheduled-jobs/${jobId}/retry`, { method: 'POST' });
+      if (!response.ok) throw new Error(await responseError(response));
+      notify('La publicación se volvió a poner en cola.', 'success');
+      await refreshScheduleJobs();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'No se pudo reintentar la publicación.', 'error');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const cancelScheduleJob = async (jobId: string) => {
+    setBusyAction(`cancel-job:${jobId}`);
+    try {
+      const response = await apiFetch(`${API_BASE}/api/scheduled-jobs/${jobId}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setScheduleJobs((current) => current.filter((job) => job.id !== jobId));
+      notify('La publicación programada se canceló.', 'success');
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'No se pudo cancelar la publicación.', 'error');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
   return (
     <main className="results-page" id="main-content">
       <h1 className="visually-hidden">{project ? `Resultados de ${project.title}` : 'Resultados del proyecto'}</h1>
@@ -503,6 +566,13 @@ export function ResultsPage({
           <button type="button" onClick={publishSelected} disabled={!selectedClips.length || busyAction === 'publish'}>
             {busyAction === 'publish' ? <LoaderCircle size={15} className="spin" /> : <ArrowRight size={15} />}
             Publicar
+          </button>
+          <button type="button" onClick={() => setCrossPublishOpen(true)} disabled={!selectedClips.length} title="Los mismos clips a varias plataformas y cuentas a la vez">
+            <Megaphone size={15} /> Publicar en varias
+          </button>
+          <button type="button" onClick={() => void duplicateProject()} disabled={busyAction === 'duplicate-project'} title="Clonar el proyecto y reprocesarlo con otra configuración, sin volver a subir el video">
+            {busyAction === 'duplicate-project' ? <LoaderCircle size={15} className="spin" /> : <CopyPlus size={15} />}
+            Duplicar proyecto
           </button>
           <button type="button" onClick={() => void downloadSelected()} disabled={busyAction === 'archive'}>
             {busyAction === 'archive' ? <LoaderCircle size={15} className="spin" /> : <Download size={15} />}
@@ -573,7 +643,10 @@ export function ResultsPage({
           <div className="scheduled-job-list">
             {scheduleJobs.map((job) => (
               <article className="scheduled-job" key={job.id}>
-                <div><strong>{job.platform} · clip {job.clip_id.slice(0, 8)}</strong><small>{new Date(job.scheduled_at).toLocaleString()} · {job.visibility}</small></div>
+                <div><strong>{job.platform} · clip {job.clip_id.slice(0, 8)}</strong><small>{new Date(job.scheduled_at).toLocaleString()} · {job.visibility}
+                  {(job.attempts ?? 0) > 0 ? ` · intento ${job.attempts} de 3` : ''}
+                  {job.status === 'scheduled' && job.next_attempt_at ? ` · próximo intento: ${new Date(job.next_attempt_at).toLocaleString()}` : ''}
+                </small></div>
                 <span className={`job-status ${job.status}`}>{{
                   scheduled: 'En cola',
                   processing: 'Procesando',
@@ -581,6 +654,16 @@ export function ResultsPage({
                   exported: 'Exportado localmente',
                   failed: 'No confirmado',
                 }[job.status] ?? job.status}</span>
+                {job.status === 'failed' && (
+                  <button type="button" className="job-link" disabled={busyAction === `retry-job:${job.id}`} onClick={() => void retryScheduleJob(job.id)}>
+                    <RotateCcw size={13} /> Reintentar
+                  </button>
+                )}
+                {job.status === 'scheduled' && (
+                  <button type="button" className="job-link" disabled={busyAction === `cancel-job:${job.id}`} onClick={() => void cancelScheduleJob(job.id)}>
+                    Cancelar
+                  </button>
+                )}
                 {job.external_url && <a className="job-link" href={job.external_url} target="_blank" rel="noreferrer">Ver publicación</a>}
                 {job.download_url && <button className="job-link" type="button" onClick={() => void downloadWithAuth(
                   `${API_BASE}${job.download_url}`,
@@ -699,6 +782,8 @@ export function ResultsPage({
                     <FileText size={15} /> VTT
                   </button>
                   <button type="button" className="clip-action" disabled={busyAction === 'publish'} onClick={() => void publishClips([clip.id])}><ArrowRight size={15} /> Publicar</button>
+                  <button type="button" className="clip-action" onClick={() => setCaptionsClip(clip)} title="Generar 3 variantes de título, descripción y hashtags con IA"><Type size={15} /> Títulos</button>
+                  <button type="button" className="clip-action" onClick={() => setSaveMomentClip(clip)} title="Guardar este momento para reutilizarlo en otros proyectos"><BookmarkPlus size={15} /> Guardar momento</button>
                   <button
                     type="button"
                     className="clip-action"
@@ -825,6 +910,32 @@ export function ResultsPage({
       )}
       {project?.status !== 'completed' && project?.status !== 'failed' && project?.status !== 'cancelled' && !error && <p className="results-loading"><LoaderCircle size={17} className="spin" /> Cargando el estado real del proyecto…</p>}
       <a className="back-button results-back" href="/">Volver al inicio</a>
+      {crossPublishOpen && project && (
+        <CrossPublishModal
+          projectId={project.id}
+          clipIds={selectedClips.map((clip) => clip.id)}
+          onClose={() => setCrossPublishOpen(false)}
+          onDone={() => { setCrossPublishOpen(false); void refreshScheduleJobs(); }}
+          onNotice={notify}
+        />
+      )}
+      {captionsClip && project && (
+        <CaptionsPanel
+          projectId={project.id}
+          clip={captionsClip}
+          onClose={() => setCaptionsClip(null)}
+          onApplied={() => { setCaptionsClip(null); void onProjectUpdated(project.id); }}
+          onNotice={notify}
+        />
+      )}
+      {saveMomentClip && project && (
+        <SavedMomentsPanel
+          clip={saveMomentClip}
+          projectId={project.id}
+          onClose={() => setSaveMomentClip(null)}
+          onNotice={notify}
+        />
+      )}
     </main>
   );
 }

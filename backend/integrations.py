@@ -574,7 +574,10 @@ def _refresh_account(
             }
         else:
             raise IntegrationError(f"No se puede renovar el acceso de {provider}.")
-    database.save_connected_account(
+    # save_account_document enruta el refresco al mismo sitio donde estaba
+    # la cuenta (predeterminada o extra): refrescar una cuenta extra no
+    # debe desplazar a la predeterminada (Fase 3, ítem 10).
+    database.save_account_document(
         settings.database_path,
         provider,
         refreshed["account_id"],
@@ -592,11 +595,21 @@ def _access_token(
     settings: AppSettings,
     provider: str,
     owner_id: str = "legacy",
+    account_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    account = database.get_connected_account(
-        settings.database_path,
-        provider,
-        owner_id,
+    account = (
+        database.get_account_by_id(
+            settings.database_path,
+            provider,
+            account_id,
+            owner_id,
+        )
+        if account_id
+        else database.get_connected_account(
+            settings.database_path,
+            provider,
+            owner_id,
+        )
     )
     if account is None:
         raise IntegrationError(f"No hay una cuenta de {provider} conectada.")
@@ -618,12 +631,15 @@ def publish_clip(
     file_path: Path,
     visibility: str,
     owner_id: str = "legacy",
+    account_id: str | None = None,
 ) -> dict[str, str]:
+    """Publica un clip. Sin account_id usa la cuenta predeterminada de la
+    plataforma; con account_id, esa cuenta concreta (Fase 3, ítem 10)."""
     if platform not in {"youtube", "tiktok", "instagram"}:
         raise IntegrationError(f"Plataforma de publicación no admitida: {platform}.")
     if not file_path.is_file():
         raise IntegrationError("El MP4 del clip no está disponible para publicar.")
-    token, account = _access_token(settings, platform, owner_id)
+    token, account = _access_token(settings, platform, owner_id, account_id)
     if platform == "youtube":
         return _publish_youtube(token, clip, file_path, visibility)
     if platform == "tiktok":
@@ -1369,3 +1385,120 @@ def download_broll(
         target_path.unlink(missing_ok=True)
         raise IntegrationError(f"{provider.title()} devolvió un archivo vacío.")
     return {"provider": provider.title(), "creator": creator, "attribution_url": attribution}
+
+
+def list_account_summaries(
+    database_path: Path,
+    owner_id: str = "legacy",
+) -> dict[str, list[dict[str, Any]]]:
+    """Cuentas conectadas por proveedor, sin tokens (Fase 3, ítem 10)."""
+    return {
+        provider: [
+            database.account_summary(account)
+            for account in database.list_connected_accounts(
+                database_path, provider, owner_id
+            )
+        ]
+        for provider in ("youtube", "tiktok", "instagram")
+    }
+
+
+def search_broll_videos(
+    settings: AppSettings,
+    provider: str,
+    query: str,
+    *,
+    per_page: int = 6,
+) -> list[dict[str, Any]]:
+    """Busca videos de B-roll en Pexels o Pixabay (Fase 3, ítem 13).
+
+    Devuelve resultados SIN descargar: la biblioteca descarga solo el que
+    el usuario importa. Sin clave API del proveedor, lanza
+    IntegrationError explicando que hay que configurarla en .env; la
+    biblioteca local sigue funcionando sin claves.
+    """
+    provider = provider.strip().lower()
+    if provider not in {"pexels", "pixabay"}:
+        raise IntegrationError("El proveedor de B-roll debe ser Pexels o Pixabay.")
+    missing = _missing_credentials(provider, settings)
+    if missing:
+        raise IntegrationError(
+            f"Falta la clave de {provider.title()} en .env: {', '.join(missing)}. "
+            "Sin clave puedes usar la biblioteca local, pero no buscar en el proveedor."
+        )
+    search_term = " ".join(query.split())[:100]
+    if not search_term:
+        raise IntegrationError("Escribe qué B-roll quieres buscar.")
+    per_page = max(1, min(per_page, 12))
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        if provider == "pexels":
+            payload = _request_json(
+                client,
+                "GET",
+                "https://api.pexels.com/videos/search",
+                "Pexels",
+                headers={"Authorization": settings.pexels_api_key.strip()},
+                params={"query": search_term, "per_page": per_page},
+            )
+            results: list[dict[str, Any]] = []
+            for video in payload.get("videos") or []:
+                files = [
+                    file
+                    for file in video.get("video_files") or []
+                    if file.get("file_type") == "video/mp4" and file.get("link")
+                ]
+                if not files:
+                    continue
+                selected = min(files, key=lambda item: int(item.get("width") or 10**9))
+                results.append(
+                    {
+                        "provider": "Pexels",
+                        "external_id": str(video.get("id") or ""),
+                        "title": str(
+                            (video.get("user") or {}).get("name") or "Video de Pexels"
+                        ),
+                        "creator": str((video.get("user") or {}).get("name") or "Pexels"),
+                        "attribution_url": str(video.get("url") or "Pexels"),
+                        "preview_url": str(video.get("image") or ""),
+                        "download_url": str(selected["link"]),
+                        "duration": float(video.get("duration") or 0),
+                        "width": int(selected.get("width") or 0),
+                        "height": int(selected.get("height") or 0),
+                    }
+                )
+            return results
+        payload = _request_json(
+            client,
+            "GET",
+            "https://pixabay.com/api/videos/",
+            "Pixabay",
+            params={
+                "key": settings.pixabay_api_key.strip(),
+                "q": search_term,
+                "per_page": per_page,
+                "safesearch": "true",
+            },
+        )
+        results = []
+        for video in payload.get("hits") or []:
+            variants = video.get("videos") or {}
+            selected = (
+                variants.get("medium") or variants.get("small") or variants.get("tiny")
+            )
+            if not isinstance(selected, dict) or not selected.get("url"):
+                continue
+            results.append(
+                {
+                    "provider": "Pixabay",
+                    "external_id": str(video.get("id") or ""),
+                    "title": str(video.get("tags") or "Video de Pixabay")[:200],
+                    "creator": str(video.get("user") or "Pixabay"),
+                    "attribution_url": str(video.get("pageURL") or "Pixabay"),
+                    "preview_url": "",
+                    "download_url": str(selected["url"]),
+                    "duration": float(video.get("duration") or 0),
+                    "width": int(selected.get("width") or 0),
+                    "height": int(selected.get("height") or 0),
+                }
+            )
+        return results

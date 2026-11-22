@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import logging
 import os
 import socket
@@ -17,6 +18,12 @@ _LOG_MAX_BYTES = 5 * 1024 * 1024
 _LOG_BACKUP_COUNT = 3
 _WINDOW_TITLE = "kellyClipAi"
 _SINGLE_INSTANCE_MUTEX = "Local\\kellyClipAi-desktop"
+# Modo portable (Fase 3, ítem 17, C.6.36): se activa con la variable
+# de entorno KELLYCLIP_PORTABLE=1 o con un archivo "portable.txt"
+# junto al ejecutable (el ZIP portable lo incluye). En ese modo los
+# datos viven junto al ejecutable, no en %LOCALAPPDATA%.
+_PORTABLE_ENV_VAR = "KELLYCLIP_PORTABLE"
+_PORTABLE_MARKER = "portable.txt"
 # Puerto preferido del backend local y último puerto de respaldo: si el
 # 8000 está ocupado se prueba 8001-8010 en orden (B34).
 _DEFAULT_PORT = 8000
@@ -106,8 +113,6 @@ class _SingleInstance:
 def _find_main_window(user32: ctypes.WinDLL) -> int | None:
     matching_windows: list[int] = []
     enum_windows_proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
-    user32.IsWindowVisible.argtypes = (ctypes.c_void_p,)
-    user32.IsWindowVisible.restype = ctypes.c_int
     user32.GetWindowTextLengthW.argtypes = (ctypes.c_void_p,)
     user32.GetWindowTextLengthW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)
@@ -115,8 +120,9 @@ def _find_main_window(user32: ctypes.WinDLL) -> int | None:
 
     @enum_windows_proc
     def visit_window(hwnd: int, _parameter: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
+        # Sin filtro de visibilidad: una ventana oculta en la bandeja
+        # (C.6.38) sigue existiendo y un segundo arranque debe poder
+        # restaurarla con ShowWindow en vez de rendirse.
         title_length = user32.GetWindowTextLengthW(hwnd)
         if title_length <= 0:
             return True
@@ -154,11 +160,52 @@ def _focus_existing_window(timeout: float = 10) -> bool:
     return False
 
 
-def _prepare_user_directory() -> Path:
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if not local_app_data:
-        raise RuntimeError("Windows no proporcionó la carpeta LOCALAPPDATA.")
-    user_dir = Path(local_app_data) / "kellyClipAi"
+def _app_directory() -> Path:
+    """Carpeta del ejecutable (bundle PyInstaller) o del repo en
+    desarrollo: la base del modo portable."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _is_portable_mode(app_dir: Path | None = None) -> bool:
+    """¿Modo portable? Variable de entorno o marcador junto al
+    ejecutable. La variable también sirve en desarrollo."""
+    if os.getenv(_PORTABLE_ENV_VAR, "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    base = app_dir if app_dir is not None else _app_directory()
+    return (base / _PORTABLE_MARKER).is_file()
+
+
+def _instance_mutex_name(portable: bool, user_dir: Path) -> str:
+    """Nombre del mutex de instancia única.
+
+    En modo portable incluye un hash de la carpeta de datos: la
+    instalada y la portable pueden correr a la vez, y también dos
+    copias portables en carpetas distintas (el caso de uso para
+    comparar versiones).
+    """
+    if not portable:
+        return _SINGLE_INSTANCE_MUTEX
+    digest = hashlib.sha1(str(user_dir).encode("utf-8")).hexdigest()[:12]
+    return f"Local\\kellyClipAi-portable-{digest}"
+
+
+def _prepare_user_directory(app_dir: Path | None = None) -> Path:
+    """Prepara el directorio de datos del usuario y devuelve su ruta.
+
+    Instalado: ``%LOCALAPPDATA%\\kellyClipAi``. Portable: la carpeta
+    del ejecutable (``.env``, ``desktop.log`` y ``data/`` junto al
+    .exe, para llevar la app en un USB o probarla sin instalar).
+    """
+    if _is_portable_mode(app_dir):
+        user_dir = app_dir if app_dir is not None else _app_directory()
+        os.environ[_PORTABLE_ENV_VAR] = "1"
+    else:
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if not local_app_data:
+            raise RuntimeError("Windows no proporcionó la carpeta LOCALAPPDATA.")
+        user_dir = Path(local_app_data) / "kellyClipAi"
     user_dir.mkdir(parents=True, exist_ok=True)
     env_file = user_dir / ".env"
     if not env_file.exists():
@@ -272,6 +319,45 @@ class DesktopApi:
         return selected[0] if selected else None
 
 
+def _start_hidden(user_dir: Path) -> bool:
+    """¿Arrancar con la ventana oculta? Solo si la preferencia está
+    activa Y la bandeja está disponible: sin bandeja, una ventana
+    oculta dejaría la app sin forma de mostrarse."""
+    from backend.desktop_prefs import load_desktop_prefs, tray_available
+
+    available, _reason = tray_available()
+    if not available:
+        return False
+    return load_desktop_prefs(user_dir / "data").get("start_minimized", False)
+
+
+def _start_tray(window: object, user_dir: Path, *, visible: bool):  # type: ignore[no-untyped-def]
+    """Arranca la bandeja del sistema si está disponible; si no,
+    devuelve None y la app funciona como antes (sin bandeja)."""
+    from backend.desktop_prefs import load_desktop_prefs, tray_available
+    from desktop_tray import TrayController
+
+    available, reason = tray_available()
+    if not available:
+        _logger.info("Bandeja del sistema no disponible: %s", reason)
+        return None
+    data_dir = user_dir / "data"
+
+    def minimize_to_tray() -> bool:
+        # Se relee en cada cierre: el interruptor de Ajustes se
+        # aplica sin reiniciar la app.
+        return load_desktop_prefs(data_dir).get("minimize_to_tray", True)
+
+    controller = TrayController(
+        window=window,
+        clips_dir=data_dir / "projects",
+        on_quit=window.destroy,  # type: ignore[attr-defined]
+        minimize_to_tray=minimize_to_tray,
+        visible=visible,
+    )
+    return controller if controller.start() else None
+
+
 def _run_app(
     user_dir: Path,
     smoke_test: bool,
@@ -309,10 +395,15 @@ def _run_app(
 
     if log_handler is not None:
         _configure_uvicorn_logging(log_handler)
+    # En modo portable el actualizador queda desactivado: instalar la
+    # actualización abriría el instalador de la versión instalada, no
+    # actualizaría la copia portable. La vía de actualización portable
+    # es descargar el ZIP nuevo desde GitHub.
+    portable = os.getenv(_PORTABLE_ENV_VAR) == "1"
     updater = UpdateManager(
         APP_VERSION,
         user_dir,
-        Path(sys.executable) if getattr(sys, "frozen", False) else None,
+        None if portable else (Path(sys.executable) if getattr(sys, "frozen", False) else None),
     )
     server = uvicorn.Server(
         uvicorn.Config(
@@ -332,6 +423,7 @@ def _run_app(
         daemon=True,
     )
     server_thread.start()
+    tray = None
     try:
         _wait_for_backend(server_thread, port, startup_error)
         if smoke_test:
@@ -348,16 +440,21 @@ def _run_app(
                     timeout=15,
                 )
             return
-        webview.create_window(
+        hidden = _start_hidden(user_dir)
+        window = webview.create_window(
             _WINDOW_TITLE,
             f"http://127.0.0.1:{port}/",
             min_size=(360, 600),
             width=1440,
             height=940,
+            hidden=hidden,
             js_api=DesktopApi(),
         )
+        tray = _start_tray(window, user_dir, visible=not hidden)
         webview.start(gui="edgechromium", debug=False)
     finally:
+        if tray is not None:
+            tray.stop()
         server.should_exit = True
         server_thread.join(timeout=10)
 
@@ -372,7 +469,10 @@ def main(smoke_test: bool = False) -> None:
         force=True,
     )
     threading.excepthook = _log_thread_exception
-    instance = _SingleInstance()
+    portable = os.getenv(_PORTABLE_ENV_VAR) == "1"
+    if portable:
+        _logger.info("Modo portable: datos en %s", user_dir)
+    instance = _SingleInstance(_instance_mutex_name(portable, user_dir))
     if not instance.acquire():
         if not _focus_existing_window():
             _logger.warning("No se pudo traer a primer plano la ventana de kellyClipAi.")
@@ -396,7 +496,8 @@ if __name__ == "__main__":
             _show_error(
                 f"No se pudo iniciar kellyClipAi.\n\n{error}\n\n"
                 "Si falta WebView2, conéctate a internet y vuelve a ejecutar el instalador. "
-                "Registro: %LOCALAPPDATA%\\kellyClipAi\\desktop.log"
+                "Registro: desktop.log (junto a la aplicación en modo portable "
+                "o en %LOCALAPPDATA%\\kellyClipAi)."
             )
         except (OSError, AttributeError, ctypes.ArgumentError):
             print(f"No se pudo iniciar kellyClipAi: {error}", file=sys.stderr)

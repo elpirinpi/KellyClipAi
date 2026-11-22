@@ -16,6 +16,15 @@ export type UpdateStatus = {
   state: 'idle' | 'unavailable' | 'checking' | 'current' | 'available' | 'downloading' | 'downloaded' | 'installer_opened' | 'error';
   progress: number;
   error: string | null;
+  // Fase 3 (ítem 20, C.6.40): canal beta y notas de la versión.
+  channel: 'stable' | 'beta';
+  release_notes: string | null;
+  release_url: string | null;
+  is_prerelease: boolean;
+  // Fase 3 (ítem 17, C.6.37): rollback a la versión anterior.
+  rollback: boolean;
+  previous_version: string | null;
+  rollback_available: boolean;
 };
 
 type UseUpdatesOptions = {
@@ -53,6 +62,13 @@ export function useUpdates({ apiBase, authReady, authSession, userId, notify }: 
             state: 'error',
             progress: 0,
             error: 'No se pudo comprobar si hay actualizaciones.',
+            channel: 'stable',
+            release_notes: null,
+            release_url: null,
+            is_prerelease: false,
+            rollback: false,
+            previous_version: null,
+            rollback_available: false,
           });
         }
       }
@@ -129,5 +145,35 @@ export function useUpdates({ apiBase, authReady, authSession, userId, notify }: 
     }
   };
 
-  return { updateStatus, downloadUpdate, installUpdate, checkForUpdates };
+  // Fase 3 (ítem 20, C.6.40): cambiar el canal descarta lo pendiente
+  // y busca de inmediato en el canal nuevo.
+  const setChannel = async (channel: 'stable' | 'beta') => {
+    try {
+      const response = await apiFetch(`${apiBase}/api/updates/channel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel }),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      setUpdateStatus(await response.json() as UpdateStatus);
+      await checkForUpdates();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'No se pudo cambiar el canal de actualizaciones.', 'error');
+    }
+  };
+
+  // Fase 3 (ítem 17, C.6.37): restaurar la versión anterior. El
+  // sondeo de progreso existente cubre los estados checking y
+  // downloading, así que no hace falta uno propio.
+  const startRollback = async () => {
+    try {
+      const response = await apiFetch(`${apiBase}/api/updates/rollback`, { method: 'POST' });
+      if (!response.ok) throw new Error(await responseError(response));
+      setUpdateStatus(await response.json() as UpdateStatus);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'No se pudo restaurar la versión anterior.', 'error');
+    }
+  };
+
+  return { updateStatus, downloadUpdate, installUpdate, checkForUpdates, setChannel, startRollback };
 }

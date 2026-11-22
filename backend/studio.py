@@ -220,3 +220,17 @@ def local_transcript_words(
             }
         )
     return output
+
+
+# --- modo gancho (Fase 3, ítem 8) ---------------------------------------------
+# Los primeros segundos de un clip vertical deciden la retención: el
+# Studio marca esta ventana en la línea de tiempo y muestra en ella
+# el texto de gancho que escriba el usuario.
+HOOK_SECONDS = 3.0
+
+
+def hook_range(start: float, end: float) -> tuple[float, float]:
+    """Ventana de gancho de un clip: los primeros 3 s (o menos)."""
+    if end <= start:
+        return (start, start)
+    return (start, min(start + HOOK_SECONDS, end))

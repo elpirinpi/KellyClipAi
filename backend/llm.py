@@ -549,6 +549,82 @@ def _request_clip_content(
     return content, first.get("finish_reason")
 
 
+def chat_completion_text(
+    llm: ResolvedLLM,
+    *,
+    system: str,
+    user: str,
+    max_tokens: int = 4000,
+    on_rate_limit: Callable[[float, int], None] | None = None,
+) -> str:
+    """Una llamada de texto plano al LLM (sin modo JSON).
+
+    Para tareas que devuelven texto libre (traducción de subtítulos):
+    reutiliza ``_post_with_retry`` (reintentos, 429, errores de
+    proveedor) pero sin ``response_format`` ni la instrucción de JSON
+    de ``_request_clip_content``. Devuelve el contenido tal cual ("" si
+    el proveedor no devolvió opciones).
+    """
+    timeout = httpx.Timeout(150, connect=15)
+    with httpx.Client(timeout=timeout) as client:
+        if llm.provider == "Anthropic":
+            response = _post_with_retry(
+                client,
+                llm.provider,
+                f"{llm.base_url}/v1/messages",
+                on_rate_limit=on_rate_limit,
+                headers={
+                    "x-api-key": llm.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": llm.model,
+                    "max_tokens": max_tokens,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user}],
+                },
+            )
+            blocks = response.json().get("content", [])
+            return "\n".join(
+                block.get("text", "")
+                for block in blocks
+                if block.get("type") == "text"
+            )
+        request_payload: dict[str, Any] = {
+            "model": llm.model,
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if llm.provider == "Groq" and llm.model.casefold().startswith(
+            "openai/gpt-oss-"
+        ):
+            request_payload["reasoning_format"] = "hidden"
+        response = _post_with_retry(
+            client,
+            llm.provider,
+            f"{llm.base_url}/chat/completions",
+            on_rate_limit=on_rate_limit,
+            headers={"Authorization": f"Bearer {llm.api_key}"},
+            json=request_payload,
+        )
+        choices = response.json().get("choices", [])
+        if not choices:
+            return ""
+        content = choices[0].get("message", {}).get("content", "") or ""
+        if isinstance(content, list):
+            content = "\n".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict)
+            )
+        return content
+
+
 def propose_clips(
     transcript: list[TranscriptSegment],
     project: ProjectConfig,
@@ -622,3 +698,21 @@ def propose_clips(
                 raise TypeError("La respuesta LLM no contiene una lista de clips.")
             return parsed[:10]
     raise AssertionError("El ciclo de reintento de propuestas LLM terminó inesperadamente.")
+
+
+def request_text_completion(
+    llm: ResolvedLLM,
+    system: str,
+    user: str,
+) -> str:
+    """Una llamada de texto al LLM resuelto (Fase 3, ítem 12).
+
+    Reutiliza el mismo transporte que propose_clips (reintentos por 429,
+    modo JSON con fallback). Devuelve el contenido en bruto: el llamador
+    lo interpreta y valida. Lanza LLMConfigurationError si no hay clave
+    (desde resolve_llm) y LLMResponseError si el proveedor falla.
+    """
+    timeout = httpx.Timeout(150, connect=15)
+    with httpx.Client(timeout=timeout) as client:
+        content, _ = _request_clip_content(client, llm, system, user)
+    return content

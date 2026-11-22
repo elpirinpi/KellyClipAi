@@ -1,13 +1,19 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { API_BASE } from '../context/constants';
+import { apiFetch } from '../auth';
+import { responseError } from '../utils';
+import { BrollLibraryPage } from './BrollLibraryPage';
+import { CalendarPage } from './CalendarPage';
 import { ClipEditorPage } from './ClipEditorPage';
 import { HomePage } from './HomePage';
 import { AuthPage, ProcessingPage, SharedClipPage } from './Pages';
 import { ProjectsPage } from './ProjectsPage';
+import { QueuePage } from './QueuePage';
 import { RecordModal } from './RecordModal';
 import { ResultsPage } from './ResultsPage';
 import { SettingsPage } from './SettingsPage';
+import { SetupWizard } from './SetupWizard';
 import { StudioPage } from '../studio/StudioPage';
 import type { ClipProposalRecord } from '../types';
 import { ToastStack } from './Toasts';
@@ -28,6 +34,9 @@ export function AppShell() {
     authConfigurationError,
     isSettings,
     isProjects,
+    isCalendar,
+    isQueue,
+    isBroll,
     projectRouteId,
     projectRouteMode,
     editClipId,
@@ -55,11 +64,35 @@ export function AppShell() {
     target.focus({ preventScroll: true });
   }, [route]);
 
+  // Fase 3 (ítem 19, C.6.42): asistente de primer arranque. Solo para
+  // sesiones autenticadas (el asistente guarda la clave por cuenta);
+  // los enlaces compartidos no lo ven. Si la comprobación falla, la
+  // app sigue sin asistente en vez de bloquear el arranque.
+  const [setupNeeded, setSetupNeeded] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (shareToken || !authSession) return;
+    let active = true;
+    apiFetch(`${API_BASE}/api/setup`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await responseError(response));
+        return response.json() as Promise<{ needs_setup: boolean }>;
+      })
+      .then((setup) => { if (active) setSetupNeeded(setup.needs_setup); })
+      .catch(() => { if (active) setSetupNeeded(false); });
+    return () => { active = false; };
+  }, [shareToken, authSession]);
+
   if (!shareToken && !authReady) {
     return <main className="auth-page"><p role="status">Conectando con el servicio de autenticación…</p></main>;
   }
   if (!shareToken && !authSession) {
     return <AuthPage configurationError={authConfigurationError} />;
+  }
+  if (!shareToken && setupNeeded === null) {
+    return <main className="auth-page"><p role="status">Comprobando la configuración inicial…</p></main>;
+  }
+  if (!shareToken && setupNeeded) {
+    return <SetupWizard onDone={() => setSetupNeeded(false)} />;
   }
 
   return (
@@ -95,6 +128,15 @@ export function AppShell() {
           onOpen={(projectId) => navigate(`/p/${projectId}`)}
           onNew={() => navigate('/')}
         />
+      ) : isCalendar ? (
+        <CalendarPage onNotice={notify} />
+      ) : isQueue ? (
+        <QueuePage
+          onNotice={notify}
+          onOpenProject={(projectId) => navigate(`/p/${projectId}`)}
+        />
+      ) : isBroll ? (
+        <BrollLibraryPage onNotice={notify} />
       ) : projectRouteId && projectRouteMode !== 'configure' ? (
         projectRouteMode === 'processing'
           ? <ProcessingPage apiBase={API_BASE} project={project} error={projectError} onRetry={() => void retryProject()} onCancelled={(cancelled) => setProject(cancelled)} />

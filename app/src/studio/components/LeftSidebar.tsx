@@ -23,6 +23,10 @@ interface LeftSidebarProps {
   // Progreso del análisis en curso (v1.3.2, 0-100); null cuando no
   // hay ningún cálculo en marcha.
   faceTrackProgress: number | null;
+  // Plantilla de marca (Fase 3, ítem 5): si el usuario tiene un kit
+  // guardado, el botón "Aplicar mi marca" lo aplica a este clip.
+  hasBrandKit: boolean;
+  onApplyBrand: () => void;
   onUpdateSetting: <K extends keyof EditorSettings>(key: K, value: EditorSettings[K]) => void;
   onApplySubtitlePreset: (patch: Partial<EditorSettings>) => void;
   onTrimStartChange: (val: number) => void;
@@ -41,6 +45,8 @@ export function LeftSidebar({
   bgmName,
   faceTrackStatus,
   faceTrackProgress,
+  hasBrandKit,
+  onApplyBrand,
   onUpdateSetting,
   onApplySubtitlePreset,
   onTrimStartChange,
@@ -415,6 +421,48 @@ export function LeftSidebar({
                   className="w-full h-8 bg-[#0b0d11] border border-slate-800 rounded-lg p-0.5 cursor-pointer"
                 />
               </div>
+            </section>
+
+            <section className="p-4 flex flex-col gap-3">
+              <h2 className="text-xs font-semibold text-slate-300">Gancho</h2>
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Texto superpuesto durante los primeros 3 segundos del clip
+                (la zona ámbar de la línea de tiempo). Pruébalo aquí: se
+                quema en la exportación.
+              </p>
+              <input
+                type="text"
+                maxLength={80}
+                placeholder="p. ej. Lo que nadie te cuenta de…"
+                value={settings.hookText}
+                onChange={(e) => onUpdateSetting('hookText', e.target.value)}
+                className="w-full bg-[#0b0d11] border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500"
+              />
+            </section>
+
+            <section className="p-4 flex flex-col gap-3">
+              <h2 className="text-xs font-semibold text-slate-300">Marca</h2>
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Aplica tu plantilla de marca a este clip: colores en los
+                subtítulos y la barra, fuente y logo en la esquina.
+              </p>
+              <button
+                type="button"
+                onClick={onApplyBrand}
+                disabled={!hasBrandKit}
+                className="py-1.5 px-3 rounded-lg text-xs font-medium bg-indigo-600 text-white hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 cursor-pointer disabled:cursor-not-allowed transition-colors"
+              >
+                {hasBrandKit ? 'Aplicar mi marca' : 'Sin plantilla de marca guardada'}
+              </button>
+              {settings.brandLogoUrl && (
+                <button
+                  type="button"
+                  onClick={() => onUpdateSetting('brandLogoUrl', null)}
+                  className="text-[11px] font-medium text-slate-400 hover:text-slate-200 cursor-pointer self-start"
+                >
+                  Quitar logo de este clip
+                </button>
+              )}
             </section>
           </>
         )}

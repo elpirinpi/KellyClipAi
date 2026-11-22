@@ -66,6 +66,15 @@ export interface EditorSettings {
   trimEnd: number;
   speed: number;
 
+  // Texto de gancho (Fase 3, ítem 8): se muestra superpuesto durante
+  // los primeros 3 segundos del clip (la ventana de gancho). Vacío =
+  // sin texto de gancho.
+  hookText: string;
+  // Logo de marca (Fase 3, ítem 5): URL del logo guardado
+  // (/api/brand-kit/logo) o null. El canvas lo dibuja en la esquina
+  // superior derecha; la exportación lo incluye al capturar el canvas.
+  brandLogoUrl: string | null;
+
   progressBar: boolean;
   progressPos: ProgressPos;
   progressColor: string;
@@ -110,6 +119,9 @@ export const DEFAULT_SETTINGS: EditorSettings = {
   trimStart: 0,
   trimEnd: 12,
   speed: 1,
+
+  hookText: '',
+  brandLogoUrl: null,
 
   progressBar: true,
   progressPos: 'top',
@@ -160,6 +172,10 @@ export function normalizeStudioEdit(value: unknown): StudioEditSpec | null {
     savedRatio === '9:16' || savedRatio === '1:1' || savedRatio === '16:9'
       ? savedRatio
       : '9:16';
+  // brandLogoUrl es string | null y el filtro por tipo del bucle lo
+  // dejaría fuera (typeof null es 'object'): se valida aparte.
+  const savedLogo = (spec.settings as Partial<EditorSettings>).brandLogoUrl;
+  settings.brandLogoUrl = typeof savedLogo === 'string' ? savedLogo : null;
   const cues: SubtitleCue[] = [];
   spec.cues.forEach((cue, index) => {
     if (typeof cue !== 'object' || cue === null) return;

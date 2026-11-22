@@ -207,6 +207,10 @@ _SILENCE_FALLBACK_SECONDS = 2.0
 _MMR_MIN_SECONDS = 30.0
 _MMR_MAX_SECONDS = 90.0
 _MMR_DURATION_DIVISOR = 15.0
+# Factor de la diversidad temporal (Fase 3, ítem 2): un candidato en
+# una franja temporal ya ocupada multiplica su puntuación efectiva por
+# este factor antes de compararla con el umbral.
+_TEMPORAL_BUCKET_FACTOR = 0.8
 # Similitud coseno TF-IDF por encima de la cual dos clips "dicen lo mismo".
 _TFIDF_DUPLICATE_SIMILARITY = 0.55
 # Rango de duración preferido cuando el proyecto pide "Cualquiera" (igual
@@ -1312,6 +1316,7 @@ def _select_diverse(
     enable_semantic: bool = False,
     semantic_threshold: float | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    duration: float | None = None,
 ) -> list[_ScoredCandidate]:
     """Elige hasta max_clips por puntuación, con diversidad MMR + TF-IDF.
 
@@ -1321,6 +1326,16 @@ def _select_diverse(
       elegido más próximo (factor 0.5 si es adyacente, 1.0 a >= X s); si
       la penalizada cae bajo el umbral, el candidato se descarta. Solo un
       momento excepcional puede quedar junto a otro elegido.
+    - Diversidad temporal (Fase 3, ítem 2): con ``duration``, el video
+      se divide en ``max_clips`` franjas iguales y un candidato en una
+      franja ya ocupada sufre un factor extra de 0.8 sobre su
+      puntuación efectiva. Sin ``duration`` (llamadas antiguas y
+      tests), el comportamiento es el de siempre: la MMR por cercanía
+      ya evita la concentración extrema, pero en un video largo los
+      clips podían agruparse en un solo tramo porque la separación
+      tiene tope (90 s); las franjas reparten los clips por todo el
+      video. Como en la MMR, solo un momento excepcional puede
+      duplicar franja.
     - TF-IDF: si el texto es casi idéntico al de un clip elegido
       (similitud > 0.55), se queda el de mayor puntuación.
     - Semántico (Fase D, solo si ``enable_semantic``): además del
@@ -1364,6 +1379,13 @@ def _select_diverse(
     selected: list[_ScoredCandidate] = []
     selected_vectors: list[dict[str, float]] = []
     selected_embeddings: list[np.ndarray] = []
+    # Franjas temporales (diversidad temporal): solo con duración.
+    bucket_width = (
+        duration / max_clips
+        if duration is not None and duration > 0 and max_clips > 0
+        else None
+    )
+    occupied_buckets: set[int] = set()
     for index, candidate in enumerate(ordered):
         if len(selected) >= max_clips:
             break
@@ -1372,6 +1394,7 @@ def _select_diverse(
         )
         if overlaps:
             continue
+        effective_score = candidate.score
         if selected:
             gap = min(
                 max(
@@ -1382,8 +1405,14 @@ def _select_diverse(
                 for chosen in selected
             )
             factor = 0.5 + 0.5 * min(1.0, gap / separation_seconds)
-            if candidate.score * factor < threshold:
-                continue
+            effective_score *= factor
+        bucket = None
+        if bucket_width is not None:
+            bucket = min(max_clips - 1, max(0, int(candidate.start // bucket_width)))
+            if bucket in occupied_buckets:
+                effective_score *= _TEMPORAL_BUCKET_FACTOR
+        if effective_score < threshold:
+            continue
         vector = vectors[index]
         if any(
             _cosine_similarity(vector, chosen) > _TFIDF_DUPLICATE_SIMILARITY
@@ -1403,6 +1432,8 @@ def _select_diverse(
                 continue
         selected.append(candidate)
         selected_vectors.append(vector)
+        if bucket is not None:
+            occupied_buckets.add(bucket)
         if lazy_embeddings is not None:
             embedding = lazy_embeddings.get(index)
             if embedding is not None:
@@ -1688,6 +1719,7 @@ def detect_moments(
         idf_corpus=[phrase.text for phrase in phrases],
         enable_semantic=enable_semantic,
         should_cancel=should_cancel,
+        duration=duration,
     )
     # Tema del video: contenido más frecuente de toda la transcripción,
     # para hashtags genéricos del tema en cada clip.

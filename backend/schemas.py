@@ -68,6 +68,19 @@ class EditOptions(BaseModel):
     silence: bool = False
     censor: bool = False
     face_tracking: bool = True
+    # Quitar muletillas y micro-pausas (Fase 3, ítem 8): resta los
+    # intervalos detectados por fillers.py, como la eliminación de
+    # silencios. Apagado por defecto: recorta palabras reales.
+    remove_fillers: bool = False
+    # Zoom punch-in en picos de energía del audio (Fase 3, ítem 3b).
+    punch_in: bool = False
+    # Split dinámico en entrevistas (Fase 3, ítem 3b): con diarización
+    # disponible, un clip con dos hablantes que alternan se renderiza
+    # en pantalla dividida aunque el encuadre sea "speaker".
+    dynamic_split: bool = False
+    # Aplicar la plantilla de marca del usuario (Fase 3, ítem 5):
+    # colores/fuente de marca en los subtítulos y logo superpuesto.
+    brand: bool = False
 
 
 class SubtitleStyle(BaseModel):
@@ -402,6 +415,8 @@ class SaveProjectFilesRequest(BaseModel):
 class PublishClipsRequest(ClipArchiveRequest):
     platform: PublishingPlatform
     visibility: Literal["private", "public", "unlisted"] = "private"
+    # Cuenta concreta; None = la predeterminada (Fase 3, ítem 10).
+    account_id: str | None = Field(default=None, max_length=256)
 
     @model_validator(mode="after")
     def validate_visibility(self) -> PublishClipsRequest:
@@ -480,6 +495,37 @@ class CustomTemplateRequest(BaseModel):
         return self
 
 
+# Plantilla de marca (Fase 3, ítem 5): un kit por usuario. El logo se
+# sube aparte (POST /api/brand-kit/logo) y aquí solo se guarda su
+# nombre de archivo; ``logo_url`` lo calcula el endpoint GET.
+class BrandKit(BaseModel):
+    name: str = Field(default="", max_length=60)
+    primary_color: str = Field(default="#ffffff", pattern=r"^#[0-9a-fA-F]{6}$")
+    accent_color: str = Field(default="#facc15", pattern=r"^#[0-9a-fA-F]{6}$")
+    font_family: (
+        Literal["Arial", "Arial Black", "Georgia", "Tahoma", "Verdana"] | None
+    ) = None
+    logo_filename: str | None = None
+
+
+class BrandKitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(default="", max_length=60)
+    primary_color: str = Field(default="#ffffff", pattern=r"^#[0-9a-fA-F]{6}$")
+    accent_color: str = Field(default="#facc15", pattern=r"^#[0-9a-fA-F]{6}$")
+    font_family: (
+        Literal["Arial", "Arial Black", "Georgia", "Tahoma", "Verdana"] | None
+    ) = None
+
+
+class TranslateSubtitlesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_language: Literal["en", "fr", "de", "it", "pt", "es"]
+    format_name: Literal["srt", "vtt"] = "srt"
+
+
 class Word(BaseModel):
     start: float = Field(ge=0)
     end: float = Field(gt=0)
@@ -516,9 +562,282 @@ class ClipProposal(BaseModel):
     # Fase B, "eventos") más "completitud" (multiplicador 0–1). None en
     # las propuestas del LLM. La UI lo usa para el "por qué este clip".
     signal_breakdown: dict[str, float] | None = None
+    # Tema y serie (Fase 3, ítem 2): series.py agrupa las propuestas
+    # por tema; los grupos de 2+ clips forman una serie numerada
+    # ("Parte 1", "Parte 2"…) en orden cronológico.
+    topic: str | None = None
+    series: str | None = None
+    part_number: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_order(self) -> ClipProposal:
         if self.fin <= self.inicio:
             raise ValueError("El fin del clip debe ser posterior al inicio.")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Publicación y flujo (Fase 3, ítems 9–15)
+# ---------------------------------------------------------------------------
+
+
+def _validate_target_visibility(
+    platform: PublishingPlatform,
+    visibility: str,
+) -> None:
+    if platform == "instagram" and visibility != "public":
+        raise ValueError("Instagram solo admite la visibilidad pública.")
+    if platform == "tiktok" and visibility == "unlisted":
+        raise ValueError("TikTok no admite la visibilidad no listada.")
+
+
+class CrossPublishTarget(BaseModel):
+    """Un destino de publicación cruzada: plataforma + cuenta + hora."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    platform: PublishingPlatform
+    # Cuenta concreta; None = la predeterminada de esa plataforma.
+    account_id: str | None = Field(default=None, max_length=256)
+    # Hora programada con zona horaria; None = publicar cuanto antes.
+    scheduled_at: datetime | None = None
+    visibility: Literal["private", "public", "unlisted"] = "private"
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def normalize_scheduled_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("La fecha programada debe incluir zona horaria.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> CrossPublishTarget:
+        _validate_target_visibility(self.platform, self.visibility)
+        return self
+
+
+class CrossPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clip_ids: list[str] = Field(min_length=1, max_length=10)
+    targets: list[CrossPublishTarget] = Field(min_length=1, max_length=9)
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> CrossPublishRequest:
+        if len(self.clip_ids) != len(set(self.clip_ids)):
+            raise ValueError("La selección contiene clips duplicados.")
+        seen: set[tuple[str, str | None]] = set()
+        for target in self.targets:
+            key = (target.platform, target.account_id)
+            if key in seen:
+                raise ValueError(
+                    "Hay destinos duplicados para la misma plataforma y cuenta."
+                )
+            seen.add(key)
+        return self
+
+
+class RescheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scheduled_at: datetime
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def require_timezone_and_normalize(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("La fecha programada debe incluir zona horaria.")
+        return value.astimezone(UTC)
+
+
+class BatchEnqueueRequest(BaseModel):
+    """Encolar varios videos: staged listos + enlaces a descargar."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    staged_ids: list[str] = Field(default_factory=list, max_length=20)
+    urls: list[str] = Field(default_factory=list, max_length=20)
+    config: ProjectConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_not_empty(self) -> BatchEnqueueRequest:
+        if not self.staged_ids and not self.urls:
+            raise ValueError("El lote necesita al menos un video o un enlace.")
+        if len(self.staged_ids) + len(self.urls) > 20:
+            raise ValueError("Un lote admite como máximo 20 videos.")
+        return self
+
+
+class WatchFolderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=1024)
+    enabled: bool = True
+    config: ProjectConfig | None = None
+    poll_seconds: int = Field(default=300, ge=60, le=86400)
+
+
+class WatchFolderUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    config: ProjectConfig | None = None
+    poll_seconds: int | None = Field(default=None, ge=60, le=86400)
+
+
+class NightWindowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    start: str = Field(default="22:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end: str = Field(default="06:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+class CaptionGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # None = todos los clips listos del proyecto.
+    clip_ids: list[str] | None = Field(default=None, max_length=10)
+
+
+class CaptionApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=100)
+    description: str | None = Field(default=None, max_length=4000)
+    hashtags: dict[PublishingPlatform, list[str]] | None = None
+
+
+class BrollSearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["pexels", "pixabay"] = "pexels"
+    query: str = Field(min_length=1, max_length=100)
+    per_page: int = Field(default=6, ge=1, le=12)
+
+
+class BrollImportRequest(BaseModel):
+    """Importar un resultado del proveedor a la biblioteca local."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["pexels", "pixabay"]
+    external_id: str = Field(default="", max_length=100)
+    title: str = Field(min_length=1, max_length=200)
+    query: str = Field(default="", max_length=100)
+    creator: str = Field(default="", max_length=200)
+    attribution_url: str = Field(default="", max_length=1000)
+    preview_url: str = Field(default="", max_length=1000)
+    download_url: str = Field(min_length=1, max_length=2000)
+    duration: float = Field(default=0, ge=0)
+    width: int = Field(default=0, ge=0)
+    height: int = Field(default=0, ge=0)
+
+
+class BrollUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    favorite: bool | None = None
+
+
+class BrollAssignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    broll_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    clip_id: str = Field(min_length=1)
+    # start=end=0 → B-roll de todo el clip; si no, segmento en segundos.
+    start: float = Field(default=0, ge=0)
+    end: float = Field(default=0, ge=0)
+    label: str = Field(default="", max_length=200)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> BrollAssignRequest:
+        if (self.start == 0) != (self.end == 0):
+            raise ValueError(
+                "El segmento necesita inicio y fin, o ambos en cero para todo el clip."
+            )
+        if self.end and self.end <= self.start:
+            raise ValueError("El fin del segmento debe ser posterior al inicio.")
+        return self
+
+
+class SavedMomentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=1000)
+    project_id: str | None = Field(default=None, max_length=64)
+    clip_id: str | None = Field(default=None, max_length=64)
+    start: float | None = Field(default=None, ge=0)
+    end: float | None = Field(default=None, ge=0)
+    excerpt: str = Field(default="", max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=10)
+
+
+class SavedMomentUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=1000)
+    excerpt: str | None = Field(default=None, max_length=2000)
+    tags: list[str] | None = Field(default=None, max_length=10)
+
+
+class ApplySavedMomentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(min_length=1)
+
+
+class DuplicateProjectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=200)
+    ratio: str | None = None
+    duration: str | None = None
+    subtitle_template: str | None = None
+    # True = encolar el duplicado para procesarlo de inmediato.
+    process: bool = False
+
+
+# --- Escritorio y distribución (Fase 3, ítems 17–20) -----------------------
+
+
+class UpdateChannelRequest(BaseModel):
+    """Canal de actualizaciones (C.6.40): "stable" solo acepta
+    releases estables; "beta" también acepta prereleases."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel: Literal["stable", "beta"]
+
+
+class AutostartRequest(BaseModel):
+    """Auto-inicio con Windows (C.6.39)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
+class DesktopPreferencesRequest(BaseModel):
+    """Preferencias de la bandeja del sistema (C.6.38). Los campos
+    ausentes (None) no cambian: la actualización es parcial."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    minimize_to_tray: bool | None = None
+    start_minimized: bool | None = None
+
+
+class SetupCompleteRequest(BaseModel):
+    """Cierre del asistente de primer arranque (C.6.42)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    whisper_model: WhisperModel | None = None
+    skipped: bool = False

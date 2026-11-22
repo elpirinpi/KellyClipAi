@@ -219,3 +219,186 @@ export async function exportStudioVideo(
   if (!response.ok) throw new Error(await responseError(response));
   return response.json() as Promise<ClipResult>;
 }
+
+// --- Forma de onda (Fase 3, ítem 4b) ---------------------------------------
+// Picos normalizados 0-1 del video fuente; la línea de tiempo dibuja
+// las barras en un <canvas> sin decodificar el audio en el navegador.
+
+export interface Waveform {
+  start: number;
+  end: number;
+  buckets: number;
+  peaks: number[];
+}
+
+export async function fetchWaveform(
+  projectId: string,
+  start: number,
+  end: number,
+  buckets = 1200,
+): Promise<Waveform> {
+  const params = new URLSearchParams({
+    start: String(start),
+    end: String(end),
+    buckets: String(buckets),
+  });
+  const response = await apiFetch(`${API_BASE}/api/projects/${projectId}/waveform?${params}`);
+  if (!response.ok) throw new Error(await responseError(response));
+  const value = (await response.json()) as {
+    start?: unknown;
+    end?: unknown;
+    buckets?: unknown;
+    peaks?: unknown;
+  };
+  const peaks = Array.isArray(value.peaks)
+    ? value.peaks.filter((peak): peak is number => typeof peak === 'number' && Number.isFinite(peak))
+    : [];
+  return {
+    start: typeof value.start === 'number' ? value.start : start,
+    end: typeof value.end === 'number' ? value.end : end,
+    buckets: typeof value.buckets === 'number' ? value.buckets : peaks.length,
+    peaks: peaks.map((peak) => Math.max(0, Math.min(1, peak))),
+  };
+}
+
+// --- Plantilla de marca (Fase 3, ítem 5) ------------------------------------
+
+export interface BrandKit {
+  name: string;
+  primary_color: string;
+  accent_color: string;
+  font_family: string | null;
+  logo_filename: string | null;
+  logo_url: string | null;
+}
+
+function parseBrandKit(value: unknown): BrandKit | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const candidate = value as Partial<BrandKit>;
+  if (
+    typeof candidate.primary_color !== 'string'
+    || typeof candidate.accent_color !== 'string'
+  ) return null;
+  return {
+    name: typeof candidate.name === 'string' ? candidate.name : '',
+    primary_color: candidate.primary_color,
+    accent_color: candidate.accent_color,
+    font_family: typeof candidate.font_family === 'string' ? candidate.font_family : null,
+    logo_filename: typeof candidate.logo_filename === 'string' ? candidate.logo_filename : null,
+    logo_url: typeof candidate.logo_url === 'string' ? candidate.logo_url : null,
+  };
+}
+
+export async function fetchBrandKit(): Promise<BrandKit | null> {
+  const response = await apiFetch(`${API_BASE}/api/brand-kit`);
+  if (!response.ok) throw new Error(await responseError(response));
+  const value = (await response.json()) as { brand_kit?: unknown };
+  return parseBrandKit(value.brand_kit);
+}
+
+export async function saveBrandKit(kit: {
+  name: string;
+  primary_color: string;
+  accent_color: string;
+  font_family: string | null;
+}): Promise<BrandKit | null> {
+  const response = await apiFetch(`${API_BASE}/api/brand-kit`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(kit),
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+  const value = (await response.json()) as { brand_kit?: unknown };
+  return parseBrandKit(value.brand_kit);
+}
+
+export async function uploadBrandLogo(file: File): Promise<BrandKit | null> {
+  const form = new FormData();
+  form.append('file', file);
+  const response = await apiFetch(`${API_BASE}/api/brand-kit/logo`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+  const value = (await response.json()) as { brand_kit?: unknown };
+  return parseBrandKit(value.brand_kit);
+}
+
+export async function deleteBrandKit(): Promise<void> {
+  const response = await apiFetch(`${API_BASE}/api/brand-kit`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await responseError(response));
+}
+
+// --- Versiones de clip (Fase 3, ítem 6) --------------------------------------
+
+export interface ClipVersion {
+  version: number;
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+  has_subtitles: boolean;
+}
+
+export async function fetchClipVersions(
+  projectId: string,
+  clipId: string,
+): Promise<ClipVersion[]> {
+  const response = await apiFetch(
+    `${API_BASE}/api/projects/${projectId}/clips/${clipId}/versions`,
+  );
+  if (!response.ok) throw new Error(await responseError(response));
+  const value = (await response.json()) as { versions?: unknown };
+  if (!Array.isArray(value.versions)) return [];
+  return value.versions.filter((item): item is ClipVersion => (
+    typeof item === 'object'
+    && item !== null
+    && typeof (item as ClipVersion).version === 'number'
+    && typeof (item as ClipVersion).filename === 'string'
+  ));
+}
+
+export async function restoreClipVersion(
+  projectId: string,
+  clipId: string,
+  version: number,
+): Promise<ClipVersion[]> {
+  const response = await apiFetch(
+    `${API_BASE}/api/projects/${projectId}/clips/${clipId}/versions/${version}/restore`,
+    { method: 'POST' },
+  );
+  if (!response.ok) throw new Error(await responseError(response));
+  const value = (await response.json()) as { versions?: unknown };
+  if (!Array.isArray(value.versions)) return [];
+  return value.versions.filter((item): item is ClipVersion => (
+    typeof item === 'object'
+    && item !== null
+    && typeof (item as ClipVersion).version === 'number'
+  ));
+}
+
+// --- Traducción de subtítulos (Fase 3, ítem 7) -------------------------------
+// Devuelve el archivo traducido como Blob para descargarlo; sin clave
+// de IA el backend responde 409 con un mensaje claro.
+
+export async function downloadTranslatedSubtitles(
+  projectId: string,
+  clipId: string,
+  targetLanguage: string,
+  formatName: 'srt' | 'vtt',
+): Promise<{ blob: Blob; filename: string }> {
+  const response = await apiFetch(
+    `${API_BASE}/api/projects/${projectId}/clips/${clipId}/subtitles/translate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_language: targetLanguage, format_name: formatName }),
+    },
+  );
+  if (!response.ok) throw new Error(await responseError(response));
+  const disposition = response.headers.get('Content-Disposition') || '';
+  const match = /filename="([^"]+)"/.exec(disposition);
+  return {
+    blob: await response.blob(),
+    filename: match ? match[1] : `${clipId}-${targetLanguage}.${formatName}`,
+  };
+}

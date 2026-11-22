@@ -4,11 +4,17 @@ import asyncio
 import logging
 import os
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import database
 from .integrations import IntegrationError, provider_missing_credentials, publish_clip
+from .publish_guide import (
+    SCHEDULE_MAX_ATTEMPTS,
+    is_transient_publish_error,
+    retry_delay_for_attempt,
+)
 from .settings import AppSettings
 
 _logger = logging.getLogger(__name__)
@@ -47,6 +53,68 @@ def _export_clip(settings: AppSettings, job: dict[str, Any], clip: dict[str, Any
     return target
 
 
+def _attempts_of(settings: AppSettings, job: dict[str, Any]) -> int:
+    """Intentos ya hechos de este job, leídos de la BD.
+
+    El dict del job puede haberse leído antes o después de reclamarlo
+    (claim_schedule_job suma 1 al tomarlo), así que el dict no es fiable:
+    la BD tiene el valor actual. Si la BD no responde, se usa el dict + 1.
+    """
+    try:
+        current = database.get_schedule_job(settings.database_path, str(job["id"]))
+        if current is not None:
+            return max(int(current.get("attempts") or 0), 1)
+    except Exception:
+        _logger.exception(
+            "No se pudo leer los intentos de la tarea %s; se usa el valor del job.",
+            job["id"],
+        )
+    try:
+        return int(job.get("attempts") or 0) + 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _requeue_or_fail(
+    settings: AppSettings,
+    job: dict[str, Any],
+    error: str,
+    *,
+    output_path: str | None = None,
+) -> bool:
+    """Reencola el job con backoff si el fallo es transitorio y quedan
+    intentos; si no, lo marca como fallido (terminal). Devuelve True si
+    se reencoló. El MP4 exportado se regenera en cada intento y su ruta
+    queda guardada en el job al fallar de forma terminal.
+    """
+    attempts = _attempts_of(settings, job)
+    if attempts < SCHEDULE_MAX_ATTEMPTS and is_transient_publish_error(error):
+        next_attempt = datetime.now(UTC) + retry_delay_for_attempt(attempts)
+        if database.requeue_schedule_job_for_retry(
+            settings.database_path,
+            str(job["id"]),
+            next_attempt.isoformat(),
+            f"{error} Se reintentará automáticamente "
+            f"(intento {attempts + 1} de {SCHEDULE_MAX_ATTEMPTS}).",
+        ):
+            _logger.warning(
+                "La publicación %s falló (intento %d de %d); se reintenta a las %s.",
+                job["id"],
+                attempts,
+                SCHEDULE_MAX_ATTEMPTS,
+                next_attempt.isoformat(timespec="minutes"),
+            )
+            return True
+    database.finish_schedule_job(
+        settings.database_path,
+        str(job["id"]),
+        "failed",
+        output_path=output_path,
+        error=error,
+    )
+    return False
+
+
 def process_schedule_job(settings: AppSettings, job: dict[str, Any]) -> None:
     project = database.get_project(settings.database_path, str(job["project_id"]))
     if project is None:
@@ -60,10 +128,20 @@ def process_schedule_job(settings: AppSettings, job: dict[str, Any]) -> None:
 
     missing = provider_missing_credentials(str(job["platform"]), settings)
     owner_id = str(project["owner_id"])
-    account = database.get_connected_account(
-        settings.database_path,
-        str(job["platform"]),
-        owner_id,
+    account_id = job.get("account_id")
+    account = (
+        database.get_account_by_id(
+            settings.database_path,
+            str(job["platform"]),
+            str(account_id),
+            owner_id,
+        )
+        if account_id
+        else database.get_connected_account(
+            settings.database_path,
+            str(job["platform"]),
+            owner_id,
+        )
     )
     if missing or account is None:
         exported = _export_clip(settings, job, clip)
@@ -93,15 +171,15 @@ def process_schedule_job(settings: AppSettings, job: dict[str, Any]) -> None:
             / str(clip["filename"]),
             str(job["visibility"]),
             owner_id,
+            account_id=str(account_id) if account_id else None,
         )
     except IntegrationError as error:
         exported = _export_clip(settings, job, clip)
-        database.finish_schedule_job(
-            settings.database_path,
-            str(job["id"]),
-            "failed",
+        _requeue_or_fail(
+            settings,
+            job,
+            f"{error} El MP4 quedó exportado localmente; la publicación no se confirmó.",
             output_path=str(exported),
-            error=f"{error} El MP4 quedó exportado localmente; la publicación no se confirmó.",
         )
         return
 
@@ -161,6 +239,20 @@ def _finish_job_failed(settings: AppSettings, job: dict[str, Any], error: str) -
         )
 
 
+def _fail_or_retry_job(settings: AppSettings, job: dict[str, Any], error: str) -> None:
+    """Cierre de un job que lanzó fuera de publish_clip (timeout del
+    supervisor o error inesperado): reintenta con backoff si el fallo
+    parece transitorio y quedan intentos; si no, marca como fallido.
+    Nunca lanza (B22).
+    """
+    try:
+        _requeue_or_fail(settings, job, error)
+    except Exception:
+        _logger.exception(
+            "No se pudo marcar la tarea programada %s como fallida.", job["id"]
+        )
+
+
 async def _process_due_jobs(settings: AppSettings) -> None:
     """Un ciclo del supervisor: procesa los jobs vencidos, uno a uno.
 
@@ -189,12 +281,11 @@ async def _process_due_jobs(settings: AppSettings) -> None:
             )
         except TimeoutError:
             _logger.error(
-                "La tarea programada %s superó el tiempo máximo de %.0f s; "
-                "se marca como fallida.",
+                "La tarea programada %s superó el tiempo máximo de %.0f s.",
                 job["id"],
                 _SCHEDULE_JOB_TIMEOUT_SECONDS,
             )
-            _finish_job_failed(
+            _fail_or_retry_job(
                 settings,
                 job,
                 "La publicación superó el tiempo máximo de "
@@ -202,7 +293,7 @@ async def _process_due_jobs(settings: AppSettings) -> None:
             )
         except Exception as error:
             _logger.exception("No se pudo completar la tarea programada %s", job["id"])
-            _finish_job_failed(
+            _fail_or_retry_job(
                 settings,
                 job,
                 f"No se pudo completar la tarea programada: {error}",

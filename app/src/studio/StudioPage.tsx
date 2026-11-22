@@ -22,10 +22,13 @@ import type { ClipResult, ProjectResult } from '../types';
 import {
   apiCuesToLocal,
   exportStudioVideo,
+  fetchBrandKit,
   fetchClipCues,
   fetchFaceTrack,
   fetchRangeCues,
+  fetchWaveform,
   saveStudioEdit,
+  type BrandKit,
 } from './api';
 import { LeftSidebar } from './components/LeftSidebar';
 import { ExportModal, ScriptModal } from './components/Modals';
@@ -155,6 +158,15 @@ export function StudioPage({
   const [faceTrack, setFaceTrack] = useState<FaceTrack | null>(null);
   const [faceTrackStatus, setFaceTrackStatus] = useState<FaceTrackStatus>('idle');
   const [faceTrackProgress, setFaceTrackProgress] = useState<number | null>(null);
+
+  // Forma de onda (Fase 3, ítem 4b): undefined = cargando, null = no
+  // disponible (el backend falló o no hay audio), array = lista.
+  const [waveform, setWaveform] = useState<number[] | null | undefined>(undefined);
+  // Plantilla de marca (Fase 3, ítem 5): null = el usuario no tiene
+  // kit guardado. El logo se carga como imagen para dibujarlo en el
+  // canvas (vive en un ref, como la pista de rostro).
+  const [brandKit, setBrandKit] = useState<BrandKit | null>(null);
+  const brandLogoRef = useRef<HTMLImageElement | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -389,6 +401,40 @@ export function StudioPage({
     };
   }, [settings.faceFollow, settings.ratio, projectId, showToast]);
 
+  // Forma de onda y plantilla de marca (Fase 3, ítems 4b y 5): la onda
+  // se pide cuando se conoce la duración del video fuente; la marca,
+  // una vez por sesión del Studio. Ambas son best-effort: si fallan,
+  // la línea de tiempo muestra su estado vacío y el botón de marca
+  // queda sin efecto, sin bloquear el editor.
+  useEffect(() => {
+    if (duration <= 0) return;
+    let cancelled = false;
+    fetchWaveform(projectId, 0, duration)
+      .then((result) => {
+        if (!cancelled) setWaveform(result.peaks);
+      })
+      .catch(() => {
+        if (!cancelled) setWaveform(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [duration, projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchBrandKit()
+      .then((kit) => {
+        if (!cancelled) setBrandKit(kit);
+      })
+      .catch(() => {
+        if (!cancelled) setBrandKit(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const getBlurResources = useCallback(() => {
     if (!blurCanvasRef.current) {
       const bc = document.createElement('canvas');
@@ -428,10 +474,59 @@ export function StudioPage({
         // también durante la exportación), así que el follow-cam se
         // aplica en la exportación sin ningún cambio en ese camino.
         faceTrack: faceTrackRef.current,
+        brandLogo: brandLogoRef.current,
       });
     },
     [getBlurResources]
   );
+
+  // Logo de marca (Fase 3, ítem 5): cuando settings trae una URL de
+  // logo (al abrir un clip guardado con marca o al aplicarla), se
+  // carga la imagen y se redibuja el fotograma actual para que
+  // aparezca también en pausa. La URL viaja con la cookie de medios
+  // (como el video fuente y las miniaturas).
+  useEffect(() => {
+    const url = settings.brandLogoUrl;
+    if (!url) {
+      brandLogoRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const image = new Image();
+    image.onload = () => {
+      if (cancelled) return;
+      brandLogoRef.current = image;
+      drawCurrentFrame();
+    };
+    image.onerror = () => {
+      if (!cancelled) brandLogoRef.current = null;
+    };
+    image.src = url;
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.brandLogoUrl, drawCurrentFrame]);
+
+  // Aplicar la plantilla de marca al clip (Fase 3, ítem 5): colores
+  // de marca en subtítulos y barra de progreso, fuente de marca y
+  // logo. Los ajustes quedan en settings (se guardan con el clip).
+  const handleApplyBrand = useCallback(() => {
+    if (!brandKit) {
+      showToast('Aún no guardaste una plantilla de marca (pestaña Marca al crear un proyecto).');
+      return;
+    }
+    setSettings((prev) => ({
+      ...prev,
+      subColor: brandKit.primary_color,
+      subHighlight: brandKit.accent_color,
+      progressColor: brandKit.accent_color,
+      subFont: brandKit.font_family
+        ? `'${brandKit.font_family}', sans-serif`
+        : prev.subFont,
+      brandLogoUrl: brandKit.logo_url ? `${API_BASE}${brandKit.logo_url}` : null,
+    }));
+    showToast('Plantilla de marca aplicada a este clip.');
+  }, [brandKit, showToast]);
 
   const applyAudioVolumes = useCallback((volVideo: number, volBgm: number, bgmActive: boolean) => {
     const audioCtx = audioCtxRef.current;
@@ -1470,6 +1565,8 @@ export function StudioPage({
             bgmName={bgmName}
             faceTrackStatus={faceTrackStatus}
             faceTrackProgress={faceTrackProgress}
+            hasBrandKit={brandKit !== null}
+            onApplyBrand={handleApplyBrand}
             onUpdateSetting={updateSetting}
             onApplySubtitlePreset={applySubtitlePreset}
             onTrimStartChange={handleTrimStartChange}
@@ -1531,6 +1628,7 @@ export function StudioPage({
           bgmName={bgmName}
           subtitles={subtitles}
           selectedSubId={selectedSubId}
+          waveform={waveform}
           onSeek={seekTo}
           onSelectSub={setSelectedSubId}
           onMoveSub={handleMoveSub}

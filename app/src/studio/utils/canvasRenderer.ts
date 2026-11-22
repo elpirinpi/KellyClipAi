@@ -39,6 +39,10 @@ interface RenderFrameParams {
   // su propia caché en StudioPage; nunca en settings/studio_edit).
   // Solo se usa en modo cover con settings.faceFollow activo.
   faceTrack?: FaceTrack | null;
+  // Logo de marca (Fase 3, ítem 5): imagen ya cargada, o null. Vive
+  // en StudioPage (como la pista de rostro); settings solo guarda la
+  // URL. Se dibuja en la esquina superior derecha.
+  brandLogo?: HTMLImageElement | null;
 }
 
 interface ParsedWord {
@@ -451,6 +455,7 @@ export function renderEditorFrame({
   settings,
   subtitles,
   faceTrack,
+  brandLogo,
 }: RenderFrameParams): void {
   // Dimensiones según el ratio elegido; un ratio ausente o inválido
   // (p. ej. ajustes viejos sin ratio) cae al 9:16 por defecto.
@@ -566,4 +571,57 @@ export function renderEditorFrame({
   }
 
   drawSubtitles(ctx, cw, ch, currentTime, settings, subtitles);
+
+  // Texto de gancho (Fase 3, ítem 8): superpuesto en la parte
+  // superior durante los primeros 3 s del recorte. La exportación
+  // MediaRecorder captura este mismo canvas, así que el gancho queda
+  // quemado en el clip exportado sin ningún cambio en ese camino.
+  const hookText = (settings.hookText || '').trim();
+  if (
+    hookText
+    && currentTime >= settings.trimStart
+    && currentTime < settings.trimStart + 3
+  ) {
+    ctx.save();
+    const hookSize = Math.round(ch * 0.042);
+    ctx.font = `800 ${hookSize}px ${settings.subFont}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const maxWidth = cw * 0.86;
+    // Envolver en hasta 2 líneas para que no se salga del ancho.
+    const words = hookText.split(/\s+/);
+    const lines: string[] = [];
+    let current = '';
+    words.forEach((word) => {
+      const candidate = current ? `${current} ${word}` : word;
+      if (ctx.measureText(candidate).width > maxWidth && current) {
+        lines.push(current);
+        current = word;
+      } else {
+        current = candidate;
+      }
+    });
+    if (current) lines.push(current);
+    const shown = lines.slice(0, 2);
+    const lineHeight = hookSize * 1.25;
+    const startY = ch * 0.14 - ((shown.length - 1) * lineHeight) / 2;
+    shown.forEach((line, index) => {
+      const y = startY + index * lineHeight;
+      ctx.lineWidth = Math.max(6, hookSize * 0.18);
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.strokeText(line, cw / 2, y);
+      ctx.fillStyle = settings.subHighlight;
+      ctx.fillText(line, cw / 2, y);
+    });
+    ctx.restore();
+  }
+
+  // Logo de marca (Fase 3, ítem 5): esquina superior derecha, a un
+  // 18 % del ancho del canvas. Solo se dibuja con la imagen cargada.
+  if (brandLogo && brandLogo.complete && brandLogo.naturalWidth > 0) {
+    const logoWidth = cw * 0.18;
+    const logoHeight = (brandLogo.naturalHeight / brandLogo.naturalWidth) * logoWidth;
+    const margin = cw * 0.03;
+    ctx.drawImage(brandLogo, cw - logoWidth - margin, margin, logoWidth, logoHeight);
+  }
 }

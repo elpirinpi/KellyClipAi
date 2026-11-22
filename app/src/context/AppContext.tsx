@@ -3,6 +3,7 @@ import type { Session } from '@supabase/supabase-js';
 import { useLocation, useMatch, useNavigate } from 'react-router-dom';
 import { apiFetch } from '../auth';
 import { useAuth } from '../hooks/useAuth';
+import { useDesktopNotifications } from '../hooks/useDesktopNotifications';
 import { useGlobalShortcuts } from '../hooks/useGlobalShortcuts';
 import { useImport } from '../hooks/useImport';
 import { useLinkImport } from '../hooks/useLinkImport';
@@ -33,6 +34,9 @@ export type AppContextValue = {
   navigate: (next: string) => void;
   isSettings: boolean;
   isProjects: boolean;
+  isCalendar: boolean;
+  isQueue: boolean;
+  isBroll: boolean;
   shareToken: string;
   projectRouteId: string;
   projectRouteMode: ProjectRouteMode;
@@ -121,6 +125,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const isSettings = Boolean(useMatch('/settings'));
   // Fase 2 (ítem 15): ruta de la página "Mis proyectos".
   const isProjects = Boolean(useMatch('/projects'));
+  // Fase 3 (ítems 9, 11, 13): calendario, cola y biblioteca de B-roll.
+  const isCalendar = Boolean(useMatch('/calendar'));
+  const isQueue = Boolean(useMatch('/queue'));
+  const isBroll = Boolean(useMatch('/broll'));
   const shareToken = useMatch('/share/:token')?.params.token ?? '';
   const configureMatch = useMatch('/p/:projectId/configure');
   const processingMatch = useMatch('/p/:projectId/processing');
@@ -162,6 +170,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     navigate,
     onConfigureProject: config.applyProjectConfiguration,
   });
+
+  // Fase 3 (ítem 18, C.4.31): aviso de escritorio cuando un
+  // procesamiento largo termina con la ventana oculta.
+  useDesktopNotifications({ project });
 
   const beginProjectProcessing = async (projectId: string) => {
     const response = await apiFetch(`${API_BASE}/api/projects/${projectId}/process`, {
@@ -271,6 +283,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     navigate,
     isSettings,
     isProjects,
+    isCalendar,
+    isQueue,
+    isBroll,
     shareToken,
     projectRouteId,
     projectRouteMode,

@@ -13,8 +13,15 @@ from pathlib import Path
 from typing import Any
 
 _RELEASE_URL = "https://api.github.com/repos/elpirinpi/KellyClipAi/releases/latest"
+_RELEASES_URL = "https://api.github.com/repos/elpirinpi/KellyClipAi/releases?per_page=20"
+_RELEASE_TAG_URL = "https://api.github.com/repos/elpirinpi/KellyClipAi/releases/tags/v{version}"
 _MAX_INSTALLER_SIZE = 1024 * 1024 * 1024
+# Notas de la versión que se muestran en la app antes de instalar
+# (C.6.40): recortadas para que un changelog largo no hinche el estado.
+_MAX_RELEASE_NOTES_CHARS = 4000
 _VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+_PRERELEASE_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
+_CHANNELS = ("stable", "beta")
 _INSTALLER_NAME_PATTERN = re.compile(r"^KellyClipAi-Setup-.*\.exe(\.part)?$")
 logger = logging.getLogger(__name__)
 
@@ -61,7 +68,35 @@ def _version_tuple(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in match.groups())
 
 
-def _request_json(url: str) -> dict[str, Any]:
+def _prerelease_parts(value: str) -> tuple[tuple[int, Any], ...]:
+    """Partes de un sufijo prerelease para comparar (semver): los
+    números comparan numéricamente y van antes que las letras."""
+    parts: list[tuple[int, Any]] = []
+    for part in value.replace("-", ".").split("."):
+        if part.isdigit():
+            parts.append((0, int(part)))
+        else:
+            parts.append((1, part))
+    return tuple(parts)
+
+
+def _version_key(value: str) -> tuple[int, int, int, int, tuple[tuple[int, Any], ...]]:
+    """Clave comparable de una versión, con prereleases (C.6.40).
+
+    Una versión estable es mayor que cualquier prerelease de su misma
+    base (1.4.0 > 1.4.0-rc.1) y entre prereleases manda el sufijo
+    (1.4.0-beta.1 < 1.4.0-beta.2 < 1.4.0-rc.1).
+    """
+    match = _PRERELEASE_PATTERN.fullmatch(value)
+    if match is None:
+        raise UpdateError("GitHub devolvió una versión no válida.")
+    major, minor, patch, prerelease = match.groups()
+    if prerelease is None:
+        return int(major), int(minor), int(patch), 1, ()
+    return int(major), int(minor), int(patch), 0, _prerelease_parts(prerelease)
+
+
+def _fetch_json(url: str) -> Any:
     request = urllib.request.Request(
         url,
         headers={
@@ -72,7 +107,7 @@ def _request_json(url: str) -> dict[str, Any]:
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read())
+            return json.loads(response.read())
     except urllib.error.HTTPError as error:
         raise UpdateError(
             f"GitHub respondió con un error al consultar actualizaciones (HTTP {error.code})."
@@ -83,7 +118,20 @@ def _request_json(url: str) -> dict[str, Any]:
         ) from error
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise UpdateError("GitHub devolvió una respuesta de actualización no válida.") from error
+
+
+def _request_json(url: str) -> dict[str, Any]:
+    payload = _fetch_json(url)
     if not isinstance(payload, dict):
+        raise UpdateError("GitHub devolvió una respuesta de actualización no válida.")
+    return payload
+
+
+def _request_json_list(url: str) -> list[Any]:
+    """Como _request_json, para los endpoints que devuelven una lista
+    (el listado de releases del canal beta)."""
+    payload = _fetch_json(url)
+    if not isinstance(payload, list):
         raise UpdateError("GitHub devolvió una respuesta de actualización no válida.")
     return payload
 
@@ -101,6 +149,11 @@ class UpdateManager:
         self.enabled = os.name == "nt" and application_path is not None
         self._lock = threading.Lock()
         self._latest: dict[str, Any] | None = None
+        # Canal de actualizaciones (C.6.40) e historial de versiones
+        # para el rollback (C.6.37): ambos viven en archivos JSON
+        # junto a los instaladores descargados.
+        self._channel = self._read_channel()
+        self._previous_version = self._record_version_history()
         self._status: dict[str, Any] = {
             "enabled": self.enabled,
             "current_version": current_version,
@@ -109,12 +162,218 @@ class UpdateManager:
             "state": "idle" if self.enabled else "unavailable",
             "progress": 0,
             "error": None,
+            "channel": self._channel,
+            "release_notes": None,
+            "release_url": None,
+            "is_prerelease": False,
+            # True cuando lo pendiente de instalar es la versión
+            # anterior (rollback), no una actualización.
+            "rollback": False,
+            "previous_version": self._previous_version,
+            "rollback_available": self._previous_version is not None,
         }
         self._thread: threading.Thread | None = None
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._status)
+
+    # --- Canal beta (C.6.40) -------------------------------------------
+
+    @property
+    def channel(self) -> str:
+        return self._channel
+
+    def _read_channel(self) -> str:
+        path = self.update_dir / "channel.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "stable"
+        channel = payload.get("channel") if isinstance(payload, dict) else None
+        return channel if channel in _CHANNELS else "stable"
+
+    def set_channel(self, channel: str) -> dict[str, Any]:
+        """Cambia el canal y descarta cualquier actualización pendiente:
+        lo encontrado en un canal no vale para el otro."""
+        if channel not in _CHANNELS:
+            raise UpdateError("El canal de actualizaciones no es válido.")
+        self.update_dir.mkdir(parents=True, exist_ok=True)
+        channel_file = self.update_dir / "channel.json"
+        temporary = channel_file.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({"channel": channel}, indent=2), encoding="utf-8")
+        temporary.replace(channel_file)
+        with self._lock:
+            self._channel = channel
+            self._latest = None
+            self._status.update(
+                latest_version=None,
+                update_available=False,
+                state="idle" if self.enabled else "unavailable",
+                progress=0,
+                error=None,
+                channel=channel,
+                release_notes=None,
+                release_url=None,
+                is_prerelease=False,
+                rollback=False,
+            )
+            return dict(self._status)
+
+    # --- Historial de versiones y rollback (C.6.37) --------------------
+
+    def _record_version_history(self) -> str | None:
+        """Registra la versión con la que arranca la app.
+
+        Al detectar un cambio de versión (actualización o rollback
+        instalados), la versión anterior queda guardada como candidata
+        de "Restaurar versión anterior". Un historial ausente o
+        corrupto equivale a no tener versión anterior.
+        """
+        history_file = self.update_dir / "version-history.json"
+        try:
+            payload = json.loads(history_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        previous = None
+        if isinstance(payload, dict):
+            stored_current = payload.get("current_version")
+            stored_previous = payload.get("previous_version")
+            if isinstance(stored_previous, str) and stored_previous:
+                previous = stored_previous
+            if (
+                isinstance(stored_current, str)
+                and stored_current
+                and stored_current != self.current_version
+            ):
+                try:
+                    _version_key(stored_current)
+                except UpdateError:
+                    logger.warning(
+                        "Historial de versiones con versión no válida: %s",
+                        stored_current,
+                    )
+                else:
+                    previous = stored_current
+        try:
+            self.update_dir.mkdir(parents=True, exist_ok=True)
+            temporary = history_file.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "current_version": self.current_version,
+                        "previous_version": previous,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(history_file)
+        except OSError:
+            logger.warning("No se pudo guardar el historial de versiones.")
+        return previous
+
+    def rollback_info(self) -> dict[str, Any]:
+        """¿Se puede restaurar la versión anterior?
+
+        ``installer_ready`` indica que el instalador de la versión
+        anterior sigue en el directorio de updates (la restauración
+        no necesita descargarlo de nuevo).
+        """
+        if self._previous_version is None:
+            return {
+                "available": False,
+                "previous_version": None,
+                "installer_ready": False,
+            }
+        installer = self.update_dir / f"KellyClipAi-Setup-{self._previous_version}.exe"
+        return {
+            "available": True,
+            "previous_version": self._previous_version,
+            "installer_ready": installer.is_file(),
+        }
+
+    def start_rollback(self) -> dict[str, Any]:
+        """Inicia la restauración de la versión anterior: descarga su
+        instalador desde GitHub (o reutiliza el guardado) y deja la
+        app lista para instalarlo con el flujo normal."""
+        if not self.enabled:
+            raise UpdateError("Las actualizaciones están disponibles solo en la app instalada.")
+        if self._previous_version is None:
+            raise UpdateError("No hay ninguna versión anterior guardada para restaurar.")
+        with self._lock:
+            if self._status["state"] in {"checking", "downloading"}:
+                return dict(self._status)
+            self._status.update(
+                state="checking",
+                progress=0,
+                error=None,
+                rollback=True,
+                latest_version=self._previous_version,
+                update_available=True,
+            )
+            self._thread = threading.Thread(
+                target=self._rollback_to_previous,
+                name="kellyclipai-rollback",
+                daemon=True,
+            )
+            self._thread.start()
+            return dict(self._status)
+
+    def _rollback_to_previous(self) -> None:
+        try:
+            previous_version = self._previous_version
+            if previous_version is None:
+                raise UpdateError("No hay ninguna versión anterior guardada para restaurar.")
+            release = _request_json(_RELEASE_TAG_URL.format(version=previous_version))
+            if release.get("draft"):
+                raise UpdateError("La versión anterior ya no está disponible en GitHub.")
+            latest = self._validated_release(release, previous_version)
+            installer = self.update_dir / latest["asset_name"]
+            if installer.is_file():
+                # El instalador de la versión anterior se conservó al
+                # actualizar: se verifica el hash contra el release y,
+                # si coincide, no hace falta descargar nada.
+                try:
+                    local_matches = _sha256_file(installer) == latest["sha256"]
+                except OSError:
+                    local_matches = False
+                if local_matches:
+                    with self._lock:
+                        self._latest = latest
+                        self._status.update(
+                            latest_version=previous_version,
+                            update_available=True,
+                            state="downloaded",
+                            progress=100,
+                            error=None,
+                            release_notes=latest["release_notes"],
+                            release_url=latest["release_url"],
+                            is_prerelease=latest["is_prerelease"],
+                        )
+                    return
+            with self._lock:
+                self._latest = latest
+            self._download_installer(latest)
+        except UpdateError as error:
+            with self._lock:
+                self._status.update(
+                    state="error",
+                    error=str(error),
+                    rollback=False,
+                    update_available=False,
+                    latest_version=None,
+                )
+        except Exception:
+            logger.exception("Falló la restauración de la versión anterior")
+            with self._lock:
+                self._status.update(
+                    state="error",
+                    error="No se pudo restaurar la versión anterior.",
+                    rollback=False,
+                    update_available=False,
+                    latest_version=None,
+                )
 
     def start_check(self) -> dict[str, Any]:
         if not self.enabled:
@@ -137,59 +396,108 @@ class UpdateManager:
             self._thread.start()
             return dict(self._status)
 
-    def _check_latest_release(self) -> None:
-        try:
-            release = _request_json(_RELEASE_URL)
-            if release.get("draft") or release.get("prerelease"):
-                raise UpdateError("El release más reciente no es una versión estable.")
+    def _validated_release(self, release: dict[str, Any], version: str) -> dict[str, Any]:
+        """Valida el instalador de un release y devuelve sus datos.
+
+        Las mismas comprobaciones que ya hacía la comprobación de
+        actualizaciones: el asset existe, su digest SHA-256 es válido
+        y la URL de descarga es la oficial de GitHub. Además recoge
+        las notas de la versión para mostrarlas antes de instalar
+        (C.6.40).
+        """
+        asset_name = f"KellyClipAi-Setup-{version}.exe"
+        assets = release.get("assets")
+        if not isinstance(assets, list):
+            raise UpdateError("El release no incluye el instalador de Windows.")
+        asset = next(
+            (item for item in assets if isinstance(item, dict) and item.get("name") == asset_name),
+            None,
+        )
+        if asset is None:
+            raise UpdateError(
+                "Hay una versión nueva, pero todavía no está disponible su instalador."
+            )
+        digest = str(asset.get("digest", ""))
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+            raise UpdateError("El instalador no tiene una suma SHA-256 verificable.")
+        download_url = str(asset.get("browser_download_url", ""))
+        parsed_url = urllib.parse.urlparse(download_url)
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.hostname != "github.com"
+            or not parsed_url.path.startswith(
+                f"/elpirinpi/KellyClipAi/releases/download/v{version}/"
+            )
+        ):
+            raise UpdateError("La dirección del instalador no es confiable.")
+        notes = release.get("body")
+        release_notes = None
+        if isinstance(notes, str) and notes.strip():
+            release_notes = notes.strip()[:_MAX_RELEASE_NOTES_CHARS]
+        release_url = release.get("html_url")
+        return {
+            "version": version,
+            "download_url": download_url,
+            "sha256": digest.removeprefix("sha256:").lower(),
+            "size": int(asset.get("size", 0)),
+            "asset_name": asset_name,
+            "release_notes": release_notes,
+            "release_url": release_url if isinstance(release_url, str) else None,
+            "is_prerelease": bool(release.get("prerelease")),
+        }
+
+    def _select_beta_release(self) -> tuple[dict[str, Any], str]:
+        """Release más reciente del canal beta (C.6.40).
+
+        GitHub devuelve el listado de más reciente a más antiguo: el
+        primer release no borrador con una versión válida y con
+        instalador es el candidato, sea estable o prerelease. Los
+        releases sin instalador (p. ej. publicados antes de que el
+        workflow adjunte el .exe) se saltan en vez de fallar.
+        """
+        releases = _request_json_list(_RELEASES_URL)
+        for release in releases:
+            if not isinstance(release, dict) or release.get("draft"):
+                continue
             version = str(release.get("tag_name", "")).removeprefix("v")
-            latest_version = _version_tuple(version)
-            current_version = _version_tuple(self.current_version)
+            try:
+                _version_key(version)
+            except UpdateError:
+                continue
             asset_name = f"KellyClipAi-Setup-{version}.exe"
             assets = release.get("assets")
             if not isinstance(assets, list):
-                raise UpdateError("El release no incluye el instalador de Windows.")
-            asset = next(
-                (
-                    item
-                    for item in assets
-                    if isinstance(item, dict) and item.get("name") == asset_name
-                ),
-                None,
-            )
-            is_newer = latest_version > current_version
-            if is_newer and asset is None:
-                raise UpdateError(
-                    "Hay una versión nueva, pero todavía no está disponible su instalador."
-                )
-            digest = str(asset.get("digest", "")) if asset else ""
-            if is_newer and not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
-                raise UpdateError("El instalador no tiene una suma SHA-256 verificable.")
-            download_url = str(asset.get("browser_download_url", "")) if asset else ""
-            parsed_url = urllib.parse.urlparse(download_url)
-            if is_newer and (
-                parsed_url.scheme != "https"
-                or parsed_url.hostname != "github.com"
-                or not parsed_url.path.startswith(
-                    f"/elpirinpi/KellyClipAi/releases/download/v{version}/"
-                )
+                continue
+            if not any(
+                isinstance(item, dict) and item.get("name") == asset_name for item in assets
             ):
-                raise UpdateError("La dirección del instalador no es confiable.")
-            latest = {
-                "version": version,
-                "download_url": download_url,
-                "sha256": digest.removeprefix("sha256:").lower(),
-                "size": int(asset.get("size", 0)) if asset else 0,
-                "asset_name": asset_name,
-            }
+                continue
+            return release, version
+        raise UpdateError("No hay ninguna versión disponible en el canal beta todavía.")
+
+    def _check_latest_release(self) -> None:
+        try:
+            if self._channel == "beta":
+                release, version = self._select_beta_release()
+            else:
+                release = _request_json(_RELEASE_URL)
+                if release.get("draft") or release.get("prerelease"):
+                    raise UpdateError("El release más reciente no es una versión estable.")
+                version = str(release.get("tag_name", "")).removeprefix("v")
+            is_newer = _version_key(version) > _version_key(self.current_version)
+            latest = self._validated_release(release, version) if is_newer else None
             with self._lock:
-                self._latest = latest if is_newer else None
+                self._latest = latest
                 self._status.update(
                     latest_version=version,
                     update_available=is_newer,
                     state="available" if is_newer else "current",
                     progress=0,
                     error=None,
+                    release_notes=latest["release_notes"] if latest else None,
+                    release_url=latest["release_url"] if latest else None,
+                    is_prerelease=latest["is_prerelease"] if latest else False,
+                    rollback=False,
                 )
         except UpdateError as error:
             with self._lock:
@@ -388,7 +696,9 @@ class UpdateManager:
 
     def _cleanup_old_installers(self, keep: Path) -> None:
         """Borra instaladores de versiones anteriores del directorio de
-        updates, conservando solo el descargado actual (`keep`).
+        updates, conservando el descargado actual (`keep`) y el de la
+        versión instalada: ese último es el que permite "Restaurar
+        versión anterior" sin descargar nada (C.6.37).
 
         Solo se tocan archivos con el nombre de nuestros instaladores
         (KellyClipAi-Setup-*.exe y sus .part); cualquier otro archivo del
@@ -399,8 +709,11 @@ class UpdateManager:
             entries = list(self.update_dir.iterdir())
         except OSError:
             return
+        current_installer = f"KellyClipAi-Setup-{self.current_version}.exe"
         for entry in entries:
             if entry.resolve() == keep.resolve():
+                continue
+            if entry.name == current_installer:
                 continue
             if not _INSTALLER_NAME_PATTERN.fullmatch(entry.name):
                 continue

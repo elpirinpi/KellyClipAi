@@ -1,3 +1,7 @@
 -r requirements.txt
 pywebview==5.4
 pyinstaller==6.15.0
+# Bandeja del sistema (Fase 3, ítem 18, C.6.38): dependencia opcional
+# en runtime (la app arranca sin bandeja si falta), pero instalada en
+# el bundle de escritorio. Pillow ya estaba en el lock (vía matplotlib).
+pystray==0.19.5

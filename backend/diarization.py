@@ -1304,6 +1304,76 @@ def detect_speakers(
     )
 
 
+def get_speaker_result(
+    input_path: Path | str | None,
+    duration: float,
+    ffmpeg_path: str | None,
+    *,
+    enabled: bool = True,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    embed_workers: int = _EMBED_WORKERS,
+) -> DiarizationResult | None:
+    """Diarización completa (timeline + segmentos) o None si no se pudo.
+
+    Mismo contrato que ``get_speaker_timeline``: nunca lanza por
+    problemas de la diarización (sin runtime, sin modelo, sin red,
+    sin audio) — registra un aviso y devuelve None. Solo propaga
+    DiarizationCancelled. El render usa los segmentos para el split
+    dinámico (Fase 3, ítem 3b).
+    """
+    if not enabled or input_path is None or not ffmpeg_path:
+        return None
+    try:
+        return detect_speakers(
+            input_path,
+            duration,
+            ffmpeg_path,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+            embed_workers=embed_workers,
+        )
+    except DiarizationCancelled:
+        raise
+    except DiarizationError as error:
+        logger.warning("Diarización no disponible (%s); el motor sigue sin este canal.", error)
+        return None
+    except Exception as error:  # Defensa: la diarización jamás rompe un proyecto.
+        logger.warning(
+            "La diarización falló de forma inesperada (%s); el motor sigue sin este canal.",
+            error,
+        )
+        return None
+
+
+def get_speaker_segments(
+    input_path: Path | str | None,
+    duration: float,
+    ffmpeg_path: str | None,
+    *,
+    enabled: bool = True,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    embed_workers: int = _EMBED_WORKERS,
+) -> list[dict[str, float | int]]:
+    """Segmentos de hablante como dicts JSON (para metadata y render)."""
+    result = get_speaker_result(
+        input_path,
+        duration,
+        ffmpeg_path,
+        enabled=enabled,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+        embed_workers=embed_workers,
+    )
+    if result is None:
+        return []
+    return [
+        {"start": segment.start, "end": segment.end, "speaker": segment.speaker}
+        for segment in result.segments
+    ]
+
+
 def get_speaker_timeline(
     input_path: Path | str | None,
     duration: float,
@@ -1323,28 +1393,16 @@ def get_speaker_timeline(
     pipeline debe traducir a su propia cancelación.
     ``embed_workers`` paraleliza los embeddings (ver _EMBED_WORKERS).
     """
-    if not enabled or input_path is None or not ffmpeg_path:
-        return None
-    try:
-        result = detect_speakers(
-            input_path,
-            duration,
-            ffmpeg_path,
-            on_progress=on_progress,
-            should_cancel=should_cancel,
-            embed_workers=embed_workers,
-        )
-    except DiarizationCancelled:
-        raise
-    except DiarizationError as error:
-        logger.warning("Diarización no disponible (%s); el motor sigue sin este canal.", error)
-        return None
-    except Exception as error:  # Defensa: la diarización jamás rompe un proyecto.
-        logger.warning(
-            "La diarización falló de forma inesperada (%s); el motor sigue sin este canal.",
-            error,
-        )
-        return None
+    result = get_speaker_result(
+        input_path,
+        duration,
+        ffmpeg_path,
+        enabled=enabled,
+        on_progress=on_progress,
+        should_cancel=should_cancel,
+        embed_workers=embed_workers,
+    )
+    return result.timeline if result is not None else None
     turns = sum(
         1
         for prev, cur in zip(result.segments, result.segments[1:], strict=False)

@@ -766,7 +766,9 @@ def test_cleanup_removes_old_installers_and_keeps_current(
 ) -> None:
     manager = UpdateManager("1.0.4", tmp_path, tmp_path / "KellyClipAi.exe")
     update_dir = tmp_path / "updates"
-    update_dir.mkdir(parents=True)
+    # El constructor ya crea el directorio (historial de versiones,
+    # Fase 3, C.6.37): exist_ok para no depender de ese detalle.
+    update_dir.mkdir(parents=True, exist_ok=True)
     current = update_dir / "KellyClipAi-Setup-1.0.4.exe"
     current.write_bytes(b"actual")
     old_exe = update_dir / "KellyClipAi-Setup-1.0.3.exe"
@@ -824,6 +826,8 @@ def test_download_cleans_up_previous_installers(
     update_dir.mkdir(parents=True)
     old_installer = update_dir / "KellyClipAi-Setup-1.0.3.exe"
     old_installer.write_bytes(b"viejo")
+    ancient_installer = update_dir / "KellyClipAi-Setup-1.0.2.exe"
+    ancient_installer.write_bytes(b"muy viejo")
 
     manager = UpdateManager("1.0.3", tmp_path, tmp_path / "KellyClipAi.exe")
     manager.enabled = True
@@ -836,4 +840,8 @@ def test_download_cleans_up_previous_installers(
 
     assert manager.status()["state"] == "downloaded"
     assert (update_dir / "KellyClipAi-Setup-1.0.4.exe").read_bytes() == payload
-    assert not old_installer.exists()
+    # Fase 3 (C.6.37): el instalador de la versión instalada se
+    # conserva como candidato de "Restaurar versión anterior"; solo
+    # los instaladores más antiguos se borran.
+    assert old_installer.exists()
+    assert not ancient_installer.exists()

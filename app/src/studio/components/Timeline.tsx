@@ -1,5 +1,8 @@
-import React, { useRef } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { SubtitleCue } from '../types/editor';
+
+// Ventana de gancho (Fase 3, ítem 8): los primeros 3 s del clip.
+const HOOK_SECONDS = 3;
 
 interface TimelineProps {
   duration: number;
@@ -11,9 +14,60 @@ interface TimelineProps {
   bgmName: string;
   subtitles: SubtitleCue[];
   selectedSubId: number | null;
+  // Picos de la forma de onda (Fase 3, ítem 4b), normalizados 0-1,
+  // cubriendo [0, duration). Null mientras se cargan o si fallaron.
+  waveform?: number[] | null;
   onSeek: (time: number) => void;
   onSelectSub: (id: number) => void;
   onMoveSub: (id: number, start: number, end: number) => void;
+}
+
+// Lienzo de la forma de onda: una barra por pico, centrada
+// verticalmente. Las barras dentro del recorte van en índigo y las de
+// fuera en gris, para ver de un vistazo qué parte del audio se usa.
+function WaveformCanvas({
+  waveform,
+  duration,
+  trimStart,
+  trimEnd,
+}: {
+  waveform: number[];
+  duration: number;
+  trimStart: number;
+  trimEnd: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const width = canvas.width;
+    const height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    if (!waveform.length || duration <= 0) return;
+    const barWidth = width / waveform.length;
+    waveform.forEach((peak, index) => {
+      const time = (index / waveform.length) * duration;
+      const inTrim = time >= trimStart && time < trimEnd;
+      const barHeight = Math.max(2, peak * (height - 4));
+      const x = index * barWidth;
+      const y = (height - barHeight) / 2;
+      ctx.fillStyle = inTrim ? '#818cf8' : '#475569';
+      ctx.fillRect(x, y, Math.max(1, barWidth - 0.5), barHeight);
+    });
+  }, [waveform, duration, trimStart, trimEnd]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={1200}
+      height={28}
+      className="absolute inset-0 h-full w-full"
+      aria-hidden="true"
+    />
+  );
 }
 
 export function Timeline({
@@ -26,6 +80,7 @@ export function Timeline({
   bgmName,
   subtitles,
   selectedSubId,
+  waveform,
   onSeek,
   onSelectSub,
   onMoveSub,
@@ -45,6 +100,10 @@ export function Timeline({
   const trimLeftPct = (trimStart / safeDur) * 100;
   const trimWidthPct = Math.max(0.5, ((trimEnd - trimStart) / safeDur) * 100);
   const exportDur = Math.max(0, trimEnd - trimStart) / speed;
+  // Ventana de gancho: los primeros 3 s del recorte (o menos, si el
+  // clip es más corto). Se marca en ámbar sobre la pista de video.
+  const hookEnd = Math.min(trimStart + HOOK_SECONDS, trimEnd);
+  const hookWidthPct = Math.max(0, ((hookEnd - trimStart) / safeDur) * 100);
 
   const scrubFromClientX = (clientX: number) => {
     const el = tracksRef.current;
@@ -106,7 +165,7 @@ export function Timeline({
   };
 
   return (
-    <footer className="h-[156px] shrink-0 bg-[#12151c] border-t border-slate-800/90 flex flex-col">
+    <footer className="h-[188px] shrink-0 bg-[#12151c] border-t border-slate-800/90 flex flex-col">
       <div className="h-8 px-4 border-b border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
         <span>Línea de tiempo (arrastra los bloques de subtítulos para sincronizarlos)</span>
         <div className="flex items-center gap-2 font-mono-tabular">
@@ -135,6 +194,36 @@ export function Timeline({
               className="absolute top-0 bottom-0 bg-indigo-500/20 border-l-2 border-r-2 border-indigo-400"
               style={{ left: `${trimLeftPct}%`, width: `${trimWidthPct}%` }}
             />
+            {hookWidthPct > 0 && (
+              <div
+                className="absolute top-0 bottom-0 bg-amber-400/25 border-r border-amber-400/70 pointer-events-none"
+                style={{ left: `${trimLeftPct}%`, width: `${hookWidthPct}%` }}
+                title="Ventana de gancho: los primeros 3 segundos del clip"
+              >
+                <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[9px] font-bold text-amber-300 whitespace-nowrap">
+                  Gancho 3s
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Audio Waveform Track */}
+          <div className="h-7 bg-[#0b0d11] border border-slate-800 rounded-md relative overflow-hidden">
+            <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-400 z-10 pointer-events-none">
+              Audio
+            </span>
+            {waveform && waveform.length > 0 ? (
+              <WaveformCanvas
+                waveform={waveform}
+                duration={safeDur}
+                trimStart={trimStart}
+                trimEnd={trimEnd}
+              />
+            ) : (
+              <span className="absolute left-16 top-1/2 -translate-y-1/2 text-[10px] text-slate-600 pointer-events-none">
+                {waveform === null ? 'Forma de onda no disponible' : 'Cargando forma de onda…'}
+              </span>
+            )}
           </div>
 
           {/* Subtitles Track */}

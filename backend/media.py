@@ -871,6 +871,7 @@ def _write_ass(
     clip_duration: float,
     retained: list[tuple[float, float]],
     resolution: int = 720,
+    brand: dict[str, Any] | None = None,
 ) -> list[tuple[float, float]]:
     width, height = _ratio_size(config.ratio, resolution)
     scale = resolution / 720
@@ -885,6 +886,18 @@ def _write_ass(
         "Neón": ("Arial Black", 60, "&H00FFFF66", "&H00FFFFFF", 4, 1, 2),
     }.get(config.subtitle_template, ("Arial", 58, "&H00FFFFFF", "&H0000FFFF", 3, 1, 2))
     font, size, primary, secondary, outline, shadow, alignment = style
+    # Plantilla de marca (Fase 3, ítem 5): los colores y la fuente de
+    # marca sustituyen a los de la plantilla; los ajustes manuales de
+    # estilo (abajo) siguen ganando a la marca. Los colores se validan
+    # (la API ya los valida, pero el kit puede venir de datos viejos).
+    if brand:
+        font = str(brand.get("font_family") or font)
+        brand_primary = str(brand.get("primary_color") or "")
+        brand_accent = str(brand.get("accent_color") or "")
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", brand_primary):
+            primary = _ass_color(brand_primary) or primary
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", brand_accent):
+            secondary = _ass_color(brand_accent) or secondary
     overrides = config.subtitle_style
     font = overrides.font_family or font
     size = overrides.font_size or size
@@ -1034,6 +1047,8 @@ def _build_filter(
     include_broll: bool = False,
     crop_paths: list[list[FaceCropKeyframe] | None] | None = None,
     framing: str = "speaker",
+    punch_in_ranges: list[tuple[float, float]] | None = None,
+    logo_input: int | None = None,
 ) -> tuple[str, str, str]:
     parts: list[str] = []
     video_labels: list[str] = []
@@ -1114,6 +1129,27 @@ def _build_filter(
             + f"concat=n={len(intervals)}:v=1:a=1[vcat][acat]"
         )
         video_input, audio_input = "[vcat]", "[acat]"
+    if punch_in_ranges:
+        # Zoom punch-in (Fase 3, ítem 3b): en los rangos de alta
+        # energía se recorta un 15 % (zoom x1.18) y se reescala al
+        # tamaño del clip. Las expresiones se evalúan por fotograma
+        # sobre la línea de tiempo CONCATENADA (tras quitar silencios
+        # y muletillas); el llamador remapea los rangos. Las
+        # dimensiones se fuerzan a pares (trunc/2*2) y las posiciones
+        # a pares para el submuestreo de croma yuv420p.
+        enable = "+".join(
+            f"between(t,{_filter_time(start)},{_filter_time(end)})"
+            for start, end in punch_in_ranges
+        )
+        parts.append(
+            f"{video_input}crop="
+            "w='if(" + enable + ",trunc(iw/1.18/2)*2,iw)':"
+            "h='if(" + enable + ",trunc(ih/1.18/2)*2,ih)':"
+            "x='trunc((iw-ow)/4)*2':y='trunc((ih-oh)/4)*2',"
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}[vzoom]"
+        )
+        video_input = "[vzoom]"
     if include_broll:
         cut_ranges = _broll_cut_ranges(clip_duration)
         if cut_ranges:
@@ -1135,6 +1171,14 @@ def _build_filter(
         f"{video_input}subtitles=filename='{subtitle_path.name}'[vout]"
     )
     video_output = "[vout]"
+    if logo_input is not None:
+        # Logo de marca (Fase 3, ítem 5): esquina superior derecha, a
+        # un cuarto del ancho del clip. La entrada del logo es una
+        # imagen en bucle (-loop 1), así que nunca se agota.
+        logo_width = max(64, width // 4)
+        parts.append(f"[{logo_input}:v]scale={logo_width}:-1[logo]")
+        parts.append(f"{video_output}[logo]overlay=x=W-w-24:y=24[vlogo]")
+        video_output = "[vlogo]"
     if censor_ranges:
         enable = "+".join(
             f"between(t,{_filter_time(start)},{_filter_time(end)})"
@@ -1174,11 +1218,47 @@ def _render_clip(
     enhance_audio: bool = False,
     broll_path: Path | None = None,
     on_analysis_progress: ProgressCallback | None = None,
+    speaker_segments: list[Any] | None = None,
+    brand_kit: dict[str, Any] | None = None,
 ) -> tuple[float, list[dict[str, object]]]:
     source_duration = proposal.fin - proposal.inicio
+    # Split dinámico (Fase 3, ítem 3b): con diarización disponible, un
+    # clip de entrevista se renderiza en pantalla dividida aunque el
+    # encuadre configurado sea "speaker".
+    framing = config.framing
+    if config.options.dynamic_split and speaker_segments:
+        from .speaker_framing import choose_framing
+
+        framing = choose_framing(
+            speaker_segments, proposal.inicio, proposal.fin, config.framing
+        )
     intervals = _retained_intervals(input_path, proposal, config.options.silence, ffmpeg_path)
     if removed_ranges:
         intervals = _subtract_intervals(intervals, removed_ranges)
+    if config.options.remove_fillers:
+        # Muletillas y micro-pausas (Fase 3, ítem 8): mismos intervalos
+        # que la eliminación de silencios. Salvaguarda: si quitarlas
+        # recortase más del 40 % del clip, se ignora (una transcripción
+        # ruidosa no debe vaciar el clip).
+        from .fillers import detect_filler_exclusions
+
+        exclusions = detect_filler_exclusions(transcript, proposal)
+        if exclusions:
+            kept_total = sum(end - start for start, end in intervals)
+            removed_total = sum(
+                max(0.0, min(end, ex_end) - max(start, ex_start))
+                for start, end in intervals
+                for ex_start, ex_end in exclusions
+            )
+            if kept_total > 0 and removed_total <= 0.4 * kept_total:
+                intervals = _subtract_intervals(intervals, exclusions)
+            else:
+                logger.warning(
+                    "Las muletillas recortarían más del 40 %% del clip "
+                    "(%.1fs de %.1fs); se ignoran.",
+                    removed_total,
+                    kept_total,
+                )
     render_duration = sum(end - start for start, end in intervals)
     if render_duration <= 0.08:
         raise MediaProcessingError("El clip no contiene suficiente audio para exportarse.")
@@ -1193,10 +1273,11 @@ def _render_clip(
         render_duration,
         intervals,
         output_resolution,
+        brand=brand_kit,
     )
     width, height = _ratio_size(config.ratio, output_resolution)
     crop_paths = None
-    if config.options.face_tracking and config.framing == "speaker":
+    if config.options.face_tracking and framing == "speaker":
         try:
             speech_intervals = [
                 (word.start, word.end)
@@ -1215,6 +1296,36 @@ def _render_clip(
             )
         except FaceTrackingError as error:
             raise MediaProcessingError(str(error)) from error
+    # Punch-in (Fase 3, ítem 3b): los picos de energía se detectan en
+    # tiempo local del clip y se remapean a la línea de tiempo
+    # concatenada (tras quitar silencios y muletillas); un pico que
+    # cae en un hueco eliminado se descarta.
+    punch_in_ranges: list[tuple[float, float]] | None = None
+    if config.options.punch_in:
+        from .speaker_framing import energy_peak_ranges
+
+        raw_ranges = energy_peak_ranges(
+            input_path, proposal.inicio, source_duration, ffmpeg_path
+        )
+        punch_in_ranges = []
+        for range_start, range_end in raw_ranges:
+            mapped_start = _remap_time(range_start, intervals)
+            mapped_end = _remap_time(range_end, intervals)
+            if (
+                mapped_start is not None
+                and mapped_end is not None
+                and mapped_end - mapped_start >= 0.3
+            ):
+                punch_in_ranges.append((mapped_start, mapped_end))
+        if not punch_in_ranges:
+            punch_in_ranges = None
+    logo_path = None
+    logo_input = None
+    if brand_kit:
+        candidate = brand_kit.get("logo_path")
+        if candidate and Path(str(candidate)).is_file():
+            logo_path = Path(str(candidate))
+            logo_input = 2 if broll_path is not None else 1
     filter_graph, video_output, audio_output = _build_filter(
         intervals,
         width,
@@ -1225,7 +1336,9 @@ def _render_clip(
         enhance_audio,
         broll_path is not None,
         crop_paths,
-        config.framing,
+        framing,
+        punch_in_ranges=punch_in_ranges,
+        logo_input=logo_input,
     )
     arguments = [
         ffmpeg_path,
@@ -1241,6 +1354,8 @@ def _render_clip(
         if not broll_path.is_file():
             raise MediaProcessingError("No se encontró el archivo de B-roll descargado.")
         arguments.extend(["-stream_loop", "-1", "-i", str(broll_path.resolve())])
+    if logo_path is not None:
+        arguments.extend(["-loop", "1", "-i", str(logo_path.resolve())])
     arguments.extend([
         "-t",
         f"{source_duration:.3f}",
@@ -1341,6 +1456,8 @@ def render_clip(
     enhance_audio: bool = False,
     broll_path: Path | None = None,
     on_analysis_progress: ProgressCallback | None = None,
+    speaker_segments: list[Any] | None = None,
+    brand_kit: dict[str, Any] | None = None,
 ) -> tuple[float, list[dict[str, object]]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return _render_clip(
@@ -1358,4 +1475,6 @@ def render_clip(
         enhance_audio,
         broll_path,
         on_analysis_progress,
+        speaker_segments,
+        brand_kit,
     )

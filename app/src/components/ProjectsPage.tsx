@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ChevronRight, FileVideo2, FolderOpen, LoaderCircle, Plus, Search } from 'lucide-react';
+import { AlertCircle, ChevronRight, CopyPlus, FileVideo2, FolderOpen, LoaderCircle, Plus, Search } from 'lucide-react';
 import { apiFetch } from '../auth';
 import type { ProjectResult } from '../types';
 import { formatDuration, responseError } from '../utils';
@@ -76,7 +76,32 @@ export function ProjectsPage({
   const [searchLoading, setSearchLoading] = useState(false);
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
+  // Fase 3 (ítem 15): duplicar un proyecto para reprocesarlo con otra
+  // configuración, sin volver a subir el video.
+  const [duplicatingId, setDuplicatingId] = useState('');
   const requestRef = useRef(0);
+
+  const duplicateProject = async (projectId: string) => {
+    setDuplicatingId(projectId);
+    setError('');
+    try {
+      const response = await apiFetch(`${apiBase}/api/projects/${projectId}/duplicate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const clone = await response.json() as ProjectResult;
+      // La copia aparece arriba de la lista, lista para abrir y
+      // reconfigurar.
+      setProjects((current) => [clone, ...current]);
+      setTotal((current) => (current === null ? null : current + 1));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'No se pudo duplicar el proyecto.');
+    } finally {
+      setDuplicatingId('');
+    }
+  };
 
   const fetchPage = useCallback(async (offset: number): Promise<{ page: ProjectResult[]; total: number | null }> => {
     const response = await apiFetch(
@@ -232,7 +257,7 @@ export function ProjectsPage({
           {visibleProjects.map((project) => {
             const readyClips = project.clips.filter((clip) => clip.status !== 'failed').length;
             return (
-              <li key={project.id}>
+              <li key={project.id} className="pf-project-row-wrap">
                 <button
                   type="button"
                   className="project-row"
@@ -261,6 +286,18 @@ export function ProjectsPage({
                     {STATUS_LABELS[project.status] ?? project.status}
                   </span>
                   <ChevronRight size={17} className="project-row-arrow" aria-hidden="true" />
+                </button>
+                {/* El duplicar va FUERA del botón de la fila: un botón
+                    dentro de otro es HTML inválido. */}
+                <button
+                  type="button"
+                  className="pf-duplicate-button"
+                  onClick={() => void duplicateProject(project.id)}
+                  disabled={duplicatingId === project.id}
+                  aria-label={`Duplicar proyecto ${project.title}`}
+                  title="Duplicar para reprocesar con otra configuración"
+                >
+                  {duplicatingId === project.id ? <LoaderCircle size={16} className="spin" /> : <CopyPlus size={16} />}
                 </button>
               </li>
             );

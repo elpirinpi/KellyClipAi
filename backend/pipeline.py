@@ -500,7 +500,12 @@ def _validate_and_complete_proposals(
     completed, completion_errors = _validate_proposals(
         completed, duration, choice, source=source
     )
-    return completed, errors + completion_errors
+    # Series y temas (Fase 3, ítem 2): embudo común de todos los
+    # motores (señales y LLM). El pulido con IA reescribe títulos
+    # después, así que process_project reagrupa tras pulir.
+    from .series import assign_series
+
+    return assign_series(completed), errors + completion_errors
 
 
 def _propose_valid_clips(
@@ -1342,6 +1347,73 @@ def _render_projects(
     if not count:
         return rendered
 
+    # Split dinámico y marca (Fase 3, ítems 3b y 5): se resuelven UNA
+    # vez por tanda, no por clip. Los segmentos de hablante se
+    # reutilizan si ya están en metadata (de una tanda anterior) y si
+    # no se calculan aquí (los modelos ya están en caché de la
+    # detección) y se guardan para los re-renders del editor.
+    speaker_segments: list[dict[str, Any]] | None = None
+    brand_kit: dict[str, Any] | None = None
+    if project_config.options.dynamic_split or project_config.options.brand:
+        try:
+            stored_project = database.get_project(
+                settings.database_path, project_id
+            )
+            stored_metadata = (
+                dict(stored_project.get("metadata") or {})
+                if stored_project is not None
+                else {}
+            )
+        except Exception as error:  # noqa: BLE001 - el render no depende de esto
+            logger.warning("No se pudo leer el proyecto para el render (%s).", error)
+            stored_metadata = {}
+        if project_config.options.dynamic_split:
+            cached = stored_metadata.get("speaker_segments")
+            if isinstance(cached, list) and cached:
+                speaker_segments = cached
+            else:
+                try:
+                    from . import diarization
+
+                    duration_value = stored_metadata.get("duration")
+                    segments = (
+                        diarization.get_speaker_segments(
+                            input_path, float(duration_value), ffmpeg_path
+                        )
+                        if duration_value is not None
+                        else []
+                    )
+                except Exception as error:  # noqa: BLE001 - sin segmentos, encuadre normal
+                    logger.warning(
+                        "No se pudo diarizar para el split dinámico (%s).", error
+                    )
+                    segments = []
+                if segments:
+                    speaker_segments = segments
+                    try:
+                        stored_metadata["speaker_segments"] = segments
+                        database.update_project(
+                            settings.database_path,
+                            project_id,
+                            metadata=stored_metadata,
+                        )
+                    except Exception as error:  # noqa: BLE001 - caché opcional
+                        logger.warning(
+                            "No se pudieron guardar los segmentos de hablante (%s).",
+                            error,
+                        )
+        if project_config.options.brand:
+            kit = database.get_brand_kit(settings.database_path, owner_id)
+            if kit is not None:
+                from .brand import brand_logo_path
+
+                brand_kit = dict(kit)
+                logo_path = brand_logo_path(
+                    settings.data_dir, owner_id, kit.get("logo_filename")
+                )
+                if logo_path is not None:
+                    brand_kit["logo_path"] = str(logo_path)
+
     for index, record in enumerate(proposal_records):
         if should_cancel is not None and should_cancel():
             # Se conservan los clips ya renderizados en esta tanda Y las
@@ -1418,6 +1490,9 @@ def _render_projects(
             )
 
         broll_path: Path | None = None
+        # Fuera del try: el handler de errores lo consulta y debe existir
+        # aunque falle antes de resolver el B-roll.
+        broll_from_library = False
         try:
             render_config = project_config.model_copy(
                 update={
@@ -1429,7 +1504,29 @@ def _render_projects(
                 }
             )
             broll_metadata: dict[str, str] | None = None
-            if project_config.options.broll:
+            # Fase 3 (ítem 13): un B-roll asignado desde la biblioteca
+            # gana a la descarga automática del proveedor. Si la consulta
+            # falla, se sigue con el comportamiento de siempre.
+            assigned_broll = None
+            try:
+                assigned_broll = database.broll_assignment_for_clip(
+                    settings.database_path, project_id, clip_id
+                )
+            except Exception:
+                logger.exception(
+                    "No se pudo leer el B-roll asignado del clip %s; "
+                    "se sigue con el proveedor.",
+                    clip_id,
+                )
+            if assigned_broll is not None:
+                broll_from_library = True
+                broll_path = Path(str(assigned_broll["broll_local_path"]))
+                broll_metadata = {
+                    "provider": str(assigned_broll.get("broll_provider") or "Biblioteca"),
+                    "creator": str(assigned_broll.get("broll_creator") or ""),
+                    "attribution_url": str(assigned_broll.get("broll_attribution_url") or ""),
+                }
+            elif project_config.options.broll:
                 broll_path = project_dir / "broll" / f"{clip_id}.mp4"
                 broll_metadata = download_broll(
                     settings,
@@ -1447,6 +1544,8 @@ def _render_projects(
                 on_encode_progress,
                 broll_path=broll_path,
                 on_analysis_progress=on_analysis_progress,
+                speaker_segments=speaker_segments,
+                brand_kit=brand_kit,
             )
             metadata = probe_media(output_path, shutil.which("ffprobe") or "ffprobe")
             clip.update(
@@ -1476,7 +1575,13 @@ def _render_projects(
                     "error": str(error).strip() or "No se pudo renderizar este clip.",
                 }
             )
-            for partial_path in (output_path, subtitle_path, broll_path):
+            # El B-roll de la biblioteca no es un archivo parcial: vive en
+            # data_dir/broll y se reutiliza; borrarlo al fallar un render
+            # destruiría la biblioteca (Fase 3, ítem 13).
+            partial_paths = [output_path, subtitle_path]
+            if not broll_from_library:
+                partial_paths.append(broll_path)
+            for partial_path in partial_paths:
                 if partial_path is None:
                     continue
                 try:
@@ -1904,6 +2009,12 @@ def process_project(
                         if polished is not None:
                             proposals = polished
                             engine_used = "signals+ai"
+            # Series (Fase 3, ítem 2): el pulido reescribe los títulos,
+            # así que se reagrupa aquí; assign_series es idempotente
+            # (limpia los sufijos previos antes de reagrupar).
+            from .series import assign_series
+
+            proposals = assign_series(proposals)
             proposal_records = [
                 {
                     "id": str(uuid.uuid4()),
